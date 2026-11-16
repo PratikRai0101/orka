@@ -1,8 +1,8 @@
 {
   "repository": "https://github.com/whysosaket/orka-api",
-  "commit": "07ab09a68289dafdd3e693b7899ba360bf01de48",
+  "commit": "6b661bddb8027953614b324cd6d3c78a36ed7b91",
   "candidate": false,
-  "sourceTreeSha256": "518bd5fe899fb0d3cfe62c17dbe125dcebac2695ed099e20bd1c48427d2c52b5",
+  "sourceTreeSha256": "2a5760390beb2551767de6019786aa75af508778cc78255d10993d933969505f",
   "files": [
     {
       "path": ".dockerignore",
@@ -71,7 +71,7 @@
     },
     {
       "path": "deploy/ec2/.env.example",
-      "sha256": "0d10239ee7df5da6a16759e4b0591affa3993672170cf6d564a3545ff605eaab",
+      "sha256": "e84c7d427389d9fa5f7b0cb900a6c56667db0089b0037fa986d405ebceb4f38e",
       "mode": 420
     },
     {
@@ -101,7 +101,7 @@
     },
     {
       "path": "deploy/ec2/compose.yml",
-      "sha256": "af23b167e37169c634fcad3c840b8276aa8adcb700b4738cc63a68d3f0345bb9",
+      "sha256": "3e1497e0871fc7301f9420a31d33f58553f881650f026f4dc7369374d0d6d51f",
       "mode": 420
     },
     {
@@ -146,12 +146,12 @@
     },
     {
       "path": "docs/authentication.md",
-      "sha256": "f6e801660c6d63047e712027ad21b13bfb9525c6910aa2e3ed5fb660db1f2abe",
+      "sha256": "2e4704afc27c9e2f54946a9e3a1be30b25376ff2961fa88b064623c5d8ed5f40",
       "mode": 420
     },
     {
       "path": "docs/compatibility.md",
-      "sha256": "55f65035be3f47fbe6cf76be82aa54dccf82cce549d00b2a75524b53dfea7925",
+      "sha256": "1ffdd445d8fd1c270b39bcf0307d55bb60cd04985f213e1e432b8a9937a9d9bc",
       "mode": 420
     },
     {
@@ -176,7 +176,7 @@
     },
     {
       "path": "docs/mcp-operations.md",
-      "sha256": "d99e554b6e8f2da1467c33668c7cd2a2d86e07239e6f277aff4d8399243329c7",
+      "sha256": "f46b25dd445dad334207e35108e762370961c75e49e3e3112a82669d03d82c87",
       "mode": 420
     },
     {
@@ -186,7 +186,7 @@
     },
     {
       "path": "docs/orka-plugin.md",
-      "sha256": "2ff9c1c5a280afcee6087039b347224ffa29430fed6f7de97ad471a26de1befa",
+      "sha256": "ad3dee40a16359a0eb074776fe6acfe16c1e0b9de2e5f2d48f9d1912acbd0ca6",
       "mode": 420
     },
     {
@@ -246,17 +246,17 @@
     },
     {
       "path": "internal/server/api.go",
-      "sha256": "37fda7c6483b607bfff7a4115d92650fba2b322b143315c61e726b51e5632354",
+      "sha256": "800f2744839efca46fd617580496b92be1a628acf1390adc2a2787d531d7cb51",
       "mode": 420
     },
     {
       "path": "internal/server/auth_test.go",
-      "sha256": "8aaae5839246285a1fcca09c7279f1cb7bfbdf36e66d5f66e7690058365c1fc6",
+      "sha256": "5db64131f9652121f6772fd5512af7cdbdc8524a22842e675436f032ec52885f",
       "mode": 420
     },
     {
       "path": "internal/server/auth.go",
-      "sha256": "441fa64e84d0a609830849a5a95909b6875424b47f5ecfd3f13bb06e308e9cca",
+      "sha256": "b02ff83bf5784622be73626fa90cf2eda5a042c01ac3213096723b3a8de30833",
       "mode": 420
     },
     {
@@ -266,7 +266,12 @@
     },
     {
       "path": "internal/server/command.go",
-      "sha256": "b7625ed1e2d0bf4d049a6afce4495f4f80b439db6f2e8532b65e086d2ac4e94e",
+      "sha256": "5d09524d008306b9b9ceb97af13c66f0d32e4ba18de8e4acad685f05de1d13a4",
+      "mode": 420
+    },
+    {
+      "path": "internal/server/connector.go",
+      "sha256": "31a1e75b0f8b6c38d47e2c084904a0e41b4091a0a8df37b881fce0dbae28e58b",
       "mode": 420
     },
     {
@@ -282,6 +287,11 @@
     {
       "path": "internal/server/contracts.json",
       "sha256": "5d3094f6004d18aa3ba6036d9e07d915de35b01dffd8b20707b5ed05f14c37dd",
+      "mode": 420
+    },
+    {
+      "path": "internal/server/crypto.go",
+      "sha256": "b905f37ff668a8953f147237c4784f143408fd6ec513074c15cfaa24ba8303fd",
       "mode": 420
     },
     {
@@ -355,11 +365,6 @@
       "mode": 420
     },
     {
-      "path": "internal/server/mcp.go",
-      "sha256": "66612d348bbf143cd9e49a52384ac2e59a1f50a64f6bb3d42db6937c8d8897bb",
-      "mode": 420
-    },
-    {
       "path": "internal/server/memory_test.go",
       "sha256": "82e6776654e7850e97748cd37d4c71e4071f5ca2db87100ddaaaa7c60ada6a80",
       "mode": 420
@@ -380,18 +385,13 @@
       "mode": 420
     },
     {
-      "path": "internal/server/oauth.go",
-      "sha256": "5482baca6f56c187a107cf885a58e9151130f32880977f6371af62f167f28281",
-      "mode": 420
-    },
-    {
       "path": "internal/server/origin.go",
       "sha256": "25761aed196850484cf216876500db60d662178f83c7d153660120e106bfc336",
       "mode": 420
     },
     {
       "path": "internal/server/pages.go",
-      "sha256": "d1100cce1311e939705fc4a7e9e0cd711f7e29f8610f62228e0c958319ab6ad7",
+      "sha256": "274a860b42389941c894f5960e2898582142b23cde482ee488d087cc125a3a43",
       "mode": 420
     },
     {
@@ -460,13 +460,8 @@
       "mode": 420
     },
     {
-      "path": "internal/server/templates/oauth.html",
-      "sha256": "301bb61b9c12823342f0460840c570084da01c260bc6fbc650c0cf89e96d9673",
-      "mode": 420
-    },
-    {
       "path": "internal/server/testbridge.go",
-      "sha256": "3aa0177779016c08fb53b72c848dbd0365b3c8b31b291c6902039f542c7b55d2",
+      "sha256": "ad78f74af7d3ac959c531ef1d48d2f752f32a1644897d14d101d167d7ff5da99",
       "mode": 420
     },
     {
@@ -476,7 +471,7 @@
     },
     {
       "path": "internal/server/transport_test.go",
-      "sha256": "cb46a1e7bbf9e980447396f3388341f4046517b5d2eec2865ca0c2eed5553ea4",
+      "sha256": "3233acc278dbc405e70eb0ef76062be7e650d2505f0dfecaf8afdfef9f014061",
       "mode": 420
     },
     {
@@ -516,12 +511,12 @@
     },
     {
       "path": "package-lock.json",
-      "sha256": "d056e9f637ab43d4bb7ec74d721e952638dc8009d118dfc3a070f79e9c9f32af",
+      "sha256": "a2d51af3969da11b3a3355c2acef59f08512fc3e36d3fac08a84f1588c3265bd",
       "mode": 420
     },
     {
       "path": "package.json",
-      "sha256": "a812dd3375760558aa09860e6d8c584f7470887c0d36c1309a2ad59711371eaf",
+      "sha256": "46eacdbd410a740dac9314523c3eb25aa7c3ea26dff80de6ad9fa9463535c409",
       "mode": 420
     },
     {
@@ -696,12 +691,12 @@
     },
     {
       "path": "tests/acceptance/github-live-e2e.ts",
-      "sha256": "988023f455caf3d44630fa714f54e497b85b2d9f478047fe22c9e998bbc68fe1",
+      "sha256": "7209ec6861e0a9bafb0fc7c9904ea67580965a2ab2dd4d1455a1c79f6a0132ed",
       "mode": 420
     },
     {
       "path": "tests/acceptance/image-e2e.ts",
-      "sha256": "68f92768f1a0e78cfa510a8d66a23dba8601f1e58570ea597324eac6720fe8bf",
+      "sha256": "9796b16902e203b519d3a7364e2bce74b1d63689a1af84c2f9e8c0bbf2bb2fbc",
       "mode": 420
     },
     {
@@ -711,17 +706,12 @@
     },
     {
       "path": "tests/acceptance/integration.ts",
-      "sha256": "3c7844a25c470dfe423d79e542dcf0ac12f8c2613c43ee388ecbb59eac7c9025",
+      "sha256": "b4185686c715e50b6967c3f93a9081f971915c18f0257ba507e151be18c2b53d",
       "mode": 420
     },
     {
       "path": "tests/acceptance/mcp-image-check.ts",
-      "sha256": "16e06dc3df6fb7f948620eba4315ad3337c3705a730c948576498e751c523abf",
-      "mode": 420
-    },
-    {
-      "path": "tests/acceptance/mcp-preview.ts",
-      "sha256": "cdddd3ec2af56832e4a9cfe0e4a887480c5310e13c107a3b5383284b2fdf2ed0",
+      "sha256": "51177ea5bfdc536eaac0fbcd74a7fd5b1919ffae2ebb415fbda6f34cf9c09b7d",
       "mode": 420
     },
     {
@@ -761,12 +751,12 @@
     },
     {
       "path": "tests/bridge/main.ts",
-      "sha256": "cf7f22c468783473384891510c77db5907c40aaf305c56d519e895839d61960b",
+      "sha256": "17dc9273d5843b7aad0b3cde7d4c1ea4b34dcf2003c63a55e00e63a8e515082c",
       "mode": 420
     },
     {
       "path": "tests/bridge/mcp.ts",
-      "sha256": "2dabe9346030d15b599e8f929f2512280c0ad9033f66484458a848c841d1ec2d",
+      "sha256": "6464386fbac9c6e9c1dc855301fd4f76f88f43020eaa1a7e806f83bfc8bc6df9",
       "mode": 420
     },
     {
@@ -851,7 +841,7 @@
     },
     {
       "path": "tests/github.integration.ts",
-      "sha256": "b539a654735a0d3d1c3d684cd8248dd2366e1c595e9943f73b0871e83502f75d",
+      "sha256": "61acec367311e53de4d67f529c1dc7ba181f555d9f169f150fd2a733b7de72be",
       "mode": 420
     },
     {
@@ -871,17 +861,17 @@
     },
     {
       "path": "tests/mcp-operations.integration.ts",
-      "sha256": "404c402f92a8324ce75d9d0c1df707f711f1b2651776ef19a01acfc2418a3ebb",
+      "sha256": "3d5659d1bba74589aa7f388ca7c70a27c3c7b1950d311573d04dc1d07211379b",
       "mode": 420
     },
     {
       "path": "tests/mcp-regression.integration.ts",
-      "sha256": "73d92299a22e8e28dc65b7f825dbd14211437dfe3e5b84640114795e8ef2992b",
+      "sha256": "5b1590b995fee33cd08ffd8f36a1eb0ad93b26d51ecf3d93b582bf905eeb2a36",
       "mode": 420
     },
     {
       "path": "tests/mcp.integration.ts",
-      "sha256": "00a790034eda60da249f8c68c67365d1412392cfc1fb3d821d1f076a038b8f02",
+      "sha256": "a261a90a80ebf761bac25bc01f9e2543c505a46ca7373ff0a66a351de35ffb5c",
       "mode": 420
     },
     {
@@ -907,6 +897,11 @@
     {
       "path": "tests/operator.test.ts",
       "sha256": "4e5090f62bf8381e330daa9663d915e4f896a4b1fa5196207725b3b22ea55b9f",
+      "mode": 420
+    },
+    {
+      "path": "tests/plugin-connection.integration.ts",
+      "sha256": "e7bddf1d2576a368257b5db4211780dc14c6931d1b6d0ff43d2acbbf05b2fc7f",
       "mode": 420
     },
     {
