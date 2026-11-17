@@ -69,7 +69,6 @@ export function SessionDetail({
   return (
     <SessionView
       id={resource.resourceId}
-      revision={resource.revision}
       contentKey={resource.files.map((file) => file.hash).join(":")}
       conflictId={view.preview}
       source={resource.source}

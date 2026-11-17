@@ -91,7 +91,6 @@ const SessionTurn = memo(function SessionTurn({
 
 export interface SessionViewProps {
   id: string;
-  revision: number;
   contentKey: string;
   /** Conflict preview to read instead of the shared version. */
   conflictId: string;
@@ -109,7 +108,6 @@ export interface SessionViewProps {
 /** The reading view for one session with paged, windowed turns. */
 export function SessionView({
   id,
-  revision,
   contentKey,
   conflictId,
   source,
@@ -122,9 +120,10 @@ export function SessionView({
   const scrollRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const [scrollMargin, setScrollMargin] = useState(0);
+  const session = useSessionMessages(id, conflictId, contentKey);
   const { messages, total, loading, error, removed, hasMore, loadMore, retry } =
-    useSessionMessages(id, revision, conflictId, contentKey);
-  const initialLoading = loading && total === null && !error;
+    session;
+  const initialLoading = session.pending && !error;
   const conversation = mode === "conversation";
   // The title card scrolls with the turns, so the virtualizer needs the list's
   // offset inside the reading column, refreshed whenever anything above resizes.
@@ -217,7 +216,7 @@ export function SessionView({
             />
           )}
           <LoadingRegion
-            id={`session:${id}:${revision}:${conflictId}`}
+            id={`session:${id}:${conflictId}`}
             label="Loading messages…"
             loading={initialLoading}
           >
