@@ -92,6 +92,8 @@ const SessionTurn = memo(function SessionTurn({
 export interface SessionViewProps {
   id: string;
   contentKey: string;
+  /** Native sessions may grow before discovery updates their catalog hashes. */
+  refreshOnMount?: boolean;
   /** Conflict preview to read instead of the shared version. */
   conflictId: string;
   source: Resource["source"];
@@ -109,6 +111,7 @@ export interface SessionViewProps {
 export function SessionView({
   id,
   contentKey,
+  refreshOnMount,
   conflictId,
   source,
   shell,
@@ -120,7 +123,12 @@ export function SessionView({
   const scrollRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const [scrollMargin, setScrollMargin] = useState(0);
-  const session = useSessionMessages(id, conflictId, contentKey);
+  const session = useSessionMessages(
+    id,
+    conflictId,
+    contentKey,
+    refreshOnMount,
+  );
   const { messages, total, loading, error, removed, hasMore, loadMore, retry } =
     session;
   const initialLoading = session.pending && !error;
