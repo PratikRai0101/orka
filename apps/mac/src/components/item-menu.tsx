@@ -1,5 +1,5 @@
 import { ChevronRightIcon, EllipsisIcon } from "lucide-react";
-import React, { useRef } from "react";
+import React, { useRef, useState } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { IconButton } from "./icon-button.js";
@@ -88,18 +88,30 @@ export function ItemContextMenu({
 }) {
   const trigger = useRef<HTMLSpanElement>(null);
   const selected = useRef(false);
+  const [open, setOpen] = useState(false);
   if (!actions.length) return children;
   return (
+    // Modal, so the click that dismisses the menu cannot reach the item below.
     <ContextMenu.Root
-      modal={false}
-      onOpenChange={(open) => {
-        if (open) selected.current = false;
+      onOpenChange={(value) => {
+        setOpen(value);
+        if (value) selected.current = false;
       }}
     >
       <ContextMenu.Trigger
         asChild
         ref={trigger}
         disabled={disabled}
+        // Not data-state: a trigger such as the project picker carries its own.
+        data-item-menu-open={open ? "" : undefined}
+        onClickCapture={(event) => {
+          // Control-click is a secondary click on macOS, but WebKit still
+          // follows it with a click. Keep that click from opening the item.
+          if (event.ctrlKey) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+        }}
         onContextMenuCapture={(event) => {
           if (hasNativeTextMenu(event.target)) event.stopPropagation();
         }}
@@ -173,7 +185,6 @@ export function ItemMenuButton({
   const selected = useRef(false);
   return (
     <DropdownMenu.Root
-      modal={false}
       onOpenChange={(open) => {
         if (open) selected.current = false;
       }}
