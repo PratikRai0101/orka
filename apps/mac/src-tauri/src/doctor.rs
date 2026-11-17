@@ -1,7 +1,7 @@
-use crate::{auth, db, sync};
+use crate::{auth, db, native, projects, sources, sync};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::io::Write;
+use std::{collections::BTreeSet, io::Write, path::Path};
 
 #[derive(Clone, Copy)]
 enum Verdict {
@@ -27,6 +27,13 @@ impl Doctor {
         let mut report = Self::default();
         report.record("Login", Self::login(db, session), "Open Orka, allow Keychain access, and sign in to the selected service; choose Sync now to refresh an expired session.");
         report.record("Sync", Self::sync(db), "Open Orka's sync menu, review issues, and choose Retry uploads or Sync now. If sync is in progress, wait and rerun doctor.");
+        if let Err(error) = report.hooks(db) {
+            report.record(
+                "Hooks",
+                Err(error),
+                "Check access to Orka's local storage and source folders, then rerun doctor.",
+            );
+        }
         report
     }
     fn record(&mut self, name: &str, finding: Finding, next: &str) {
@@ -44,6 +51,95 @@ impl Doctor {
         if code != 0 {
             self.output.push_str(&format!("  Next: {next}\n"));
         }
+    }
+    fn hooks(&mut self, db: Option<&rusqlite::Connection>) -> db::Result<()> {
+        use native::HookState::*;
+        let db = db.ok_or("Local database unavailable")?;
+        let projects = db::rows(
+            db,
+            &format!("SELECT value FROM projects WHERE {}", projects::ACTIVE),
+            &[],
+        )?;
+        let mut roots = BTreeSet::new();
+        let mut any = false;
+        for source in projects.iter().flat_map(sources::views) {
+            any = true;
+            let path = source["path"].as_str().unwrap_or("");
+            if path.is_empty() || sources::validate(&source).is_err() {
+                self.record(
+                    "Hooks",
+                    Ok((
+                        Verdict::Warn,
+                        format!("Source folder unavailable: {path:?}."),
+                    )),
+                    "Open Orka Settings > Source folders and use Locate Folder/Reconnect.",
+                );
+                continue;
+            }
+            if !roots.insert(path.to_owned()) {
+                continue;
+            }
+            let status = match native::Hooks::inspect(Path::new(path)) {
+                Ok(status) => status,
+                Err(error) => {
+                    self.record("Hooks", Err(error), "Check the Orka installation and source-folder permissions, then rerun doctor.");
+                    continue;
+                }
+            };
+            for file in status.files {
+                let (finding, next) = match file.state {
+                    Configured => {
+                        let finding =
+                            db::get(db, &format!("hookSeen:{}", file.tool)).map(|value| {
+                                match Self::time(&value) {
+                                    Some(time) => (
+                                        Verdict::Pass,
+                                        format!(
+                                            "configured; last seen {} (tool-wide, not per folder)",
+                                            Self::stamp(Some(time))
+                                        ),
+                                    ),
+                                    None => {
+                                        (Verdict::Warn, "configured; activity unverified".into())
+                                    }
+                                }
+                            });
+                        (finding, "Check local storage access, then start this tool in a connected source folder and rerun doctor.")
+                    }
+                    state => {
+                        let next = if state == Unreadable {
+                            "Allow read access to this hook file, then rerun doctor."
+                        } else {
+                            "Restore Orka's entries in this file, or disconnect and reconnect this source folder in the intended Orka profile to reinstall hooks."
+                        };
+                        let problem = match state {
+                            Missing => "missing hooks",
+                            Partial => "partial configuration",
+                            WrongProfile => "wrong Orka profile",
+                            WrongExecutable => "wrong Orka executable",
+                            Malformed => "malformed configuration",
+                            Unreadable => "file unreadable",
+                            Configured => unreachable!(),
+                        };
+                        (Ok((Verdict::Fail, problem.into())), next)
+                    }
+                };
+                let finding = finding
+                    .map(|(verdict, detail)| (verdict, format!("{detail}; file {:?}.", file.file)));
+                self.record(&format!("{} hooks", file.tool), finding, next);
+            }
+        }
+        if !any {
+            self.record(
+                "Hooks",
+                Ok((
+                    Verdict::Warn,
+                    "No connected source folders to inspect.".into(),
+                )),
+                "Connect a source folder in Orka, then start Claude or Codex there.",
+            );
+        }
+        Ok(())
     }
     fn time(value: &Value) -> Option<DateTime<Utc>> {
         value.as_str()?.parse().ok()
