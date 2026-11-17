@@ -20,8 +20,7 @@
 .item-menu-action {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  gap: 8px;
   min-height: 32px;
   padding: 6px 10px;
   border-radius: var(--radius-detail);
@@ -40,6 +39,22 @@
 
 .item-menu-action[data-danger]:not([data-disabled]) {
   color: var(--text-danger);
+}
+
+.item-menu-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.item-menu-icon {
+  flex: 0 0 16px;
+  width: 16px;
+  color: var(--text-secondary);
+}
+
+.item-menu-action[data-disabled] .item-menu-icon,
+.item-menu-action[data-danger] .item-menu-icon {
+  color: inherit;
 }
 
 .item-menu-separator {
