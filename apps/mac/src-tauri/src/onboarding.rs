@@ -648,9 +648,9 @@ async fn batch_sync(
             .or_else(|| saved["draft"]["catalog"].as_array());
         if candidates.is_some_and(|projects| {
             !projects.is_empty() && (matches["requiresChoice"] == true || projects.len() > 1)
-        }) && saved["draft"]["choices"][path]
+        }) && !saved["draft"]["choices"][path]
             .as_str()
-            .is_none_or(|choice| choice.is_empty())
+            .is_some_and(|choice| !choice.is_empty())
         {
             return Err("Choose which existing Orka project this folder should connect to".into());
         }
