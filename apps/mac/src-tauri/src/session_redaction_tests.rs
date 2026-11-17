@@ -56,7 +56,7 @@ fn new_snapshots_redact_conversations_and_nested_tools_without_editing_sources()
     }
     let record = json!({"API_KEY":"opaque", "service_TOKEN":"opaque", "Secret":"opaque", "password":"opaque", "PRIVATE_KEY":"opaque", "nested":[{"token":"opaque"}], "ordinary":"sk-short ghp_short AKIA123 AIza123 xoxo-123 sk_live_short\nPORT=3000\nTOKENIZER: enabled\nMONKEY=banana", "tokenizer":"unchanged", "secretary":"unchanged", "count":42});
     let path = f.root.join("fields.jsonl");
-    fs::write(&path, native::encode(&[record.clone()])).unwrap();
+    fs::write(&path, native::encode(std::slice::from_ref(&record))).unwrap();
     let files = crate::history::session_files("claude", &path, None).unwrap();
     let output =
         native::complete_records(&db::blob_read(files[0]["hash"].as_str().unwrap()).unwrap())
