@@ -115,7 +115,6 @@ Declared licenses are upstream metadata. Preserve the actual license notices and
 | [@pierre/theming](https://www.npmjs.com/package/@pierre/theming/v/1.0.2) | 1.0.2 | apache-2.0 |
 | [@playwright/test](https://www.npmjs.com/package/@playwright/test/v/1.64.1) | 1.64.1 | Apache-2.0 |
 | [@portable/protocol](https://www.npmjs.com/package/@portable/protocol/v/0.7.2) | 0.7.2 | MIT |
-| [@primer/octicons-react](https://www.npmjs.com/package/@primer/octicons-react/v/19.40.0) | 19.40.0 | MIT |
 | [@radix-ui/number](https://www.npmjs.com/package/@radix-ui/number/v/1.1.3) | 1.1.3 | MIT |
 | [@radix-ui/primitive](https://www.npmjs.com/package/@radix-ui/primitive/v/1.2.0) | 1.2.0 | MIT |
 | [@radix-ui/react-arrow](https://www.npmjs.com/package/@radix-ui/react-arrow/v/1.1.17) | 1.1.17 | MIT |
@@ -474,6 +473,7 @@ Declared licenses are upstream metadata. Preserve the actual license notices and
 | [lru_map](https://www.npmjs.com/package/lru_map/v/0.4.1) | 0.4.1 | MIT |
 | [lru-cache](https://www.npmjs.com/package/lru-cache/v/11.5.3) | 11.5.3 | BlueOak-1.0.0 |
 | [lru-cache](https://www.npmjs.com/package/lru-cache/v/5.1.1) | 5.1.1 | ISC |
+| [lucide-react](https://www.npmjs.com/package/lucide-react/v/1.74.0) | 1.74.0 | ISC |
 | [lz-string](https://www.npmjs.com/package/lz-string/v/1.5.0) | 1.5.0 | MIT |
 | [magic-string](https://www.npmjs.com/package/magic-string/v/0.30.21) | 0.30.21 | MIT |
 | [magic-string](https://www.npmjs.com/package/magic-string/v/0.30.21) | 0.30.21 | MIT |

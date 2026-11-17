@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { PlugIcon } from "@primer/octicons-react";
+import { PlugIcon } from "lucide-react";
 import type { Snapshot } from "../../types.js";
 import type { PluginAccount } from "../plugin-authorization.js";
 import { Button } from "../button.js";

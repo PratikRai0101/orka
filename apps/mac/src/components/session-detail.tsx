@@ -1,5 +1,5 @@
 import React from "react";
-import { DownloadIcon } from "@primer/octicons-react";
+import { DownloadIcon } from "lucide-react";
 import type { SessionConflict } from "@portable/protocol";
 import type { Project, ProjectResource as Resource } from "../types.js";
 import { Button } from "./button.js";
