@@ -88,6 +88,7 @@ import { useSessionTitles } from "./components/use-session-titles.js";
 import { useLocalResources } from "./components/use-local-resources.js";
 import { resourceCatalog } from "./components/resource-catalog.js";
 import { useWorkspace } from "./components/use-workspace.js";
+import { WorkspaceCacheProvider } from "./components/workspace-cache.js";
 import { useAccount } from "./components/use-account.js";
 import { MemberNamesProvider } from "./components/member-names.js";
 import { LoadingProvider } from "./components/loading-region.js";
@@ -135,29 +136,31 @@ export function App() {
   }, []);
   const workspace = useWorkspace();
   return (
-    <LoadingProvider
-      scope={JSON.stringify([
-        workspace.state.profile,
-        workspace.state.user,
-        workspace.state.config?.apiUrl,
-      ])}
-    >
-      <ToastProvider
+    <WorkspaceCacheProvider state={workspace.state}>
+      <LoadingProvider
         scope={JSON.stringify([
           workspace.state.profile,
           workspace.state.user,
           workspace.state.config?.apiUrl,
-          workspace.project,
         ])}
       >
-        <MemberNamesProvider
-          state={workspace.state}
-          projectId={workspace.project}
+        <ToastProvider
+          scope={JSON.stringify([
+            workspace.state.profile,
+            workspace.state.user,
+            workspace.state.config?.apiUrl,
+            workspace.project,
+          ])}
         >
-          <WorkspaceApp workspace={workspace} />
-        </MemberNamesProvider>
-      </ToastProvider>
-    </LoadingProvider>
+          <MemberNamesProvider
+            state={workspace.state}
+            projectId={workspace.project}
+          >
+            <WorkspaceApp workspace={workspace} />
+          </MemberNamesProvider>
+        </ToastProvider>
+      </LoadingProvider>
+    </WorkspaceCacheProvider>
   );
 }
 
