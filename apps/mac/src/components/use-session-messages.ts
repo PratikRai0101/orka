@@ -1,6 +1,8 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import {
   useInfiniteQuery,
+  useQueryClient,
+  type InfiniteData,
   type QueryClient,
   type QueryKey,
 } from "@tanstack/react-query";
@@ -13,8 +15,8 @@ const SESSION_PAGE_SIZE = 40;
 const SESSION_PAGE_LIMIT = 200;
 
 /**
- * Message pages for one session version. The key holds the file hashes, so a
- * cached entry can never go stale: new content is a new key.
+ * Message pages for one catalog version. Local forks can grow before discovery
+ * updates their hashes, so their readers also revalidate on each visit.
  */
 export class SessionMessagesQuery {
   static key(scope: string, id: string, conflict: string, content: string) {
@@ -67,24 +69,44 @@ export function useSessionMessages(
   id: string,
   conflictId: string,
   contentKey: string,
+  refreshOnMount = false,
 ) {
+  const scope = useWorkspaceScope();
+  const client = useQueryClient();
   const options = SessionMessagesQuery.options(
-    useWorkspaceScope(),
+    scope,
     id,
     conflictId,
     contentKey,
   );
-  // Refill as many turns as were showing, so a content change keeps the
-  // reader's place instead of collapsing to the first page.
-  const shown = useRef(0);
+  const key = options.queryKey;
+  // A pending read may have captured an older native file before this visit.
+  // Refetch-on-mount alone can deduplicate an existing background read.
+  const pendingAtMount = useRef(
+    refreshOnMount &&
+      !conflictId &&
+      client.getQueryState(key)?.fetchStatus === "fetching",
+  );
+  // Keep confirmed turns across content changes and failed refreshes. Query's
+  // placeholder data disappears on error, when the earlier turns remain useful.
+  const previous = useRef<{
+    key: QueryKey;
+    data: InfiniteData<SessionPage>;
+  } | null>(null);
+  if (
+    previous.current &&
+    !SessionMessagesQuery.sameSession(previous.current.key, key)
+  )
+    previous.current = null;
+  const earlier = previous.current?.data;
+  const shown =
+    earlier?.pages.flatMap((page) => page.messages ?? []).length ?? 0;
   const query = useInfiniteQuery({
     ...options,
+    refetchOnMount: refreshOnMount && !conflictId ? "always" : false,
     initialPageParam: {
       offset: 0,
-      limit: Math.min(
-        Math.max(shown.current, SESSION_PAGE_SIZE),
-        SESSION_PAGE_LIMIT,
-      ),
+      limit: Math.min(Math.max(shown, SESSION_PAGE_SIZE), SESSION_PAGE_LIMIT),
     },
     getNextPageParam: (last: SessionPage, pages: SessionPage[]) => {
       const offset = pages.flatMap((page) => page.messages ?? []).length;
@@ -92,23 +114,34 @@ export function useSessionMessages(
         ? { offset, limit: SESSION_PAGE_SIZE }
         : undefined;
     },
-    placeholderData: (previous, previousQuery) =>
-      previousQuery &&
-      SessionMessagesQuery.sameSession(previousQuery.queryKey, options.queryKey)
-        ? previous
-        : undefined,
   });
-  const messages = query.data?.pages.flatMap((page) => page.messages ?? []);
-  shown.current = messages?.length ?? 0;
-  const last = query.data?.pages.at(-1);
+  useEffect(() => {
+    if (!pendingAtMount.current) return;
+    pendingAtMount.current = false;
+    const filters = {
+      queryKey: SessionMessagesQuery.key(scope, id, conflictId, contentKey),
+      exact: true,
+    };
+    let active = true;
+    void client.cancelQueries(filters).then(() => {
+      if (active) void client.refetchQueries({ ...filters, type: "active" });
+    });
+    return () => {
+      active = false;
+    };
+  }, [client, scope, id, conflictId, contentKey]);
+  if (query.data) previous.current = { key, data: query.data };
+  const data = query.data ?? earlier;
+  const messages = data?.pages.flatMap((page) => page.messages ?? []);
+  const last = data?.pages.at(-1);
   const loading = query.isFetching;
   const error = query.error ? String(query.error) : "";
   return {
     messages: messages ?? [],
-    total: last ? (last.total ?? shown.current) : null,
+    total: last ? (last.total ?? messages?.length ?? 0) : null,
     loading,
     /** No turns to show yet, from the cache or an earlier version. */
-    pending: query.isPending,
+    pending: query.isPending && !data,
     error,
     removed: last?.removed === true,
     hasMore: query.hasNextPage,

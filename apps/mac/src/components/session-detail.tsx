@@ -70,6 +70,9 @@ export function SessionDetail({
     <SessionView
       id={resource.resourceId}
       contentKey={resource.files.map((file) => file.hash).join(":")}
+      refreshOnMount={Boolean(
+        resource.local || resource.localChanges || resource.fork,
+      )}
       conflictId={view.preview}
       source={resource.source}
       mode={view.fullTranscript ? "transcript" : "conversation"}
