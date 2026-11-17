@@ -136,17 +136,23 @@ export function App() {
   const workspace = useWorkspace();
   if (!workspace.hasSnapshot)
     return (
-      <main className="content-message">
-        {workspace.refreshError ? (
-          <>
-            <p role="alert">Could not load Orka: {workspace.refreshError}</p>
-            <Button onClick={() => void workspace.refresh().catch(() => {})}>
-              Try again
-            </Button>
-          </>
-        ) : (
-          <p role="status">Loading…</p>
-        )}
+      <main className="app-startup" data-tauri-drag-region>
+        <div className="app-startup__content">
+          {workspace.refreshError ? (
+            <>
+              <p className="content-message" role="alert">
+                Could not load Orka: {workspace.refreshError}
+              </p>
+              <Button onClick={() => void workspace.refresh().catch(() => {})}>
+                Try again
+              </Button>
+            </>
+          ) : (
+            <p className="content-message" role="status">
+              Loading…
+            </p>
+          )}
+        </div>
       </main>
     );
   return (
