@@ -1,4 +1,5 @@
 import {
+  BookOpenIcon,
   CodeIcon,
   CopyIcon,
   DownloadIcon,
@@ -35,6 +36,7 @@ import {
 import { Overlay } from "./overlay.js";
 import { Button } from "./button.js";
 import { Icon } from "./icon.js";
+import { MarkdownMarkIcon } from "./icons.js";
 import { SessionLauncher } from "./session-launcher.js";
 import type { ResourceView } from "./use-resource-view.js";
 import { sourcePath } from "./project-sources.js";
@@ -178,6 +180,7 @@ export function resourceViewMenuActions(
     items.push({
       id: "markdown",
       label: view.rawMarkdown ? "Show formatted" : "Show Markdown",
+      icon: view.rawMarkdown ? BookOpenIcon : MarkdownMarkIcon,
       onSelect: () => view.setRawMarkdown((value) => !value),
     });
   return items;
@@ -240,7 +243,12 @@ function ResourceMenuTarget({
   };
   const review = skillReviewState(resource, context.state, project);
   const items: ItemMenuAction[] = [
-    { id: "open", label: "Open", onSelect: () => context.onOpen(resource) },
+    {
+      id: "open",
+      label: "Open",
+      icon: BookOpenIcon,
+      onSelect: () => context.onOpen(resource),
+    },
   ];
   if (resource.kind === "session") {
     items.push({
