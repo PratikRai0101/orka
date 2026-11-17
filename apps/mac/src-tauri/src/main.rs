@@ -35,6 +35,7 @@ mod selective_sharing;
 mod session_forks;
 mod session_launcher;
 mod session_presentation;
+mod session_redaction;
 mod session_translation;
 mod settings;
 mod settings_lifecycle;
