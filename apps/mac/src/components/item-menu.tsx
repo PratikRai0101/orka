@@ -1,7 +1,7 @@
+import { ChevronRightIcon, EllipsisIcon } from "lucide-react";
 import React, { useRef } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { ChevronRightIcon, KebabHorizontalIcon } from "@primer/octicons-react";
 import { IconButton } from "./icon-button.js";
 import { hasNativeTextMenu } from "../hooks/use-web-view-menu-policy.js";
 import "./item-menu.css";
@@ -180,7 +180,7 @@ export function ItemMenuButton({
     >
       <DropdownMenu.Trigger asChild>
         <IconButton
-          icon={KebabHorizontalIcon}
+          icon={EllipsisIcon}
           variant="tertiary"
           size={size}
           aria-label={label}

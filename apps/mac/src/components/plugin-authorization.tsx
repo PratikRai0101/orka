@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { PlugIcon, XIcon } from "@primer/octicons-react";
+import { PlugIcon, XIcon } from "lucide-react";
 import { Button } from "./button.js";
 import { IconButton } from "./icon-button.js";
 import { Overlay } from "./overlay.js";
