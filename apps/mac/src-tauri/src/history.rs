@@ -544,16 +544,26 @@ impl History {
 
 pub fn session_files(tool: &str, path: &Path, scope: Option<&Path>) -> Result<Vec<Value>> {
     if tool == "codex" {
-        let history = History::local(path, scope)?;
+        let mut history = History::local(path, scope)?;
         let id = &history.rollouts.last().ok_or("Empty history")?.id;
         let latest = current_path(path, id)?;
-        return if latest == path {
-            history.files()
-        } else {
-            History::local(&latest, scope)?.files()
-        };
+        if latest != path {
+            history = History::local(&latest, scope)?;
+        }
+        for rollout in &mut history.rollouts {
+            rollout
+                .records
+                .iter_mut()
+                .for_each(crate::session_redaction::SessionRedactor::redact);
+        }
+        history.rebase_offsets();
+        return history.files();
     }
-    let bytes = native::encode(&native::complete_records(&read(path, None)?)?);
+    let mut records = native::complete_records(&read(path, None)?)?;
+    records
+        .iter_mut()
+        .for_each(crate::session_redaction::SessionRedactor::redact);
+    let bytes = native::encode(&records);
     Ok(vec![
         json!({"path":"session.jsonl","hash":db::blob(&bytes)?,"size":bytes.len(),"executable":false}),
     ])
