@@ -9,8 +9,8 @@ import {
   ChevronDownIcon,
   DownloadIcon,
   CopyIcon,
-  TerminalIcon,
-} from "@primer/octicons-react";
+  SquareTerminalIcon,
+} from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Project, ProjectResource } from "../types.js";
 import { Button } from "./button.js";
@@ -40,7 +40,7 @@ function AppIcon({
   const icon = option?.icon;
   const localIcon = icon && icon !== failed ? icon : undefined;
   if (!localIcon && option?.destination !== "desktop" && option)
-    return <Icon icon={TerminalIcon} />;
+    return <Icon icon={SquareTerminalIcon} />;
   return (
     <span className="ui-icon" aria-hidden="true">
       <img

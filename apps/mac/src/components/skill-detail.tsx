@@ -1,9 +1,5 @@
 import React, { useLayoutEffect, useRef, useState } from "react";
-import {
-  ChecklistIcon,
-  DownloadIcon,
-  GitPullRequestIcon,
-} from "@primer/octicons-react";
+import { ListChecksIcon, DownloadIcon, GitPullRequestIcon } from "lucide-react";
 import type {
   Project,
   ProjectResource as Resource,
@@ -141,7 +137,7 @@ export function SkillDetail({
           <span className="skill-action-badge">
             <IconButton
               ref={incomingRef}
-              icon={ChecklistIcon}
+              icon={ListChecksIcon}
               size="sm"
               variant="tertiary"
               aria-label={
