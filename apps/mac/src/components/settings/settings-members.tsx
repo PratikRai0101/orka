@@ -1,7 +1,7 @@
 import { HistoryIcon, MailIcon, UserPlusIcon } from "lucide-react";
 import { RepositoryRequests } from "../repository-connections.js";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Project, ProjectMember, Snapshot } from "../../types.js";
 import {
   governanceCall,
@@ -207,6 +207,7 @@ export function SettingsMembers({
     [projectId],
   );
   const scope = useWorkspaceScope();
+  const client = useQueryClient();
   // The last catalog the service returned, stored natively for this profile.
   const stored = state.governance?.find(
     (entry) => entry.projectId === projectId,
@@ -223,13 +224,30 @@ export function SettingsMembers({
     refetchOnMount: "always",
   });
   const { refetch } = catalog;
-  // A policy change refetches in place, so a failed refresh keeps the list.
-  const revision = useRef([projectId, project.policyRevision]);
+  // Cancel even an initial read before refetching: otherwise Query deduplicates
+  // it and a response from the old policy can consume the invalidation.
+  const revision = useRef([scope, projectId, project.policyRevision]);
   useEffect(() => {
-    const [id, value] = revision.current;
-    revision.current = [projectId, project.policyRevision];
-    if (id === projectId && value !== project.policyRevision) void refetch();
-  }, [projectId, project.policyRevision, refetch]);
+    const [previousScope, id, value] = revision.current;
+    revision.current = [scope, projectId, project.policyRevision];
+    if (
+      previousScope !== scope ||
+      id !== projectId ||
+      value === project.policyRevision
+    )
+      return;
+    const filters = {
+      queryKey: ["governance-catalog", scope, projectId],
+      exact: true,
+    };
+    let active = true;
+    void client.cancelQueries(filters).then(() => {
+      if (active) void client.refetchQueries({ ...filters, type: "active" });
+    });
+    return () => {
+      active = false;
+    };
+  }, [client, scope, projectId, project.policyRevision]);
   const [extended, setExtended] = useState(false);
   useEffect(() => {
     if (!catalog.isFetching) return;
