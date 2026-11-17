@@ -61,29 +61,14 @@ function renderTable() {
 const row = (title: string) => screen.getByText(title).closest("tr")!;
 const waitForMenu = () => act(() => new Promise((done) => setTimeout(done)));
 
-/**
- * jsdom does no hit-testing, so model WebKit's: a press lands on the nearest
- * element whose pointer events are on, and the click goes to the common
- * ancestor of where the press went down and where it came up.
- */
-function hit(element: Element): Element {
-  for (let node: Element | null = element; node; node = node.parentElement) {
-    const value = (node as HTMLElement).style.pointerEvents;
-    if (value === "none") return document.documentElement;
-    if (value) return element;
-  }
-  return element;
-}
+/** A full left-button press, as WebKit dispatches it, on one element. */
 async function press(element: Element) {
-  const down = hit(element);
-  fireEvent.pointerDown(down, { pointerType: "mouse" });
-  fireEvent.mouseDown(down);
+  fireEvent.pointerDown(element, { pointerType: "mouse" });
+  fireEvent.mouseDown(element);
   await waitForMenu();
-  const up = hit(element);
-  fireEvent.mouseUp(up);
-  let target: Node = down;
-  while (!target.contains(up)) target = target.parentNode!;
-  fireEvent.click(target);
+  fireEvent.pointerUp(element, { pointerType: "mouse" });
+  fireEvent.mouseUp(element);
+  fireEvent.click(element);
 }
 
 beforeEach(() => {
@@ -134,6 +119,8 @@ test("clicking another row to dismiss a menu does not open that row", async () =
   fireEvent.contextMenu(screen.getByText("Fix login"));
   await waitForMenu();
   expect(screen.getByRole("menu")).toBeTruthy();
+  // The rest of the window stays available to assistive technology.
+  expect(row("Write docs").closest("[aria-hidden]")).toBeNull();
 
   await press(screen.getByText("Write docs"));
   expect(screen.queryByRole("menu")).toBeNull();

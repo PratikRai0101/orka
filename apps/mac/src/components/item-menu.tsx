@@ -75,6 +75,27 @@ function MenuItems({
   ));
 }
 
+/**
+ * Native macOS menus swallow the click that dismisses them. Radix's modal mode
+ * would too, but it also hides the rest of the window from assistive
+ * technology, so the menus stay non-modal and drop that one click instead.
+ */
+function swallowDismissingClick() {
+  const stop = (event: Event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    disarm();
+  };
+  // A press that ends without a click, such as a right-click, must not
+  // swallow the click of the next press.
+  const disarm = () => {
+    document.removeEventListener("click", stop, true);
+    document.removeEventListener("pointerdown", disarm, true);
+  };
+  document.addEventListener("click", stop, true);
+  document.addEventListener("pointerdown", disarm, true);
+}
+
 export function ItemContextMenu({
   actions,
   label,
@@ -91,8 +112,8 @@ export function ItemContextMenu({
   const [open, setOpen] = useState(false);
   if (!actions.length) return children;
   return (
-    // Modal, so the click that dismisses the menu cannot reach the item below.
     <ContextMenu.Root
+      modal={false}
       onOpenChange={(value) => {
         setOpen(value);
         if (value) selected.current = false;
@@ -143,6 +164,7 @@ export function ItemContextMenu({
           className="item-menu-content"
           aria-label={label}
           collisionPadding={10}
+          onPointerDownOutside={swallowDismissingClick}
           onClick={(event) => event.stopPropagation()}
           onKeyDown={(event) => event.stopPropagation()}
           onCloseAutoFocus={(event) => {
@@ -185,6 +207,7 @@ export function ItemMenuButton({
   const selected = useRef(false);
   return (
     <DropdownMenu.Root
+      modal={false}
       onOpenChange={(open) => {
         if (open) selected.current = false;
       }}
@@ -207,6 +230,7 @@ export function ItemMenuButton({
           align="end"
           sideOffset={5}
           collisionPadding={10}
+          onPointerDownOutside={swallowDismissingClick}
           onClick={(event) => event.stopPropagation()}
           onKeyDown={(event) => event.stopPropagation()}
           onCloseAutoFocus={(event) => {
