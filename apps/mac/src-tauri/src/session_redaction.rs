@@ -21,7 +21,12 @@ static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----").unwrap()
 });
 static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^([ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*[=:][ \t]*)("[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]+)"#).unwrap()
+    Regex::new(r"(?m)^([ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*[=:][ \t]*)[^\r\n]+")
+        .unwrap()
+});
+static JSON_STRING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:(("(?:\\[^\r\n]|[^"\\\r\n])*")\s*:\s*))?("(?:\\[^\r\n]|[^"\\\r\n])*")"#)
+        .unwrap()
 });
 
 impl SessionRedactor {
@@ -43,7 +48,32 @@ impl SessionRedactor {
     }
 
     pub(crate) fn text(text: &str) -> String {
-        let text = PRIVATE_KEY.replace_all(text, "[REDACTED]");
+        // Walk JSON string tokens without collapsing duplicate fields or parsing
+        // numeric values. Only re-encode strings whose contents actually change.
+        let text = JSON_STRING.replace_all(text, |c: &Captures<'_>| {
+            let Ok(value) = serde_json::from_str::<String>(&c[3]) else {
+                return c[0].to_owned();
+            };
+            let secret = c
+                .get(2)
+                .and_then(|key| serde_json::from_str::<String>(key.as_str()).ok())
+                .is_some_and(|key| SECRET_NAME.is_match(&key));
+            let redacted = if secret {
+                "[REDACTED]".into()
+            } else {
+                Self::text(&value)
+            };
+            if redacted == value {
+                c[0].to_owned()
+            } else {
+                format!(
+                    "{}{}",
+                    c.get(1).map_or("", |prefix| prefix.as_str()),
+                    serde_json::to_string(&redacted).unwrap()
+                )
+            }
+        });
+        let text = PRIVATE_KEY.replace_all(&text, "[REDACTED]");
         let text = ASSIGNMENT.replace_all(&text, |c: &Captures<'_>| {
             if SECRET_NAME.is_match(&c[2]) {
                 format!("{}[REDACTED]", &c[1])
