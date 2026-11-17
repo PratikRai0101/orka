@@ -9,6 +9,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ProjectResource } from "../types.js";
 import { ResourceMenuProvider } from "./resource-menu.js";
 import { ResourceTable } from "./resource-table.js";
+import { WorkspaceCacheProvider } from "./workspace-cache.js";
 
 const session = (resourceId: string, title: string) =>
   ({
@@ -29,31 +30,35 @@ const resources = [session("a", "Fix login"), session("b", "Write docs")];
 function renderTable() {
   const onOpen = vi.fn();
   const state = {
+    profile: "test",
+    config: { apiUrl: "https://test.example", syncMinutes: 5 },
     user: "me",
     projects: [{ id: "project", name: "Project", role: "owner" }],
   } as never;
   render(
-    <ResourceMenuProvider
-      resources={resources}
-      scope="test"
-      state={state}
-      busy={false}
-      act={vi.fn()}
-      onOpen={vi.fn()}
-      onReview={vi.fn()}
-      onNotice={vi.fn()}
-      onError={vi.fn()}
-      onRefresh={vi.fn()}
-    >
-      <ResourceTable
+    <WorkspaceCacheProvider state={state}>
+      <ResourceMenuProvider
         resources={resources}
-        label="Sessions"
-        user="me"
-        displayTitle={(resource) => resource.title}
-        conflicted={new Set()}
-        onOpen={onOpen}
-      />
-    </ResourceMenuProvider>,
+        scope="test"
+        state={state}
+        busy={false}
+        act={vi.fn()}
+        onOpen={vi.fn()}
+        onReview={vi.fn()}
+        onNotice={vi.fn()}
+        onError={vi.fn()}
+        onRefresh={vi.fn()}
+      >
+        <ResourceTable
+          resources={resources}
+          label="Sessions"
+          user="me"
+          displayTitle={(resource) => resource.title}
+          conflicted={new Set()}
+          onOpen={onOpen}
+        />
+      </ResourceMenuProvider>
+    </WorkspaceCacheProvider>,
   );
   return onOpen;
 }
