@@ -130,3 +130,52 @@ test("clicking another row to dismiss a menu does not open that row", async () =
   await press(screen.getByText("Write docs"));
   expect(onOpen).toHaveBeenCalledWith("b");
 });
+
+const openMenu = {
+  "right-click": () => fireEvent.contextMenu(screen.getByText("Fix login")),
+  "…": () =>
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "Actions for Fix login" }),
+      {
+        key: "Enter",
+      },
+    ),
+};
+
+/** A secondary press on empty window chrome, in the order WebKit sends it. */
+function rightClickChrome() {
+  const chrome = document.body;
+  fireEvent.pointerDown(chrome, { button: 2, pointerType: "mouse" });
+  fireEvent.mouseDown(chrome, { button: 2 });
+  fireEvent.contextMenu(chrome, { button: 2 });
+  fireEvent.pointerUp(chrome, { button: 2, pointerType: "mouse" });
+  fireEvent.mouseUp(chrome, { button: 2 });
+}
+
+// Enter sends keydown then click. A screen reader can send the click alone.
+const activations = {
+  Enter: (element: Element) => {
+    fireEvent.keyDown(element, { key: "Enter" });
+    fireEvent.click(element);
+    fireEvent.keyUp(element, { key: "Enter" });
+  },
+  "a screen reader": (element: Element) => fireEvent.click(element),
+};
+
+for (const [menu, open] of Object.entries(openMenu))
+  for (const [name, activate] of Object.entries(activations))
+    test(`after a right-click dismisses the ${menu} menu, ${name} still opens a row`, async () => {
+      const onOpen = renderTable();
+      open();
+      await waitForMenu();
+      expect(screen.getByRole("menu")).toBeTruthy();
+
+      rightClickChrome();
+      await waitForMenu();
+      expect(screen.queryByRole("menu")).toBeNull();
+
+      const opener = screen.getByText("Write docs");
+      opener.focus();
+      activate(opener);
+      expect(onOpen).toHaveBeenCalledWith("b");
+    });

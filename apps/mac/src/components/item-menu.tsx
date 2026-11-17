@@ -81,19 +81,35 @@ function MenuItems({
  * technology, so the menus stay non-modal and drop that one click instead.
  */
 function swallowDismissingClick() {
+  let timer = 0;
   const stop = (event: Event) => {
     event.preventDefault();
     event.stopPropagation();
     disarm();
   };
-  // A press that ends without a click, such as a right-click, must not
-  // swallow the click of the next press.
-  const disarm = () => {
-    document.removeEventListener("click", stop, true);
-    document.removeEventListener("pointerdown", disarm, true);
+  // WebKit sends a press's click in the same task as its pointerup, so a timer
+  // started there runs after that click. A right-click has no click, and the
+  // timer still clears the guard before anything else can be activated.
+  const settle = () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(disarm);
   };
-  document.addEventListener("click", stop, true);
-  document.addEventListener("pointerdown", disarm, true);
+  const listeners = {
+    click: stop,
+    pointerup: settle,
+    pointercancel: settle,
+    // A press whose pointerup never arrives, for example one released
+    // outside the window, ends at the next press or key.
+    pointerdown: disarm,
+    keydown: disarm,
+  };
+  function disarm() {
+    window.clearTimeout(timer);
+    for (const [type, listener] of Object.entries(listeners))
+      document.removeEventListener(type, listener, true);
+  }
+  for (const [type, listener] of Object.entries(listeners))
+    document.addEventListener(type, listener, true);
 }
 
 export function ItemContextMenu({
