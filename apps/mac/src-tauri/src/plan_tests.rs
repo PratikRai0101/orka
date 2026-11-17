@@ -32,6 +32,156 @@ fn resources(f: &Fixture) -> Vec<Value> {
         .collect()
 }
 
+fn session_project(f: &Fixture) -> Value {
+    let mut project = f.project.clone();
+    project["sharing"] =
+        json!({"memory":false,"skill":false,"session":true,"plan":false,"env":false});
+    project
+}
+
+#[test]
+fn negative_history_cache_skips_unchanged_unrelated_transcripts() {
+    let f = Fixture::new();
+    let project = session_project(&f);
+    let mut paths = Vec::new();
+    for tool in ["claude", "codex"] {
+        let path = write_session(&f, tool, &uuid::Uuid::new_v4().to_string(), &[]);
+        let bytes = fs::read_to_string(&path).unwrap().replace(
+            f.root.to_str().unwrap(),
+            f.root.with_file_name("outside").to_str().unwrap(),
+        );
+        fs::write(&path, &bytes).unwrap();
+        if tool == "codex" {
+            let compressed = path.with_extension("jsonl.zst");
+            fs::write(
+                &compressed,
+                zstd::stream::encode_all(bytes.as_bytes(), 0).unwrap(),
+            )
+            .unwrap();
+            paths.push((compressed, (0, 1)));
+        }
+        paths.push((path, if tool == "claude" { (1, 0) } else { (0, 1) }));
+    }
+    for _ in 0..2 {
+        indexer::scan(&f.db, &project).unwrap();
+        assert!(f.resources().is_empty());
+        assert!(f.outbox().is_empty());
+        for (path, expected) in &paths {
+            assert_eq!(
+                crate::history::read_counts(path),
+                *expected,
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn negative_history_cache_rechecks_same_size_edits_with_newer_mtime() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let f = Fixture::new();
+    let project = session_project(&f);
+    for tool in ["claude", "codex"] {
+        let path = write_session(&f, tool, &uuid::Uuid::new_v4().to_string(), &[]);
+        let related = fs::read_to_string(&path).unwrap();
+        let unrelated = related.replace(
+            f.root.to_str().unwrap(),
+            f.root.with_file_name("outside").to_str().unwrap(),
+        );
+        assert_eq!(related.len(), unrelated.len());
+        fs::write(&path, unrelated).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let before = UNIX_EPOCH + Duration::new(1_700_000_000, 10);
+        let after = UNIX_EPOCH + Duration::new(1_700_000_000, 11);
+        file.set_times(fs::FileTimes::new().set_modified(before))
+            .unwrap();
+        indexer::scan(&f.db, &project).unwrap();
+        assert!(!f.resources().iter().any(|r| r["source"] == tool));
+        fs::write(&path, related).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(after))
+            .unwrap();
+        assert_eq!(file.metadata().unwrap().modified().unwrap(), after);
+        indexer::scan(&f.db, &project).unwrap();
+        assert_eq!(
+            f.resources().iter().filter(|r| r["source"] == tool).count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn negative_history_cache_keeps_related_sessions_on_repeated_scans() {
+    let f = Fixture::new();
+    let project = session_project(&f);
+    for tool in ["claude", "codex"] {
+        write_session(&f, tool, &uuid::Uuid::new_v4().to_string(), &[]);
+    }
+    indexer::scan(&f.db, &project).unwrap();
+    let resources = f.resources();
+    let outbox = f.outbox();
+    assert_eq!(resources.len(), 2);
+    indexer::scan(&f.db, &project).unwrap();
+    assert_eq!(f.resources(), resources);
+    assert_eq!(f.outbox(), outbox);
+    let first = indexer::discover(&f.db, &project, "session").unwrap();
+    let second = indexer::discover(&f.db, &project, "session").unwrap();
+    assert_eq!(second.len(), 2);
+    for (before, after) in first.iter().zip(&second) {
+        assert_eq!(before["resource"], after["resource"]);
+        assert_eq!(before["updatedAt"], after["updatedAt"]);
+    }
+}
+
+#[test]
+fn negative_history_cache_scopes_results_to_each_source() {
+    let f = Fixture::new();
+    let other = f.root.with_file_name("outside");
+    fs::create_dir(&other).unwrap();
+    let mut project = session_project(&f);
+    project["sources"] = json!([
+        {"id":"first","path":f.root}, {"id":"second","path":other}
+    ]);
+    for root in [&f.root, &other] {
+        for tool in ["claude", "codex"] {
+            let path = write_session(&f, tool, &uuid::Uuid::new_v4().to_string(), &[]);
+            let bytes = fs::read_to_string(&path)
+                .unwrap()
+                .replace(f.root.to_str().unwrap(), root.to_str().unwrap());
+            fs::write(path, bytes).unwrap();
+        }
+    }
+    indexer::scan(&f.db, &project).unwrap();
+    let first = f.resources();
+    assert_eq!(first.len(), 4);
+    indexer::scan(&f.db, &project).unwrap();
+    assert_eq!(f.resources(), first);
+    for source in ["first", "second"] {
+        assert_eq!(first.iter().filter(|r| r["sourceId"] == source).count(), 2);
+    }
+}
+
+#[test]
+fn negative_history_cache_rechecks_changed_root_and_source() {
+    let f = Fixture::new();
+    let other = f.root.with_file_name("outside");
+    fs::create_dir(&other).unwrap();
+    let mut project = session_project(&f);
+    let path = write_session(&f, "claude", &uuid::Uuid::new_v4().to_string(), &[]);
+    let bytes = fs::read_to_string(&path)
+        .unwrap()
+        .replace(f.root.to_str().unwrap(), other.to_str().unwrap());
+    fs::write(&path, bytes).unwrap();
+    indexer::scan(&f.db, &project).unwrap();
+    project["sourceId"] = json!("another-source");
+    indexer::scan(&f.db, &project).unwrap();
+    assert_eq!(crate::history::read_counts(&path), (2, 0));
+    assert!(f.resources().is_empty());
+    project["path"] = json!(other);
+    indexer::scan(&f.db, &project).unwrap();
+    assert_eq!(f.resources().len(), 1);
+}
+
 #[test]
 fn plan_only_scan_skips_unrelated_codex_histories_before_parsing_their_bodies() {
     let f = Fixture::new();
