@@ -1,8 +1,8 @@
 {
   "repository": "https://github.com/whysosaket/orka-api",
-  "commit": "b60d32968c23102049c4816d1fbe3032e3bc87a0",
+  "commit": "71c3752a82f4cd936cd63140978e6163a3b42fc2",
   "candidate": false,
-  "sourceTreeSha256": "252223a8c9e6e3de54c5580483a3b97bea52d1a2c31245faedd15d1af5790776",
+  "sourceTreeSha256": "9fd13a50d46621e81b3f7383be03944697592b68012364695fcc8043f8ceb38f",
   "files": [
     {
       "path": ".dockerignore",
@@ -186,7 +186,7 @@
     },
     {
       "path": "docs/orka-plugin.md",
-      "sha256": "0f3999913bb70fef3a2898d84f07062d0c219a3c0abf3bf5b3e8e4c788452cb2",
+      "sha256": "1f0ebe1082849c29f662fe74ec8696b0bdfa7b35d9e0a7aa7d2a87dcafa80e01",
       "mode": 420
     },
     {
@@ -366,7 +366,7 @@
     },
     {
       "path": "internal/server/mcp-tools.json",
-      "sha256": "5ae6710ed5d53861210de69608fb29b29db888683b5d7b231723f7d76556b028",
+      "sha256": "5a3b72499b3035887dcb305d8efaa743dc9e6b07d0d70b2c3d06bf4d41184221",
       "mode": 420
     },
     {
@@ -426,7 +426,7 @@
     },
     {
       "path": "internal/server/reader.go",
-      "sha256": "24c870859c40cb0734e4bb2b19491da6df15ca3047767e8159679701b69ecffb",
+      "sha256": "311d8346c46b36cff64b7a2fa8f7bf25d2c3ccd322ef8da35b33b4022c84d8a0",
       "mode": 420
     },
     {
@@ -566,7 +566,7 @@
     },
     {
       "path": "packages/protocol/src/mcp.ts",
-      "sha256": "2f87b26752b9683e80fed5fd443989dd3d8679bfcdd1d2fbc8c643c05d36b987",
+      "sha256": "440274049d10dbfcd65c4bcd5c4e2c45ab12a688137b49c6ad7212b2d4408d3c",
       "mode": 420
     },
     {
@@ -891,7 +891,7 @@
     },
     {
       "path": "tests/mcp.integration.ts",
-      "sha256": "a261a90a80ebf761bac25bc01f9e2543c505a46ca7373ff0a66a351de35ffb5c",
+      "sha256": "4dd31a9a8576b11f70501cee96732a493c00d58633c05a549b3c6ad6b7b70a71",
       "mode": 420
     },
     {
