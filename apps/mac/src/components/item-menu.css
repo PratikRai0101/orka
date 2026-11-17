@@ -412,3 +412,17 @@
 .resource-command-button-size {
   visibility: hidden;
 }
+
+/* Ring the item a context menu belongs to, as Finder does. */
+[data-item-menu-open]:not(.resource-detail, tr) {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.resource-table tbody tr[data-item-menu-open] > * {
+  background: color-mix(
+    in srgb,
+    var(--surface-tertiary) 60%,
+    var(--surface-secondary)
+  );
+}
