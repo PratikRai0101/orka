@@ -3,6 +3,7 @@ import * as ContextMenu from "@radix-ui/react-context-menu";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { ChevronRightIcon, KebabHorizontalIcon } from "@primer/octicons-react";
 import { IconButton } from "./icon-button.js";
+import { hasNativeTextMenu } from "../hooks/use-web-view-menu-policy.js";
 import "./item-menu.css";
 
 export interface ItemMenuAction {
@@ -15,24 +16,6 @@ export interface ItemMenuAction {
   separator?: boolean;
   children?: ItemMenuAction[];
   restoreFocus?: boolean;
-}
-
-export function hasNativeTextMenu(target: EventTarget | null) {
-  if (!(target instanceof Element)) return false;
-  if (
-    target.closest(
-      'input, textarea, [contenteditable]:not([contenteditable="false"]), a[href], [data-native-context-menu]',
-    )
-  )
-    return true;
-  const selection = window.getSelection();
-  return Boolean(
-    selection &&
-    !selection.isCollapsed &&
-    selection.anchorNode &&
-    (target.contains(selection.anchorNode) ||
-      selection.containsNode(target, true)),
-  );
 }
 
 function MenuItems({
