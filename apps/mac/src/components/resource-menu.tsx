@@ -1,4 +1,17 @@
-import { FileIcon, RefreshCwIcon } from "lucide-react";
+import {
+  CodeIcon,
+  CopyIcon,
+  DownloadIcon,
+  EyeIcon,
+  FileIcon,
+  FolderIcon,
+  GitCompareIcon,
+  GitForkIcon,
+  LinkIcon,
+  RefreshCwIcon,
+  TrashIcon,
+  UploadIcon,
+} from "lucide-react";
 import React, {
   createContext,
   useContext,
@@ -170,6 +183,16 @@ export function resourceViewMenuActions(
   return items;
 }
 
+/** Actions not listed here open, copy or locate the item. */
+const actionGroups: Record<string, string> = {
+  share: "share",
+  "review-incoming": "share",
+  "review-outgoing": "share",
+  "review-instructions": "share",
+  export: "share",
+  delete: "remove",
+};
+
 function ResourceMenuTarget({
   resource,
   file,
@@ -222,12 +245,14 @@ function ResourceMenuTarget({
   if (resource.kind === "session") {
     items.push({
       id: "launch",
+      icon: GitForkIcon,
       label: "Continue or fork in…",
       disabled: context.busy,
       onSelect: () => context.request("launch", resource),
     });
     items.push({
       id: "prompt",
+      icon: CopyIcon,
       label: "Copy session prompt",
       disabled: context.busy,
       onSelect: () => copy(actions.sessionPrompt, "Session prompt copied"),
@@ -242,6 +267,7 @@ function ResourceMenuTarget({
   } else {
     items.push({
       id: "editor",
+      icon: CodeIcon,
       label: "Open in editor",
       disabled: context.busy || !connected,
       reason: !connected
@@ -251,6 +277,7 @@ function ResourceMenuTarget({
     });
     items.push({
       id: "content",
+      icon: CopyIcon,
       label: resource.kind === "skill" ? "Copy file content" : "Copy content",
       disabled: context.busy,
       onSelect: () =>
@@ -267,6 +294,7 @@ function ResourceMenuTarget({
     if (shared && !resource.localChanges)
       items.push({
         id: "compare",
+        icon: GitCompareIcon,
         label: "Compare with previous revision",
         onSelect: () => context.onOpen(resource, true),
       });
@@ -274,6 +302,7 @@ function ResourceMenuTarget({
   if (shared)
     items.push({
       id: "link",
+      icon: LinkIcon,
       label: resource.localChanges ? "Copy shared snapshot link" : "Copy link",
       onSelect: () =>
         copy(
@@ -287,6 +316,7 @@ function ResourceMenuTarget({
   if (connected) {
     items.push({
       id: "reveal",
+      icon: FolderIcon,
       label: "Show in Finder",
       disabled: context.busy,
       onSelect: () =>
@@ -297,6 +327,7 @@ function ResourceMenuTarget({
     });
     items.push({
       id: "path",
+      icon: CopyIcon,
       label: "Copy local path",
       disabled: context.busy,
       onSelect: () =>
@@ -320,8 +351,8 @@ function ResourceMenuTarget({
   )
     items.push({
       id: "share",
+      icon: UploadIcon,
       label: "Share snapshot with project…",
-      separator: true,
       disabled: context.busy || !connected,
       reason: !connected
         ? "Connect this repository on this Mac first"
@@ -331,12 +362,14 @@ function ResourceMenuTarget({
   if (review.incoming)
     items.push({
       id: "review-incoming",
+      icon: EyeIcon,
       label: "Review local update…",
       onSelect: () => context.onReview(resource, "incoming"),
     });
   if (review.outgoing)
     items.push({
       id: "review-outgoing",
+      icon: EyeIcon,
       label: "Review local edits…",
       onSelect: () => context.onReview(resource, "outgoing"),
     });
@@ -348,12 +381,14 @@ function ResourceMenuTarget({
   )
     items.push({
       id: "review-instructions",
+      icon: EyeIcon,
       label: "Review local update…",
       onSelect: () => context.onReview(resource, "incoming"),
     });
   if (resource.kind !== "memory")
     items.push({
       id: "export",
+      icon: DownloadIcon,
       label:
         resource.kind === "session"
           ? "Download session (.zip)…"
@@ -365,11 +400,11 @@ function ResourceMenuTarget({
   if (canDeleteSharedResource(resource, project, context.state))
     items.push({
       id: "delete",
+      icon: TrashIcon,
       label:
         resource.kind === "session"
           ? "Remove from history…"
           : `Delete shared ${resource.kind}…`,
-      separator: true,
       danger: true,
       disabled: context.busy,
       onSelect: () => context.request("delete", resource),
@@ -377,6 +412,9 @@ function ResourceMenuTarget({
   return children(
     items.map((item) => ({
       ...item,
+      group: extraActions.includes(item)
+        ? item.group
+        : (actionGroups[item.id] ?? "item"),
       restoreFocus: ![
         "open",
         "compare",

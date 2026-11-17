@@ -3,12 +3,19 @@ import React, { useRef, useState } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { IconButton } from "./icon-button.js";
+import type { IconGlyph } from "./icons.js";
 import { hasNativeTextMenu } from "../hooks/use-web-view-menu-policy.js";
 import "./item-menu.css";
+
+/** The most top-level entries one item menu should show. */
+export const ITEM_MENU_CAP = 8;
 
 export interface ItemMenuAction {
   id: string;
   label: string;
+  icon?: IconGlyph;
+  /** Actions in one group sit together; a separator divides two groups. */
+  group?: string;
   onSelect: () => void;
   disabled?: boolean;
   reason?: string;
@@ -16,6 +23,39 @@ export interface ItemMenuAction {
   separator?: boolean;
   children?: ItemMenuAction[];
   restoreFocus?: boolean;
+}
+
+/** Whether a separator goes above each action. */
+function separators(actions: ItemMenuAction[]) {
+  let group: string | undefined;
+  return actions.map((action, index) => {
+    const changed =
+      action.group !== undefined &&
+      group !== undefined &&
+      action.group !== group;
+    group = action.group ?? group;
+    return index > 0 && (Boolean(action.separator) || changed);
+  });
+}
+
+function ActionLabel({
+  action,
+  iconSlot,
+}: {
+  action: ItemMenuAction;
+  iconSlot: boolean;
+}) {
+  return (
+    <>
+      {action.icon ? (
+        <action.icon className="item-menu-icon" size={16} aria-hidden />
+      ) : (
+        // Keeps labels aligned when only some actions have an icon.
+        iconSlot && <span className="item-menu-icon" aria-hidden />
+      )}
+      <span className="item-menu-label">{action.label}</span>
+    </>
+  );
 }
 
 function MenuItems({
@@ -28,9 +68,11 @@ function MenuItems({
   onSelect: (action: ItemMenuAction) => void;
 }) {
   const Menu = contextual ? ContextMenu : DropdownMenu;
-  return actions.map((action) => (
+  const separated = separators(actions);
+  const iconSlot = actions.some((action) => action.icon);
+  return actions.map((action, index) => (
     <React.Fragment key={action.id}>
-      {action.separator && <Menu.Separator className="item-menu-separator" />}
+      {separated[index] && <Menu.Separator className="item-menu-separator" />}
       {action.children?.length ? (
         <Menu.Sub>
           <Menu.SubTrigger
@@ -38,7 +80,7 @@ function MenuItems({
             disabled={action.disabled}
             title={action.reason}
           >
-            {action.label}
+            <ActionLabel action={action} iconSlot={iconSlot} />
             <ChevronRightIcon size={14} aria-hidden="true" />
           </Menu.SubTrigger>
           <Menu.Portal>
@@ -68,7 +110,7 @@ function MenuItems({
             action.onSelect();
           }}
         >
-          {action.label}
+          <ActionLabel action={action} iconSlot={iconSlot} />
         </Menu.Item>
       )}
     </React.Fragment>
