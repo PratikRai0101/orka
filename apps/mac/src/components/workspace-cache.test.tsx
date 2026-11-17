@@ -1,10 +1,16 @@
-import { Profiler, StrictMode } from "react";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { Profiler, StrictMode, useState } from "react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import type { Resource } from "@portable/protocol";
 import type { Inspection } from "../types.js";
-import { WorkspaceCacheProvider } from "./workspace-cache.js";
+import { WorkspaceCache, WorkspaceCacheProvider } from "./workspace-cache.js";
 import { useResourceView } from "./use-resource-view.js";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -35,15 +41,50 @@ const inspection = (content: string): Inspection => ({
   paths: null,
 });
 
-function Reader() {
-  // Keep query identity unchanged to exercise the provider's isolation.
-  const view = useResourceView(resource.resourceId, resource, [], "inspection");
+type WorkspaceState = Parameters<typeof WorkspaceCacheProvider>[0]["state"];
+
+function Reader({ workspace = state }: { workspace?: WorkspaceState }) {
+  const view = useResourceView(
+    resource.resourceId,
+    resource,
+    [],
+    WorkspaceCache.scope(workspace),
+  );
   return view.inspection ? (
     <p>{view.inspection.content}</p>
   ) : (
     <p role="status">Loading inspection…</p>
   );
 }
+
+function WorkspacePage({ workspace }: { workspace: WorkspaceState }) {
+  const [reading, setReading] = useState(false);
+  return reading ? (
+    <section role="dialog" aria-label="Skill reader">
+      <Reader workspace={workspace} />
+    </section>
+  ) : (
+    <button onClick={() => setReading(true)}>Read skill</button>
+  );
+}
+
+test("keeps the selected page and open dialog while clearing workspace data", async () => {
+  vi.mocked(invoke).mockResolvedValue(inspection("Alice's skill"));
+  const tree = (workspace: WorkspaceState) => (
+    <WorkspaceCacheProvider state={workspace}>
+      <WorkspacePage workspace={workspace} />
+    </WorkspaceCacheProvider>
+  );
+  const { rerender } = render(tree(state));
+  fireEvent.click(screen.getByRole("button", { name: "Read skill" }));
+  expect(await screen.findByText("Alice's skill")).toBeTruthy();
+
+  vi.mocked(invoke).mockResolvedValue(inspection("Bob's skill"));
+  rerender(tree({ ...state, user: "bob" }));
+  expect(screen.getByRole("dialog", { name: "Skill reader" })).toBeTruthy();
+  expect(screen.queryByText("Alice's skill")).toBeNull();
+  expect(await screen.findByText("Bob's skill")).toBeTruthy();
+});
 
 test("discards an inspection that finishes after switching workspace", async () => {
   let finish: (value: Inspection) => void = () => {};
@@ -54,7 +95,7 @@ test("discards an inspection that finishes after switching workspace", async () 
   );
   const tree = (user: string) => (
     <WorkspaceCacheProvider state={{ ...state, user }}>
-      <Reader />
+      <Reader workspace={{ ...state, user }} />
     </WorkspaceCacheProvider>
   );
   const { rerender } = render(tree("alice"));
@@ -122,7 +163,7 @@ test.each([
     vi.mocked(invoke).mockResolvedValue(inspection("Alice's skill"));
     const tree = (workspace: typeof next) => (
       <WorkspaceCacheProvider state={workspace}>
-        {workspace.user && <Reader />}
+        {workspace.user && <Reader workspace={workspace} />}
       </WorkspaceCacheProvider>
     );
     const { rerender } = render(tree(state));

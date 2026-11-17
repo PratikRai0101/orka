@@ -33,11 +33,18 @@ export function useResourceView(
   resource: Resource | undefined,
   conflicts: SessionConflict[],
   scope: string,
+  deviceId?: string,
 ): ResourceView {
   const loaded = Boolean(resource);
   const defaultFile =
     resource?.kind === "skill" ? "SKILL.md" : (resource?.files[0]?.path ?? "");
-  const selectionKey = JSON.stringify([scope, resourceId, loaded, defaultFile]);
+  const selectionKey = JSON.stringify([
+    scope,
+    deviceId,
+    resourceId,
+    loaded,
+    defaultFile,
+  ]);
   const [file, setFile] = useState(defaultFile);
   const [selection, setSelection] = useState(selectionKey);
   const [preview, setPreview] = useState("");
@@ -73,6 +80,7 @@ export function useResourceView(
     queryKey: [
       "resource-inspection",
       scope,
+      deviceId,
       resource?.projectId,
       id,
       resource?.revision,

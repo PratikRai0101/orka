@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Snapshot } from "../types.js";
 
@@ -30,16 +30,13 @@ export function WorkspaceCacheProvider({
   state: Pick<Snapshot, "profile" | "user" | "config">;
   children: ReactNode;
 }) {
-  return (
-    <WorkspaceCacheBoundary key={WorkspaceCache.scope(state)}>
-      {children}
-    </WorkspaceCacheBoundary>
-  );
-}
-
-function WorkspaceCacheBoundary({ children }: { children: ReactNode }) {
-  // Remount observers with the client so no previous account can be read.
   const [client] = useState(WorkspaceCache.createClient);
+  const scope = WorkspaceCache.scope(state);
+  useLayoutEffect(() => {
+    // Removing queries also cancels their in-flight reads. Keep the new scope's
+    // queries, which consumers may already have created during this render.
+    client.removeQueries({ predicate: (query) => query.queryKey[1] !== scope });
+  }, [client, scope]);
   useEffect(() => () => client.clear(), [client]);
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }

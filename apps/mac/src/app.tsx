@@ -88,7 +88,10 @@ import { useSessionTitles } from "./components/use-session-titles.js";
 import { useLocalResources } from "./components/use-local-resources.js";
 import { resourceCatalog } from "./components/resource-catalog.js";
 import { useWorkspace } from "./components/use-workspace.js";
-import { WorkspaceCacheProvider } from "./components/workspace-cache.js";
+import {
+  WorkspaceCache,
+  WorkspaceCacheProvider,
+} from "./components/workspace-cache.js";
 import { useAccount } from "./components/use-account.js";
 import { MemberNamesProvider } from "./components/member-names.js";
 import { LoadingProvider } from "./components/loading-region.js";
@@ -186,11 +189,7 @@ function WorkspaceApp({
   const { notify } = useToasts();
   const updates = useDesktopUpdates();
   const account = useAccount(state.config, !state.user);
-  const workspaceScope = JSON.stringify([
-    state.profile,
-    state.user,
-    state.config?.apiUrl,
-  ]);
+  const workspaceScope = WorkspaceCache.scope(state);
   useBackgroundRepositoryAccess(state);
   const [repositorySetup, setRepositorySetup] = useState("");
   const setup = useProjectSetup(
@@ -421,12 +420,8 @@ function WorkspaceApp({
     resource,
     state.user ? selected : undefined,
     state.conflicts,
-    JSON.stringify([
-      state.profile,
-      state.user,
-      state.config?.apiUrl,
-      state.deviceId,
-    ]),
+    workspaceScope,
+    state.deviceId,
   );
   useEffect(() => {
     if (comparison && selected?.resourceId === comparison) {
