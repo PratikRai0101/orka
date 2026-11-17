@@ -1,7 +1,11 @@
 import { useRef } from "react";
-import { useInfiniteQuery, type QueryKey } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  type QueryClient,
+  type QueryKey,
+} from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
-import type { SessionPage } from "../types.js";
+import type { ProjectResource, SessionPage } from "../types.js";
 import { useWorkspaceScope } from "./workspace-cache.js";
 
 const SESSION_PAGE_SIZE = 40;
@@ -15,6 +19,36 @@ const SESSION_PAGE_LIMIT = 200;
 export class SessionMessagesQuery {
   static key(scope: string, id: string, conflict: string, content: string) {
     return ["session-messages", scope, id, conflict, content] as const;
+  }
+
+  static options(scope: string, id: string, conflict: string, content: string) {
+    return {
+      queryKey: this.key(scope, id, conflict, content),
+      staleTime: Infinity,
+      queryFn: (context: { pageParam: { offset: number; limit: number } }) =>
+        invoke<SessionPage>("session_messages", {
+          id,
+          conflictId: conflict || null,
+          ...context.pageParam,
+        }),
+    };
+  }
+
+  static prefetch(
+    client: QueryClient,
+    scope: string,
+    session: ProjectResource,
+  ) {
+    if (session.kind !== "session") return;
+    return client.prefetchInfiniteQuery({
+      ...this.options(
+        scope,
+        session.resourceId,
+        "",
+        session.files.map((file) => file.hash).join(":"),
+      ),
+      initialPageParam: { offset: 0, limit: SESSION_PAGE_SIZE },
+    });
   }
 
   /** Whether two keys read the same session and conflict, at any content. */
@@ -34,7 +68,7 @@ export function useSessionMessages(
   conflictId: string,
   contentKey: string,
 ) {
-  const key = SessionMessagesQuery.key(
+  const options = SessionMessagesQuery.options(
     useWorkspaceScope(),
     id,
     conflictId,
@@ -44,8 +78,7 @@ export function useSessionMessages(
   // reader's place instead of collapsing to the first page.
   const shown = useRef(0);
   const query = useInfiniteQuery({
-    queryKey: key,
-    staleTime: Infinity,
+    ...options,
     initialPageParam: {
       offset: 0,
       limit: Math.min(
@@ -59,15 +92,9 @@ export function useSessionMessages(
         ? { offset, limit: SESSION_PAGE_SIZE }
         : undefined;
     },
-    queryFn: ({ pageParam }) =>
-      invoke<SessionPage>("session_messages", {
-        id,
-        conflictId: conflictId || null,
-        ...pageParam,
-      }),
     placeholderData: (previous, previousQuery) =>
       previousQuery &&
-      SessionMessagesQuery.sameSession(previousQuery.queryKey, key)
+      SessionMessagesQuery.sameSession(previousQuery.queryKey, options.queryKey)
         ? previous
         : undefined,
   });
