@@ -171,6 +171,46 @@ mod doctor_tests {
         assert!(!report.output.contains("/not-a-connected-source"));
     }
     #[test]
+    fn doctor_ignores_unconnected_sources_alongside_healthy_connected_folders() {
+        let (f, session) = Setup::fixture();
+        let mut project = f.project.clone();
+        project["path"] = Value::Null;
+        project["sources"] = json!([
+            {"id":"connected","path":f.root},
+            {"id":"disconnected","path":null,"folderIdentity":null},
+            {"id":"remote"}
+        ]);
+        let id = project["id"].as_str().unwrap();
+        db::upsert(&f.db, "projects", id, "", &project).unwrap();
+        let report = Setup::check(&f, Ok(session));
+        assert_eq!(report.code, 0, "{}", report.output);
+        assert_eq!(report.output.matches("PASS claude hooks:").count(), 1);
+        assert_eq!(report.output.matches("PASS codex hooks:").count(), 1);
+        assert!(!report.output.contains("WARN Hooks"));
+    }
+    #[test]
+    fn doctor_reports_no_connected_folders_for_unconnected_registrations() {
+        let (f, session) = Setup::fixture();
+        let mut project = f.project.clone();
+        project["path"] = Value::Null;
+        for sources in [
+            json!([{"id":"disconnected","path":null}, {"id":"remote"}]),
+            Value::Null,
+        ] {
+            project["sources"] = sources;
+            let id = project["id"].as_str().unwrap();
+            db::upsert(&f.db, "projects", id, "", &project).unwrap();
+            let report = Setup::check(&f, Ok(session.clone()));
+            assert_eq!(report.code, 2, "{}", report.output);
+            assert!(report
+                .output
+                .contains("WARN Hooks: No connected source folders to inspect."));
+            assert!(!report.output.contains("Source folder unavailable"));
+            assert!(!report.output.contains("claude hooks:"));
+            assert!(!report.output.contains("codex hooks:"));
+        }
+    }
+    #[test]
     fn doctor_reports_unreadable_hooks_and_unavailable_or_disconnected_sources() {
         let (f, session) = Setup::fixture();
         let path = f.root.join(".claude/settings.local.json");

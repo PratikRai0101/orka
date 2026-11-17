@@ -63,8 +63,10 @@ impl Doctor {
         let mut roots = BTreeSet::new();
         let mut any = false;
         for source in projects.iter().flat_map(sources::views) {
+            let Some(path) = source["path"].as_str() else {
+                continue;
+            };
             any = true;
-            let path = source["path"].as_str().unwrap_or("");
             if path.is_empty() || sources::validate(&source).is_err() {
                 self.record(
                     "Hooks",
