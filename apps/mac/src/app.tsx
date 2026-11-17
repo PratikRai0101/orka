@@ -134,6 +134,27 @@ export function App() {
     return () => document.removeEventListener("contextmenu", menu);
   }, []);
   const workspace = useWorkspace();
+  if (!workspace.hasSnapshot)
+    return (
+      <main className="app-startup" data-tauri-drag-region>
+        <div className="app-startup__content">
+          {workspace.refreshError ? (
+            <>
+              <p className="content-message" role="alert">
+                Could not load Orka: {workspace.refreshError}
+              </p>
+              <Button onClick={() => void workspace.refresh().catch(() => {})}>
+                Try again
+              </Button>
+            </>
+          ) : (
+            <p className="content-message" role="status">
+              Loading…
+            </p>
+          )}
+        </div>
+      </main>
+    );
   return (
     <LoadingProvider
       scope={JSON.stringify([
