@@ -74,9 +74,9 @@ mod doctor_tests {
         }
     }
     #[test]
-    fn doctor_sync_freshness_uses_the_interval_with_a_five_minute_floor() {
+    fn doctor_sync_freshness_allows_one_jitter_window_with_a_five_minute_floor() {
         let (f, session) = Setup::fixture();
-        for (minutes, age, code) in [(1, 299, 0), (1, 301, 2), (10, 1199, 0), (10, 1201, 2)] {
+        for (minutes, age, code) in [(1, 299, 0), (1, 301, 2), (10, 1319, 0), (10, 1321, 2)] {
             let config = json!({"apiUrl":"https://d.invalid","syncMinutes":minutes});
             Setup::set(&f, "config", config);
             let at = (chrono::Utc::now() - chrono::Duration::seconds(age)).to_rfc3339();

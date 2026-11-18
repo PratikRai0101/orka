@@ -2,6 +2,7 @@ use crate::{
     auth,
     db::{self, Result},
     indexer, native, packages,
+    sync_schedule::{Interval, Schedule, Turn},
 };
 use fs2::FileExt;
 use rusqlite::params;
@@ -1125,7 +1126,7 @@ async fn pull(owner: &str, db: &mut rusqlite::Connection, project: &str, name: &
     Ok(())
 }
 pub async fn once() -> Result<()> {
-    cycle().await.map(|_| ())
+    cycle(&Turn::All).await.map(|_| ())
 }
 pub(crate) async fn onboarding_once(scope: Option<(&str, &str)>) -> Result<()> {
     // The current onboarding job already owns its retry lock.
@@ -1141,10 +1142,10 @@ enum WorkspaceSync {
 }
 
 // Item failures retain retry backoff without reporting a connectivity failure.
-async fn cycle() -> Result<bool> {
+async fn cycle(turn: &Turn) -> Result<bool> {
     let preparation = crate::onboarding::resume_pending_connections().await;
     // Only a service-wide failure should prevent unrelated projects from syncing.
-    workspace_cycle(
+    workspace_turn(
         preparation.or_else(|error| {
             if service_error(&error) {
                 Err(error)
@@ -1155,6 +1156,7 @@ async fn cycle() -> Result<bool> {
         None,
         None,
         None,
+        turn,
     )
     .await
     .map(|outcome| match outcome {
@@ -1168,6 +1170,42 @@ async fn workspace_cycle(
     project_filter: Option<&str>,
     connection: Option<&crate::plugin_connection::Binding>,
 ) -> Result<WorkspaceSync> {
+    workspace_turn(preparation, scope, project_filter, connection, &Turn::All).await
+}
+
+struct SyncSlot {
+    _file: fs::File,
+}
+
+impl SyncSlot {
+    async fn acquire(base: &Path) -> Result<Self> {
+        fs::create_dir_all(base).map_err(|e| e.to_string())?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(base.join("sync-slot.lock"))
+            .map_err(|e| e.to_string())?;
+        loop {
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+}
+
+async fn workspace_turn(
+    preparation: Result<()>,
+    scope: Option<(&str, &str)>,
+    project_filter: Option<&str>,
+    connection: Option<&crate::plugin_connection::Binding>,
+    turn: &Turn,
+) -> Result<WorkspaceSync> {
+    let _slot = SyncSlot::acquire(&db::base_root()?).await?;
     let _lock = crate::projects::lock()?;
     if let Some(connection) = connection {
         connection.check_current()?;
@@ -1184,12 +1222,14 @@ async fn workspace_cycle(
         crate::projects::active(&db, project)?;
     }
     if project_filter.is_none() {
-        db::set(&db, "syncHandledRequest", &db::get(&db, "syncRequest")?)?;
+        if matches!(turn, Turn::All) {
+            db::set(&db, "syncHandledRequest", &db::get(&db, "syncRequest")?)?;
+        }
         let _ = crate::account_profile::flush_pending().await;
     }
     progress(&db, "Preparing sync", None, 0, None)?;
     let result = match preparation {
-        Ok(()) => sync_workspace(&mut db, &owner, project_filter).await,
+        Ok(()) => sync_workspace(&mut db, &owner, project_filter, turn).await,
         Err(error) => Err(error),
     };
     let status_key = project_filter
@@ -1302,6 +1342,7 @@ async fn sync_workspace(
     db: &mut rusqlite::Connection,
     owner: &str,
     project_filter: Option<&str>,
+    turn: &Turn,
 ) -> Result<WorkspaceSync> {
     if crate::projects::foreground_waiting()? {
         return Ok(WorkspaceSync::Yielded);
@@ -1330,6 +1371,10 @@ async fn sync_workspace(
             queue_session_copy(db, &binding, &device)?;
         }
     }
+    let in_turn = |project: &Value| {
+        project_filter.is_none_or(|id| project["id"] == id)
+            && turn.includes(project["id"].as_str().unwrap_or(""))
+    };
     let local = db::rows(
         db,
         &format!(
@@ -1339,7 +1384,7 @@ async fn sync_workspace(
         &[],
     )?
     .into_iter()
-    .filter(|p| project_filter.is_none_or(|id| p["id"] == id))
+    .filter(in_turn)
     .collect::<Vec<_>>();
     if project_filter.is_none() {
         crate::history::clear_missing_session_errors(db)?;
@@ -1392,7 +1437,7 @@ async fn sync_workspace(
         &[],
     )?
     .into_iter()
-    .filter(|p| project_filter.is_none_or(|id| p["id"] == id))
+    .filter(in_turn)
     .collect::<Vec<_>>();
     let mut blocked_projects = HashSet::new();
     for p in &local {
@@ -1717,9 +1762,29 @@ async fn sync_workspace(
     }
     let devices = api_as(owner, "GET", "/v2/devices", None).await?;
     crate::device_metadata::update_devices(db, &devices)?;
-    let has_errors: bool = db
-        .query_row("SELECT EXISTS(SELECT 1 FROM errors)", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
+    let has_errors: bool = if matches!(turn, Turn::All) {
+        db.query_row("SELECT EXISTS(SELECT 1 FROM errors)", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+    } else {
+        // An error in another project should not shorten this turn's interval.
+        let errors = db::rows(
+            db,
+            "SELECT json_object('source', errors.source, 'project', resources.project)
+             FROM errors LEFT JOIN resources ON resources.id=errors.source",
+            &[],
+        )?;
+        local.iter().filter_map(|p| p["id"].as_str()).any(|id| {
+            errors.iter().any(|error| {
+                error["project"] == id
+                    || error["source"] == id
+                    || error["source"].as_str().is_some_and(|source| {
+                        source
+                            .strip_prefix(id)
+                            .is_some_and(|suffix| suffix.starts_with(':'))
+                    })
+            })
+        })
+    };
     Ok(WorkspaceSync::Complete(!deferred.is_empty() || has_errors))
 }
 
@@ -1890,11 +1955,8 @@ async fn run_mode(foreground: bool) {
         return;
     }
     let executable_identity = db::executable_identity().unwrap_or_default();
-    let mut next = Instant::now();
-    let mut last_request = String::new();
-    let mut last_user = String::new();
-    let mut last_sync = Instant::now();
-    let mut retry = 30;
+    let mut schedule = Schedule::default();
+    let mut last_request = None;
     let mut beat = Instant::now();
     let mut network_poll = Instant::now();
     let mut network = String::new();
@@ -1911,8 +1973,7 @@ async fn run_mode(foreground: bool) {
             return;
         }
         let cfg = db::get(&db, "config").unwrap_or(json!({}));
-        let interval =
-            Duration::from_secs(cfg["syncMinutes"].as_u64().unwrap_or(15).clamp(1, 1440) * 60);
+        let interval = Interval::from_config(&cfg);
         let request = db::get(&db, "syncRequest")
             .unwrap_or(Value::Null)
             .as_str()
@@ -1938,8 +1999,18 @@ async fn run_mode(foreground: bool) {
         } else {
             false
         };
-        let requested = request != last_request || user != last_user || reconnect;
-        let due = Instant::now() >= next || last_sync.elapsed() >= interval;
+        let handled = last_request.get_or_insert_with(|| {
+            db::get(&db, "syncHandledRequest")
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        });
+        let now = Instant::now();
+        let turn = if !user.is_empty() && schedule.observe(&db, now).is_ok() {
+            schedule.turn(now, &interval, request != *handled || reconnect)
+        } else {
+            None
+        };
         db::set(
             &db,
             "daemon",
@@ -1951,21 +2022,10 @@ async fn run_mode(foreground: bool) {
             .and_then(|db| crate::onboarding::snapshot(&db))
             .is_ok_and(|value| value["active"] == true);
         let onboarding_sync = crate::onboarding::sync_running().unwrap_or(false);
-        if !onboarding_active && !onboarding_sync && !user.is_empty() && (requested || due) {
-            last_request = request;
-            last_user = user.clone();
-            match cycle().await {
-                Ok(false) => {
-                    last_sync = Instant::now();
-                    next = Instant::now() + interval;
-                    retry = 30;
-                }
-                Ok(true) | Err(_) => {
-                    next = Instant::now() + Duration::from_secs(retry);
-                    retry = (retry * 2).min(interval.as_secs());
-                    last_sync = Instant::now();
-                }
-            }
+        if let Some(turn) = turn.filter(|_| !onboarding_active && !onboarding_sync) {
+            last_request = Some(request);
+            let result = cycle(&turn).await;
+            schedule.finish(&turn, Instant::now(), &interval, &result);
         }
         if !onboarding_active && !user.is_empty() && Instant::now() >= beat {
             let _ = heartbeat().await;
@@ -1978,6 +2038,23 @@ async fn run_mode(foreground: bool) {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn another_profile_waits_for_the_shared_sync_slot() {
+        let base = tempfile::tempdir().unwrap();
+        let first = SyncSlot::acquire(base.path()).await.unwrap();
+        let mut second = std::pin::pin!(SyncSlot::acquire(base.path()));
+        tokio::select! {
+            biased;
+            _ = &mut second => panic!("second profile entered an occupied slot"),
+            _ = std::future::ready(()) => {}
+        }
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     fn queued(sequence: i64, resource: &str) -> Value {
         json!({"sequence":sequence,"id":format!("request-{sequence}"),"project":"project","path":"/v2/sync/push","value":{"resource":{"resourceId":resource,"kind":"memory"}}})
