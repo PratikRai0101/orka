@@ -112,11 +112,23 @@ pub(crate) async fn register_device(owner: &str, origin: &str, device: &str) -> 
     api_at(owner, origin, "POST", "/v2/devices", Some(&registration)).await?;
     Ok(())
 }
-pub(crate) async fn upload(owner: &str, project: &str, files: &[Value]) -> Result<()> {
+pub(crate) async fn upload(owner: &str, project: &str, resource: &Value) -> Result<()> {
+    use crate::session_redaction::SessionRedactor;
+
+    let session = resource["kind"] == "session";
+    if let Some(title) = resource["title"].as_str().filter(|_| session) {
+        SessionRedactor::check_upload(title.as_bytes())?;
+    }
+    let files = resource["files"]
+        .as_array()
+        .ok_or("Local upload: missing files")?;
     packages::reject_env_files(files).map_err(|e| format!("Local upload: {e}"))?;
     for f in files {
         let hash = f["hash"].as_str().ok_or("Local upload: missing hash")?;
         let bytes = db::blob_read(hash).map_err(|e| format!("Local upload: {e}"))?;
+        if session {
+            SessionRedactor::check_upload(&bytes)?;
+        }
         let response = request(owner, "PUT", &format!("/v2/blobs/{project}/{hash}"))
             .await?
             .body(bytes)
