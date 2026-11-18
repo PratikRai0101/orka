@@ -209,6 +209,7 @@ function WorkspaceApp({
     setError,
     state.config?.apiUrl,
     (id) => setRepositorySetup(id),
+    state.projects,
   );
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const reducedMotion = useReducedMotion();
@@ -1124,6 +1125,7 @@ function WorkspaceApp({
             run={(action) => void act(action)}
             sharing={setup.sharing}
             onSharingChange={setup.setSharing}
+            invite={setup.invite}
             busy={busy}
             error={error}
             onChange={setup.setInput}
