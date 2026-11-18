@@ -98,3 +98,48 @@ test("a confirmed missing email does not revive the cached account email", async
   await expect(self.locator("p")).toHaveCount(0);
   await expect(self.getByText("Morgan Taylor", { exact: true })).toBeVisible();
 });
+
+test("a policy change during the initial Members read obtains the latest catalog", async ({
+  page,
+}) => {
+  await page.clock.install();
+  const settings = await settingsFixture(page);
+  await page.evaluate(() => {
+    const w = window as any;
+    const original = w.__TAURI_INTERNALS__.invoke;
+    w.memberCatalogReads = 0;
+    w.__TAURI_INTERNALS__.invoke = async (command: string, args: any) => {
+      if (command === "governance_command" && args.action === "catalog") {
+        w.memberCatalogReads++;
+        if (w.memberCatalogReads === 1) {
+          const previous = structuredClone(w.settingsCatalog);
+          await new Promise<void>((resolve) => {
+            w.finishPreviousCatalog = resolve;
+          });
+          return previous;
+        }
+      }
+      return original(command, args);
+    };
+  });
+  await settings.getByRole("button", { name: "Members", exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).memberCatalogReads))
+    .toBe(1);
+  await page.evaluate(() => {
+    const w = window as any;
+    w.settingsState.projects[0].policyRevision++;
+    w.settingsCatalog.policyRevision++;
+    w.settingsCatalog.members = [
+      { id: "owner", name: "Current owner", role: "owner" },
+      { id: "new-member", name: "New teammate", role: "member" },
+    ];
+  });
+  await page.clock.runFor(3100);
+  await expect(settings).toContainText("New teammate");
+  await page.evaluate(() => (window as any).finishPreviousCatalog());
+  await expect(settings).toContainText("New teammate");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).memberCatalogReads))
+    .toBe(2);
+});
