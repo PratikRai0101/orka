@@ -3,10 +3,11 @@ import {
   useInfiniteQuery,
   useQueryClient,
   type InfiniteData,
+  type QueryClient,
   type QueryKey,
 } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
-import type { SessionPage } from "../types.js";
+import type { ProjectResource, SessionPage } from "../types.js";
 import { useWorkspaceScope } from "./workspace-cache.js";
 
 const SESSION_PAGE_SIZE = 40;
@@ -20,6 +21,36 @@ const SESSION_PAGE_LIMIT = 200;
 export class SessionMessagesQuery {
   static key(scope: string, id: string, conflict: string, content: string) {
     return ["session-messages", scope, id, conflict, content] as const;
+  }
+
+  static options(scope: string, id: string, conflict: string, content: string) {
+    return {
+      queryKey: this.key(scope, id, conflict, content),
+      staleTime: Infinity,
+      queryFn: (context: { pageParam: { offset: number; limit: number } }) =>
+        invoke<SessionPage>("session_messages", {
+          id,
+          conflictId: conflict || null,
+          ...context.pageParam,
+        }),
+    };
+  }
+
+  static prefetch(
+    client: QueryClient,
+    scope: string,
+    session: ProjectResource,
+  ) {
+    if (session.kind !== "session") return;
+    return client.prefetchInfiniteQuery({
+      ...this.options(
+        scope,
+        session.resourceId,
+        "",
+        session.files.map((file) => file.hash).join(":"),
+      ),
+      initialPageParam: { offset: 0, limit: SESSION_PAGE_SIZE },
+    });
   }
 
   /** Whether two keys read the same session and conflict, at any content. */
@@ -42,7 +73,13 @@ export function useSessionMessages(
 ) {
   const scope = useWorkspaceScope();
   const client = useQueryClient();
-  const key = SessionMessagesQuery.key(scope, id, conflictId, contentKey);
+  const options = SessionMessagesQuery.options(
+    scope,
+    id,
+    conflictId,
+    contentKey,
+  );
+  const key = options.queryKey;
   // A pending read may have captured an older native file before this visit.
   // Refetch-on-mount alone can deduplicate an existing background read.
   const pendingAtMount = useRef(
@@ -65,8 +102,7 @@ export function useSessionMessages(
   const shown =
     earlier?.pages.flatMap((page) => page.messages ?? []).length ?? 0;
   const query = useInfiniteQuery({
-    queryKey: key,
-    staleTime: Infinity,
+    ...options,
     refetchOnMount: refreshOnMount && !conflictId ? "always" : false,
     initialPageParam: {
       offset: 0,
@@ -78,12 +114,6 @@ export function useSessionMessages(
         ? { offset, limit: SESSION_PAGE_SIZE }
         : undefined;
     },
-    queryFn: ({ pageParam }) =>
-      invoke<SessionPage>("session_messages", {
-        id,
-        conflictId: conflictId || null,
-        ...pageParam,
-      }),
   });
   useEffect(() => {
     if (!pendingAtMount.current) return;

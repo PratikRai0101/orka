@@ -1,4 +1,4 @@
-import { Profiler } from "react";
+import { Profiler, useState } from "react";
 import {
   act,
   cleanup,
@@ -9,7 +9,8 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import type { SessionPage } from "../types.js";
+import type { ProjectResource, SessionPage } from "../types.js";
+import { ResourceTable } from "./resource-table.js";
 import { WorkspaceCacheProvider } from "./workspace-cache.js";
 import { useSessionMessages } from "./use-session-messages.js";
 
@@ -104,6 +105,112 @@ test("a second visit renders cached turns without a loading state", async () => 
   expect(await screen.findByText("Second turn")).toBeTruthy();
   expect(loadingCommits).not.toContain(true);
 });
+
+const resource: ProjectResource = {
+  resourceId: "session",
+  projectId: "project",
+  kind: "session",
+  source: "codex",
+  title: "Recent session",
+  logicalPath: "codex/session",
+  deleted: false,
+  files: [
+    { path: "session.jsonl", hash: "hash-a", size: 100, executable: false },
+  ],
+  hash: "hash-a",
+  revision: 1,
+  owner: "alice",
+  updatedBy: "alice",
+  updatedAt: "2026-01-01",
+};
+
+function SessionIndex({ local = false }: { local?: boolean }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <ResourceTable
+        resources={[{ ...resource, local: local ? true : undefined }]}
+        label="Session"
+        user="alice"
+        displayTitle={(item) => item.title}
+        conflicted={new Set()}
+        onOpen={() => setOpen(true)}
+      />
+      {open && <Sessions contentKey="hash-a" refreshOnMount={local} />}
+    </>
+  );
+}
+
+test("opening a local session during prefetch obtains a current native answer", async () => {
+  let finishEarlier: (value: SessionPage) => void = () => {};
+  vi.mocked(invoke)
+    .mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishEarlier = resolve;
+      }),
+    )
+    .mockResolvedValue(page("Latest native turn"));
+  render(
+    <WorkspaceCacheProvider state={state}>
+      <SessionIndex local />
+    </WorkspaceCacheProvider>,
+  );
+  fireEvent.pointerEnter(screen.getByRole("row", { name: /Recent session/ }));
+  expect(reads()).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "Recent session" }));
+  expect(await screen.findByText("Latest native turn")).toBeTruthy();
+  expect(reads()).toHaveLength(2);
+  await act(async () => finishEarlier(page("Earlier native turn")));
+  expect(screen.queryByText("Earlier native turn")).toBeNull();
+});
+
+for (const intent of ["pointerEnter", "focus"] as const) {
+  test(`${intent} warms the row, deduplicates reads and isolates scopes`, async () => {
+    vi.mocked(invoke).mockResolvedValue(page("Warmed turn"));
+    const loadingCommits: boolean[] = [];
+    const tree = (profile: string) => (
+      <WorkspaceCacheProvider state={{ ...state, profile }}>
+        <Profiler
+          id="intent"
+          onRender={() =>
+            loadingCommits.push(Boolean(screen.queryByRole("status")))
+          }
+        >
+          <SessionIndex />
+        </Profiler>
+      </WorkspaceCacheProvider>
+    );
+    const { rerender } = render(tree("work"));
+    const row = screen.getByRole("row", { name: /Recent session/ });
+    await act(async () =>
+      fireEvent[intent](
+        intent === "focus"
+          ? screen.getByRole("button", { name: "Recent session" })
+          : row,
+      ),
+    );
+    await waitFor(() => expect(reads()).toHaveLength(1));
+    await act(async () => fireEvent[intent](row));
+    expect(reads()).toHaveLength(1);
+    loadingCommits.length = 0;
+    fireEvent.click(screen.getByRole("button", { name: "Recent session" }));
+    expect(screen.getByText("Warmed turn")).toBeTruthy();
+    expect(loadingCommits).not.toContain(true);
+    expect(reads()).toHaveLength(1);
+    expect(reads()[0]?.[1]).toEqual({
+      id: "session",
+      conflictId: null,
+      offset: 0,
+      limit: 40,
+    });
+
+    vi.mocked(invoke).mockResolvedValue(page("Other scope turn"));
+    rerender(tree("personal"));
+    expect(screen.queryByText("Warmed turn")).toBeNull();
+    expect(await screen.findByText("Other scope turn")).toBeTruthy();
+    expect(reads()).toHaveLength(2);
+  });
+}
 
 test("a content change refills as many turns as were showing", async () => {
   let version = "a";
