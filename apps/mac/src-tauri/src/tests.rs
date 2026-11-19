@@ -897,7 +897,7 @@ fn exporting_a_project_writes_cached_resources_and_drafts() {
     let queued = json!({"id":"draft","projectId":id,"status":"local","createdAt":db::now(),"resource":{"resourceId":"draft-resource","kind":"memory","source":"shared","logicalPath":"knowledge/draft.md","title":"Draft","deleted":false,"files":[{"path":"content.md","hash":db::blob(draft).unwrap(),"size":draft.len(),"executable":false}]}});
     db::upsert(&f.db, "drafts", "draft", id, &queued).unwrap();
     let path = f.root.join("project.zip");
-    bundles::export_project(&f.db, id, &path).unwrap();
+    bundles::export_project(&db::CacheScope::current().unwrap(), id, &path).unwrap();
     let mut zip = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
     let mut names = Vec::new();
     for index in 0..zip.len() {
@@ -2580,6 +2580,19 @@ fn session_presentation_preview_preserves_stored_resource() {
     assert_eq!(title.as_deref(), Some("Clean up the session list"));
     assert_eq!(f.resources()[0], original);
     assert!(f.outbox().is_empty());
+    let mut corrupt = original.clone();
+    corrupt["files"][0]["hash"] = json!(db::blob(b"invalid JSON\n").unwrap());
+    db::upsert(
+        &f.db,
+        "resources",
+        &id,
+        f.project["id"].as_str().unwrap(),
+        &corrupt,
+    )
+    .unwrap();
+    assert!(
+        tauri::async_runtime::block_on(crate::commands::session_display_title(id.clone())).is_err()
+    );
     let mut deleted = original.clone();
     deleted["deleted"] = json!(true);
     db::upsert(
