@@ -94,6 +94,13 @@ a later active scan. A restore sends the held requests as ordinary changes.
 Archived-only, revoked, hidden, detached and purged projects, and catalogs
 without `purgeAfter`, capture nothing.
 
+Claude and Codex hooks keep recording the session and its sources for such a
+project, but inject no shared context until it is restored. The sidebar banner
+and the removal warning count the rows still waiting on this Mac. Export scans
+a restorable deleted project when it can take the workspace lock immediately.
+A busy workspace still exports the saved snapshot and reports that recent edits
+may be missing. Compression reads the scoped cache after the lock is released.
+
 ## Native modules
 
 `indexer.rs`, `plans.rs`, and session readers discover scoped native content. `sync.rs` handles exchange and local materialization. `codex_import.rs` and `claude_import.rs` preserve native identities. `env/` owns dotenv parsing, encryption, device approval, and guarded file writes. `db.rs` and `auth.rs` isolate local persistence and credentials.

@@ -2,6 +2,7 @@
 //! into the outbox and sends nothing until it is restored.
 use super::*;
 use crate::{
+    commands::export_project_with_capture,
     sync_queue::{Priority, SyncQueue},
     sync_schedule::Interval,
 };
@@ -49,6 +50,7 @@ impl Capture {
         service.set_nonblocking(true).unwrap();
         let url = format!("http://127.0.0.1:{}", service.local_addr().unwrap().port());
         db::set(&db, "config", &json!({"apiUrl":url})).unwrap();
+        let db = db::open().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let mut project = json!({"id":id,"name":"Deleted","role":"member","path":root});
         for (key, value) in lifecycle.as_object().unwrap() {
@@ -130,6 +132,10 @@ impl Capture {
             &[&self.id],
         )
         .unwrap()
+    }
+
+    fn held_count(&self) -> i64 {
+        indexer::held_count(&self.db, &self.id).unwrap()
     }
 
     fn kinds(&self) -> BTreeSet<String> {
@@ -880,6 +886,204 @@ async fn an_item_created_then_deleted_while_deleted_leaves_one_held_deletion() {
 }
 
 #[tokio::test]
+async fn held_count_covers_captured_and_unsent_rows_but_not_failed_ones() {
+    let f = Capture::new(restorable());
+    assert_eq!(f.held_count(), 0);
+    f.edit_memory("Captured while deleted\n");
+    assert!(matches!(f.run_job().await, Some(Outcome::Captured)));
+    assert_eq!(f.held_count(), 1);
+    // Another item captured in the same deletion adds up.
+    let skill = f.root.join(".agents/skills/release");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: release\ndescription: Ship it\n---\nSteps\n",
+    )
+    .unwrap();
+    assert!(matches!(f.run_job().await, Some(Outcome::Captured)));
+    assert_eq!(f.held_count(), 2);
+    // A row queued before the deletion that was never sent is waiting too.
+    let queued = uuid::Uuid::new_v4().to_string();
+    f.db.execute(
+        "INSERT INTO outbox VALUES(?,?,?,?,NULL)",
+        params![
+            queued,
+            f.id,
+            "/v2/sync/push",
+            json!({"id":queued,"projectId":f.id,"resource":{"resourceId":"earlier","kind":"plan"}})
+                .to_string()
+        ],
+    )
+    .unwrap();
+    assert_eq!(f.held_count(), 3);
+    // Restore retries 403s, but not other failures, even on marked rows.
+    f.db.execute(
+        "UPDATE outbox SET error='403: Project access denied' WHERE id=?",
+        [&queued],
+    )
+    .unwrap();
+    assert_eq!(f.held_count(), 3);
+    let first = f.outbox()[0]["id"].as_str().unwrap().to_owned();
+    f.db.execute(
+        "UPDATE outbox SET error=? WHERE id=?",
+        params![PLAN_REVISION_CONFLICT, first],
+    )
+    .unwrap();
+    assert_eq!(f.held_count(), 2);
+    f.db.execute("UPDATE outbox SET error=NULL WHERE id=?", [&first])
+        .unwrap();
+    f.db.execute(
+        "UPDATE outbox SET error=? WHERE id=?",
+        params![PLAN_REVISION_CONFLICT, queued],
+    )
+    .unwrap();
+    assert_eq!(f.held_count(), 2);
+    let publication = "env:test:pending:publication";
+    db::set(
+        &f.db,
+        publication,
+        &json!({"header":{"manifest":{"projectId":f.id}}}),
+    )
+    .unwrap();
+    let snapshot = crate::commands::snapshot().unwrap();
+    assert_eq!(snapshot["inactive"][0]["heldChanges"], 2);
+    assert_eq!(snapshot["inactive"][0]["pendingChanges"], 4);
+    assert_eq!(snapshot["inactive"][0]["pendingEnvPublications"], 1);
+    // A restore releases the marker just before upload, but the row is still
+    // local work waiting, so it stays counted until it leaves the outbox.
+    f.restore();
+    indexer::release_held_capture(&f.db, &first).unwrap();
+    assert_eq!(f.held_count(), 2);
+    f.db.execute("DELETE FROM outbox WHERE id=?", [&first])
+        .unwrap();
+    assert_eq!(f.held_count(), 1);
+    // Removing the local copy drops what was waiting with it.
+    crate::projects::remove_local(&f.db, &f.id).unwrap();
+    assert_eq!(f.held_count(), 0);
+    assert!(f.outbox().is_empty());
+    assert_eq!(db::get(&f.db, publication).unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn export_captures_edits_made_while_deleted() {
+    let f = Capture::new(restorable());
+    f.edit_memory("Exported while deleted\n");
+    assert!(f.outbox().is_empty());
+    let path = f.root.join("project.zip");
+    assert!(
+        !export_project_with_capture(&db::CacheScope::current().unwrap(), &f.id, &path).unwrap()
+    );
+    let rows = f.outbox();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["held"], 1);
+    let mut zip = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+    let mut header = Vec::new();
+    use std::io::Read;
+    zip.by_name("project.json")
+        .unwrap()
+        .read_to_end(&mut header)
+        .unwrap();
+    let header: Value = serde_json::from_slice(&header).unwrap();
+    assert_eq!(header["pendingChanges"], 1);
+    let prefix = format!("pending/{}/", rows[0]["id"].as_str().unwrap());
+    let hash = rows[0]["value"]["resource"]["files"][0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut exported = Vec::new();
+    zip.by_name(&format!("{prefix}blobs/{hash}"))
+        .unwrap()
+        .read_to_end(&mut exported)
+        .unwrap();
+    assert_eq!(exported, b"Exported while deleted\n");
+    // An active project is not scanned by export, so nothing new is queued.
+    f.restore();
+    let before = f.outbox();
+    assert!(
+        !export_project_with_capture(&db::CacheScope::current().unwrap(), &f.id, &path).unwrap()
+    );
+    assert_eq!(f.outbox(), before);
+}
+
+#[tokio::test]
+async fn export_keeps_held_changes_when_the_deleted_project_folder_is_missing() {
+    use std::io::Read;
+
+    let f = Capture::new(restorable());
+    f.edit_memory("Held before the folder went missing\n");
+    assert!(matches!(f.run_job().await, Some(Outcome::Captured)));
+    let rows = f.outbox();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["held"], 1);
+    fs::remove_dir_all(&f.root).unwrap();
+
+    let path = f.home.path().join("project.zip");
+    assert!(
+        export_project_with_capture(&db::CacheScope::current().unwrap(), &f.id, &path).unwrap()
+    );
+    assert_eq!(f.outbox(), rows);
+    let error: String =
+        f.db.query_row("SELECT error FROM errors WHERE source=?", [&f.id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        error.contains("folder") && error.contains("unavailable"),
+        "{error}"
+    );
+    let mut zip = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+    let header: Value = serde_json::from_reader(zip.by_name("project.json").unwrap()).unwrap();
+    assert_eq!(header["pendingChanges"], 1);
+    let id = rows[0]["id"].as_str().unwrap();
+    let hash = rows[0]["value"]["resource"]["files"][0]["hash"]
+        .as_str()
+        .unwrap();
+    let mut exported = Vec::new();
+    zip.by_name(&format!("pending/{id}/blobs/{hash}"))
+        .unwrap()
+        .read_to_end(&mut exported)
+        .unwrap();
+    assert_eq!(exported, b"Held before the folder went missing\n");
+}
+
+#[test]
+fn deleted_project_export_includes_the_latest_edit_behind_a_pending_request() {
+    use std::io::Read;
+
+    let f = Capture::new(json!({}));
+    f.edit_memory("Queued before deletion\n");
+    indexer::scan(&f.db, &f.project()).unwrap();
+    let queued = f.outbox();
+    let mut project = f.project();
+    for (key, value) in restorable().as_object().unwrap() {
+        project[key] = value.clone();
+    }
+    db::upsert(&f.db, "projects", &f.id, "", &project).unwrap();
+    f.edit_memory("Latest edit while deleted\n");
+
+    let path = f.home.path().join("project.zip");
+    assert!(
+        !export_project_with_capture(&db::CacheScope::current().unwrap(), &f.id, &path).unwrap()
+    );
+    assert_eq!(f.outbox(), queued);
+    let mut zip = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+    let header: Value = serde_json::from_reader(zip.by_name("project.json").unwrap()).unwrap();
+    assert_eq!(header["pendingChanges"], 1);
+    assert_eq!(header["drafts"], 1);
+    let draft = db::rows(&f.db, "SELECT value FROM drafts WHERE project=?", &[&f.id])
+        .unwrap()
+        .remove(0);
+    let id = draft["id"].as_str().unwrap();
+    let hash = draft["resource"]["files"][0]["hash"].as_str().unwrap();
+    let mut bytes = Vec::new();
+    zip.by_name(&format!("drafts/{id}/blobs/{hash}"))
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"Latest edit while deleted\n");
+}
+
+#[tokio::test]
 async fn a_new_embedded_plan_proposal_replaces_the_held_plan() {
     let f = Capture::new(restorable());
     let id = uuid::Uuid::new_v4().to_string();
@@ -959,4 +1163,58 @@ async fn explicit_purge_preserves_local_captures_and_guards_other_pending_work()
     let mut zip = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
     let id = drafts[0]["id"].as_str().unwrap();
     assert!(zip.by_name(&format!("drafts/{id}/blobs/{hash}")).is_ok());
+}
+
+#[tokio::test]
+async fn busy_deleted_project_export_reports_that_it_used_cached_content() {
+    let f = Capture::new(restorable());
+    f.edit_memory("Already captured\n");
+    assert!(matches!(f.run_job().await, Some(Outcome::Captured)));
+    let before = f.outbox();
+    f.edit_memory("New on disk\n");
+
+    let cache = db::CacheScope::current().unwrap();
+    let path = f.home.path().join("project.zip");
+    let workspace = crate::projects::lock().unwrap();
+    let writer = db::open().unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(export_project_with_capture(&cache, &f.id, &path).unwrap());
+    assert!(path.is_file());
+    assert_eq!(f.outbox(), before);
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(workspace);
+
+    assert!(!export_project_with_capture(&cache, &f.id, &path).unwrap());
+    let after = f.outbox();
+    let hash = after[0]["value"]["resource"]["files"][0]["hash"]
+        .as_str()
+        .unwrap();
+    assert_eq!(db::blob_read(hash).unwrap(), b"New on disk\n");
+}
+
+#[test]
+fn export_warns_when_one_repository_is_missing_and_captures_the_rest() {
+    let f = Capture::new(restorable());
+    let ready = uuid::Uuid::new_v4();
+    let missing = uuid::Uuid::new_v4();
+    let mut project = f.project();
+    project["sources"] = json!([
+        {"id": ready, "name": "Attached", "path": f.root},
+        {"id": missing, "name": "Missing", "path": f.home.path().join("missing")}
+    ]);
+    db::upsert(&f.db, "projects", &f.id, &f.id, &project).unwrap();
+    f.edit_memory("Edit from the available repository\n");
+
+    let cache = db::CacheScope::current().unwrap();
+    let path = f.home.path().join("project.zip");
+    assert!(export_project_with_capture(&cache, &f.id, &path).unwrap());
+    let rows = f.outbox();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["value"]["resource"]["sourceId"], ready.to_string());
+    let hash = rows[0]["value"]["resource"]["files"][0]["hash"]
+        .as_str()
+        .unwrap();
+    let id = rows[0]["id"].as_str().unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+    assert!(zip.by_name(&format!("pending/{id}/blobs/{hash}")).is_ok());
 }
