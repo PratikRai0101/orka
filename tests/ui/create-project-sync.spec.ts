@@ -137,11 +137,13 @@ async function fixture(
     await dialog.getByRole("textbox", { name: "Project name" }).fill("Atlas");
     await dialog.getByRole("button", { name: "Add folders" }).click();
   }
+  const footer = dialog.locator(".create-project-footer");
+  const restingFooter = await footer.boundingBox();
   await dialog
     .getByRole("button", { name: `${mode} project`, exact: true })
     .click();
   await expect(progress(dialog)).toContainText("Waiting for sync to finish.");
-  return dialog;
+  return { dialog, footer, restingFooter };
 }
 
 const invite = `orka://join/${"ab".repeat(24)}`;
@@ -159,7 +161,7 @@ const release = (page: Page, outcome: Outcome) =>
 test("one Create click waits for sync, keeps the choices and opens the project", async ({
   page,
 }) => {
-  const dialog = await fixture(page);
+  const { dialog } = await fixture(page);
   await expect(
     dialog.getByRole("button", { name: "Waiting for sync…" }),
   ).toBeDisabled();
@@ -190,7 +192,7 @@ test("one Create click waits for sync, keeps the choices and opens the project",
 test("Cancel stops a create that is waiting for sync without an error", async ({
   page,
 }) => {
-  const dialog = await fixture(page);
+  const { dialog } = await fixture(page);
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await expect(progress(dialog)).toHaveText("Cancelling…");
   await expect(dialog.getByRole("button", { name: "Cancel" })).toBeDisabled();
@@ -211,7 +213,7 @@ test("Cancel stops a create that is waiting for sync without an error", async ({
 test("Escape while waiting cancels instead of hiding a pending create", async ({
   page,
 }) => {
-  const dialog = await fixture(page);
+  const { dialog } = await fixture(page);
   await page.keyboard.press("Escape");
   await expect(progress(dialog)).toHaveText("Cancelling…");
   await release(page, "cancelled");
@@ -222,9 +224,10 @@ test("at minimum window size, the wait remains visible and sends keyboard focus 
   page,
 }) => {
   await page.setViewportSize({ width: 900, height: 640 });
-  const dialog = await fixture(page);
+  const { dialog, footer, restingFooter } = await fixture(page);
   const cancel = dialog.getByRole("button", { name: "Cancel" });
   await expect(cancel).toBeFocused();
+  expect(await footer.boundingBox()).toEqual(restingFooter);
   await expect(progress(dialog)).toBeInViewport({ ratio: 1 });
   const axe = await new AxeBuilder({ page })
     .include('[role="dialog"]')
@@ -233,6 +236,7 @@ test("at minimum window size, the wait remains visible and sends keyboard focus 
   await page.keyboard.press("Enter");
   await expect(progress(dialog)).toBeInViewport({ ratio: 1 });
   await expect(progress(dialog)).toHaveText("Cancelling…");
+  expect(await footer.boundingBox()).toEqual(restingFooter);
   await release(page, "cancelled");
   await expect(
     page.getByRole("button", { name: "Add project", exact: true }),
@@ -242,7 +246,7 @@ test("at minimum window size, the wait remains visible and sends keyboard focus 
 test("an incoming invite waits for a cancellable Create to settle", async ({
   page,
 }) => {
-  const dialog = await fixture(page);
+  const { dialog } = await fixture(page);
   await page.evaluate(
     (link) => (window as unknown as Fixture).openInvite(link),
     invite,
@@ -263,7 +267,7 @@ test("an incoming invite waits for a cancellable Create to settle", async ({
 test("a late Cancel shows the service error after Join leaves the wait", async ({
   page,
 }) => {
-  const dialog = await fixture(page, { join: true });
+  const { dialog } = await fixture(page, { join: true });
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await expect(progress(dialog)).toHaveText("Cancelling…");
   await release(page, "expired");
@@ -278,7 +282,7 @@ test("a late Cancel shows the service error after Join leaves the wait", async (
 test("folder failure preserves both selections and retries only attachment", async ({
   page,
 }) => {
-  const dialog = await fixture(page, { failConnection: true });
+  const { dialog } = await fixture(page, { failConnection: true });
   await release(page, "created");
   await expect(dialog).toHaveAccessibleName("Connect project folders");
   await expect(dialog.getByRole("alert")).toContainText(

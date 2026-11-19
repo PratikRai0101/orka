@@ -1579,7 +1579,7 @@
   .change-source-folder {
     @apply w-full justify-start rounded-none;
   }
-  .create-project-status {
+  .create-project-footer .create-project-status {
     @apply m-0 min-w-0 flex-1 text-body-xs text-secondary;
   }
   .setup-error.create-project-connection-error {
