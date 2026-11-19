@@ -240,6 +240,7 @@ function WorkspaceApp({
     state.config?.apiUrl,
     (id) => setRepositorySetup(id),
     state.projects,
+    workspaceScope,
   );
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const reducedMotion = useReducedMotion();
@@ -563,7 +564,7 @@ function WorkspaceApp({
       window.clearTimeout(timer);
     };
   }, [busy, pluginRequest, state.user, workspaceScope]);
-  useDeepLinks((link) => {
+  const openDeepLink = (link: URL) => {
     if (link.hostname === "connectors") {
       openSettings("connections");
       return;
@@ -610,7 +611,8 @@ function WorkspaceApp({
         navigate();
       });
     else navigate();
-  }, !busy);
+  };
+  useDeepLinks(openDeepLink, !busy, busy || Boolean(setup.dialog));
   const selectedKind = selected?.kind;
   useEffect(() => {
     if (selectedKind) setTab(selectedKind);
@@ -1353,6 +1355,8 @@ function WorkspaceApp({
             waiting={setup.waiting}
             cancelling={setup.cancelling}
             onCancelWait={setup.cancelWait}
+            connectingFolders={setup.connectingFolders}
+            folderError={setup.folderError}
             error={error}
             onChange={setup.setInput}
             onClose={setup.close}
