@@ -314,6 +314,7 @@ fn main() {
                 commands::sync_queue_state,
                 commands::sync_progress,
                 commands::cloud_action,
+                commands::invite_preview,
                 commands::connect_project,
                 sources::connect_project_sources,
                 repositories::repository_command,
