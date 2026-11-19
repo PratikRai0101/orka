@@ -25,6 +25,9 @@ export function ProjectSetupDialog({
   mode,
   value,
   busy,
+  waiting = false,
+  cancelling = false,
+  onCancelWait,
   error,
   onChange,
   onClose,
@@ -47,6 +50,10 @@ export function ProjectSetupDialog({
   mode: ProjectSetupMode;
   value: string;
   busy: boolean;
+  /** The request is held until background sync frees the workspace. */
+  waiting?: boolean;
+  cancelling?: boolean;
+  onCancelWait?: () => void;
   error: string;
   onChange: (value: string) => void;
   onClose: () => void;
@@ -64,12 +71,12 @@ export function ProjectSetupDialog({
   const action = creating ? "Create project" : "Join project";
   const title = creating ? action : (invite?.title ?? action);
   const problem = error || invite?.error || "";
+  // While waiting, closing the dialog cancels the pending request instead.
+  const dismiss = waiting ? onCancelWait : busy ? undefined : onClose;
   return (
     <Overlay
       open
-      onClose={() => {
-        if (!busy) onClose();
-      }}
+      onClose={() => dismiss?.()}
       title={title}
       className="create-project-modal"
     >
@@ -90,8 +97,8 @@ export function ProjectSetupDialog({
             aria-label={
               creating ? "Close create project" : "Close join project"
             }
-            disabled={busy}
-            onClick={onClose}
+            disabled={!dismiss || cancelling}
+            onClick={dismiss}
           />
         </div>
         <div className="create-project-fields">
@@ -179,6 +186,15 @@ export function ProjectSetupDialog({
             disabled={busy}
             onChange={onSharingChange}
           />
+          {waiting && (
+            <p className="create-project-source-hint" role="status">
+              {cancelling
+                ? "Cancelling…"
+                : `Waiting for sync to finish. Orka will ${
+                    creating ? "create" : "join"
+                  } the project as soon as it can.`}
+            </p>
+          )}
           {problem && (
             <div className="setup-error" role="alert">
               <TriangleAlertIcon size={16} aria-hidden="true" />
@@ -187,7 +203,11 @@ export function ProjectSetupDialog({
           )}
         </div>
         <div className="create-project-footer">
-          <Button variant="tertiary" onClick={onClose} disabled={busy}>
+          <Button
+            variant="tertiary"
+            onClick={dismiss}
+            disabled={!dismiss || cancelling}
+          >
             Cancel
           </Button>
           <Button
@@ -197,7 +217,13 @@ export function ProjectSetupDialog({
               busy || !value.trim() || serviceMismatch || invite?.unavailable
             }
           >
-            {busy ? (creating ? "Creating…" : "Joining…") : action}
+            {waiting
+              ? "Waiting for sync…"
+              : busy
+                ? creating
+                  ? "Creating…"
+                  : "Joining…"
+                : action}
           </Button>
         </div>
       </form>

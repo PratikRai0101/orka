@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Project, ProjectSharing } from "../types.js";
 import type { ProjectSetupMode } from "./project-setup.js";
@@ -59,6 +59,10 @@ export function useProjectSetup(
   const [input, setInput] = useState("");
   const selection = useSourceFolders();
   const [sharing, setSharing] = useState<ProjectSharing>(defaultSharing);
+  // "waiting": the native side is holding the request until sync releases the
+  // workspace. "cancelling": the user asked to stop and the request is settling.
+  const [pending, setPending] = useState<"waiting" | "cancelling" | null>(null);
+  const cancelRequested = useRef(false);
   let inviteService: string | undefined;
   let inviteToken = "";
   if (dialog === "join") {
@@ -84,7 +88,19 @@ export function useProjectSetup(
     selection.clear();
     setSourceChoice(null);
     setSharing(defaultSharing);
+    cancelRequested.current = false;
+    setPending(null);
     setDialog(mode);
+  };
+  const close = () => {
+    setDialog(null);
+    setPending(null);
+  };
+  const cancelWait = () => {
+    if (pending !== "waiting") return;
+    cancelRequested.current = true;
+    setPending("cancelling");
+    void invoke("cancel_project_setup").catch(() => {});
   };
   const submit = async () => {
     if (!dialog) return;
@@ -106,14 +122,27 @@ export function useProjectSetup(
       }
     }
     let result: { id: string; repositorySetup?: boolean };
+    cancelRequested.current = false;
+    const onProgress = new Channel<{ waiting: boolean }>((value) =>
+      setPending((current) =>
+        current === "cancelling" ? current : value.waiting ? "waiting" : null,
+      ),
+    );
     try {
       result = await invoke("cloud_action", {
         action: dialog,
         input: creating
           ? { name: input.trim(), sharing }
           : { ...invite, sharing },
+        onProgress,
       });
     } catch (error) {
+      setPending(null);
+      if (cancelRequested.current) {
+        // Nothing was created; Cancel closes the dialog like it does otherwise.
+        close();
+        return;
+      }
       if (creating) throw error;
       // The dialog shows the reason on its own line, without the native
       // bridge's status prefix.
@@ -126,8 +155,10 @@ export function useProjectSetup(
     const known = creating
       ? undefined
       : existingProjects.find((item) => item.id === result.id);
+    // A Cancel that arrives after the workspace was free cannot stop the
+    // request, so open what it created rather than hide it.
     onProject(result.id);
-    setDialog(null);
+    close();
     setInput("");
     if (known) {
       setNotice("You’re already in this project");
@@ -169,6 +200,9 @@ export function useProjectSetup(
     setSharing,
     show,
     submit,
-    close: () => setDialog(null),
+    waiting: pending !== null,
+    cancelling: pending === "cancelling",
+    cancelWait,
+    close,
   };
 }

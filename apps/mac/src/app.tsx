@@ -1226,6 +1226,9 @@ function WorkspaceApp({
             onSharingChange={setup.setSharing}
             invite={setup.invite}
             busy={busy}
+            waiting={setup.waiting}
+            cancelling={setup.cancelling}
+            onCancelWait={setup.cancelWait}
             error={error}
             onChange={setup.setInput}
             onClose={setup.close}

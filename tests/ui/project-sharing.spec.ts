@@ -226,6 +226,7 @@ for (const size of [
         name: "My workspace",
         sharing: automaticDefault,
       },
+      onProgress: expect.anything(),
     });
     expect((await calls(page)).some((c) => c.command === "env_command")).toBe(
       false,
@@ -352,6 +353,7 @@ test("saving no categories and connecting a folder carries private defaults", as
       args: {
         action: "create",
         input: { name: "Private project", sharing: automaticDefault },
+        onProgress: expect.anything(),
       },
     },
     {
@@ -433,6 +435,7 @@ test("join carries explicit sharing choices before connecting a folder", async (
       token: inviteToken,
       sharing: { ...automaticDefault, session: true },
     },
+    onProgress: expect.anything(),
   });
 });
 
@@ -458,6 +461,7 @@ test("browser invites are parsed and bound to the selected service", async ({
       serviceUrl: "https://test.orka",
       sharing: automaticDefault,
     },
+    onProgress: expect.anything(),
   });
 });
 
