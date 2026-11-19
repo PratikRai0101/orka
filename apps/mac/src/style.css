@@ -1579,6 +1579,12 @@
   .change-source-folder {
     @apply w-full justify-start rounded-none;
   }
+  .create-project-footer .create-project-status {
+    @apply m-0 min-w-0 flex-1 text-body-xs text-secondary;
+  }
+  .setup-error.create-project-connection-error {
+    @apply mt-2 max-h-24 shrink-0 overflow-y-auto;
+  }
   .create-project-footer {
     @apply mt-4 flex shrink-0 items-center justify-end gap-4;
   }
@@ -1646,6 +1652,9 @@
   }
   .create-project-footer .ui-button--primary {
     border-radius: var(--radius-control);
+  }
+  .create-project-submit {
+    min-inline-size: 10rem;
   }
   .setup-symbol {
     @apply mb-5 flex h-11 w-11 items-center justify-center rounded-xl border border-line bg-raised text-foreground;
