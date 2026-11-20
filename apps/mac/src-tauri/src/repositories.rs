@@ -56,16 +56,16 @@ impl Context {
 }
 
 pub(crate) fn verify_remote(root: &Path, expected: &str) -> Result<()> {
-    let normalized =
-        crate::onboarding::discovery::normalize_remote(expected).ok_or("Invalid repository URL")?;
-    let key = db::digest(format!("orka-remote-v1:{normalized}").as_bytes());
-    if crate::onboarding::discovery::remote_key(root.to_str().ok_or("Invalid checkout path")?)?
-        .as_deref()
-        != Some(key.as_str())
-    {
-        return Err("This folder's Git remote does not match the linked repository. Choose the correct checkout in Source folders.".into());
+    use crate::onboarding::discovery::{key_for_remote, remote_keys};
+    let key = key_for_remote(expected).ok_or("Invalid repository URL")?;
+    let keys = remote_keys(root)?;
+    if keys.contains(&key) {
+        Ok(())
+    } else if keys.is_empty() {
+        Err("This folder has no Git remote, so Orka can't confirm it is the linked repository. Choose the checkout cloned from GitHub, or add its remote.".into())
+    } else {
+        Err("This folder's Git remote does not match the linked repository. Choose the correct checkout in Source folders.".into())
     }
-    Ok(())
 }
 fn matching_source(project: &Value, clone_url: &str) -> Result<Value> {
     let matches: Vec<_> = sources::views(project)
@@ -312,6 +312,14 @@ async fn run_git(
     Ok(())
 }
 
+pub(crate) fn binding_matches(source: &Value, repository_id: &str, revision: u64) -> bool {
+    source["repository"]["id"] == repository_id
+        && source["repository"]["revision"] == revision
+        && source["repositoryRevision"]
+            .as_u64()
+            .is_none_or(|cached| cached == revision)
+}
+
 async fn attach(context: &Context, job: &Value) -> Result<()> {
     let project = job["projectId"].as_str().ok_or("Missing project")?;
     let source_id = job["sourceId"].as_str().ok_or("Missing source")?;
@@ -348,12 +356,7 @@ async fn attach(context: &Context, job: &Value) -> Result<()> {
         eprintln!("clone catalog refresh unavailable: {error}");
     }
     let cached = source(context, project, source_id)?;
-    if cached["repository"]["id"] != repository_id
-        || cached["repository"]["revision"] != revision
-        || cached["repositoryRevision"]
-            .as_u64()
-            .is_some_and(|cached| cached != revision)
-    {
+    if !binding_matches(&cached, repository_id, revision) {
         return Err(changed.into());
     }
     let path = job["destination"]
@@ -373,6 +376,7 @@ async fn attach(context: &Context, job: &Value) -> Result<()> {
         Some(source_id.into()),
         Some((&context.user, &context.service)),
         None,
+        Some((repository_id, revision)),
         lock,
     )
     .await

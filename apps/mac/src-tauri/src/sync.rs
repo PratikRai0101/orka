@@ -6,7 +6,7 @@ use crate::{
     sync_schedule::Interval,
 };
 use fs2::FileExt;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -108,7 +108,7 @@ pub(crate) async fn api_at(
     Ok(value)
 }
 
-pub(crate) async fn register_device(owner: &str, origin: &str, device: &str) -> Result<()> {
+async fn register_device(owner: &str, origin: &str, device: &str) -> Result<Value> {
     let capabilities = api_at(owner, origin, "GET", "/v2/projects/capabilities", None)
         .await
         .unwrap_or(Value::Null);
@@ -116,7 +116,8 @@ pub(crate) async fn register_device(owner: &str, origin: &str, device: &str) -> 
     if capabilities["deviceHardware"] == 1 {
         registration["hardwareFamily"] = json!(crate::device_metadata::local_family(&db::open()?)?);
     }
-    post_device_registration(owner, origin, registration).await
+    post_device_registration(owner, origin, registration).await?;
+    Ok(capabilities)
 }
 
 pub(crate) async fn post_device_registration(
@@ -1867,9 +1868,15 @@ impl<'a> SyncPass<'a> {
             .as_str()
             .ok_or("Configure the service")?
             .to_string();
-        register_device(owner, &origin, &device).await?;
+        let capabilities = register_device(owner, &origin, &device).await?;
         let projects = api_as(owner, "GET", crate::projects::CATALOG_PATH, None).await?;
         crate::projects::merge_catalog(db, &projects)?;
+        // Reuse registration's capabilities instead of probing again for pins.
+        let origin = origin.as_str();
+        crate::sources::backfill_remote_pins(db, &capabilities, |body| async move {
+            crate::sources::post_remote_pin(owner, origin, &body).await
+        })
+        .await?;
         Ok(Continue(()))
     }
 
@@ -1884,7 +1891,7 @@ impl<'a> SyncPass<'a> {
         if p["governed"] == true {
             let id = p["id"].as_str().ok_or("Missing project")?;
             let result: Result<()> = async {
-                let local = crate::governance::project(db, id)?;
+                crate::projects::active(db, id)?;
                 let catalog = api_as(
                     owner,
                     "POST",
@@ -1896,13 +1903,12 @@ impl<'a> SyncPass<'a> {
                 // A lifecycle refusal must leave queued work unchanged. Only
                 // prepare legacy knowledge after current access is confirmed.
                 if !retry_only {
-                    crate::governance::localize_outbox(db, &local)?;
+                    crate::governance::localize_outbox(db, p)?;
                 } else {
-                    crate::governance::block_legacy_retry(db, &local)?;
+                    crate::governance::block_legacy_retry(db, p)?;
                 }
                 if !retry_only {
-                    crate::context_sharing::approve_own_pending(db, owner, &local, &catalog)
-                        .await?;
+                    crate::context_sharing::approve_own_pending(db, owner, p, &catalog).await?;
                 }
                 Ok(())
             }
@@ -1944,24 +1950,27 @@ impl<'a> SyncPass<'a> {
         }
         let blocked_projects = &mut self.blocked;
         let mut outbox = ProjectOutbox::open(db, project)?;
-        let mut queued = Vec::new();
-        for row in outbox.queued(db)? {
-            if upload_waits_for_source(db, p, &row["value"])? {
-                continue;
-            }
-            let allowed = if row["path"] == crate::selective_sharing::QUEUE_PATH {
-                crate::selective_sharing::authorized_origin(db, &row)
-                    .is_ok_and(|origin| origin.is_some())
-            } else {
-                crate::projects::sharing_allowed(
-                    p,
-                    crate::projects::queued_kind(row["path"].as_str().unwrap_or(""), &row["value"]),
-                )
-            };
-            if allowed {
-                queued.push(row);
-            }
-        }
+        let paused_sources = crate::sources::paused_upload_sources(p);
+        let queued: Vec<_> = outbox
+            .queued(db)?
+            .into_iter()
+            .filter(|q| {
+                // Unattributed older rows may belong to the paused source.
+                // Keep the bytes and request ID untouched for a verified retry.
+                if crate::sources::upload_paused(&paused_sources, &q["sourceId"]) {
+                    return false;
+                }
+                if q["path"] == crate::selective_sharing::QUEUE_PATH {
+                    crate::selective_sharing::authorized_origin(db, q)
+                        .is_ok_and(|origin| origin.is_some())
+                } else {
+                    crate::projects::sharing_allowed(
+                        p,
+                        crate::projects::queued_kind(q["path"].as_str().unwrap_or(""), &q["value"]),
+                    )
+                }
+            })
+            .collect();
         deferred.extend(
             queued
                 .iter()
@@ -2513,40 +2522,6 @@ fn sync_ready_view(db: &rusqlite::Connection, project: &Value) -> Result<(Value,
     Ok((view, waiting))
 }
 
-fn upload_waits_for_source(
-    db: &rusqlite::Connection,
-    project: &Value,
-    input: &Value,
-) -> Result<bool> {
-    let waiting = |source: &str| {
-        project["sources"].as_array().is_some_and(|sources| {
-            sources
-                .iter()
-                .any(|entry| entry["id"] == source && entry["firstSyncWaiting"] == true)
-        })
-    };
-    if let Some(source) = input["resource"]["sourceId"]
-        .as_str()
-        .or_else(|| input["sourceId"].as_str())
-        .or_else(|| input["sourceSnapshot"]["sourceId"].as_str())
-    {
-        return Ok(waiting(source));
-    }
-    let Some(resource) = input["resourceId"].as_str() else {
-        return Ok(false);
-    };
-    let source: Option<String> = db
-        .query_row(
-            "SELECT json_extract(value,'$.sourceId') FROM resources WHERE project=? AND id=?",
-            [project["id"].as_str(), Some(resource)],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .flatten();
-    Ok(source.as_deref().is_some_and(waiting))
-}
-
 fn project_has_retryable_errors(db: &rusqlite::Connection, project: &str) -> Result<bool> {
     db.query_row(
         "SELECT EXISTS(SELECT 1 FROM errors
@@ -2750,7 +2725,8 @@ impl<'p> ProjectOutbox<'p> {
 
     /// Queued rows that may be sent now, oldest first.
     fn queued(&self, db: &rusqlite::Connection) -> Result<Vec<Value>> {
-        db::rows(db, "SELECT json_object('sequence',rowid,'id',id,'project',project,'path',path,'value',json(value),'error',error) FROM outbox WHERE project=? AND (EXISTS(SELECT 1 FROM meta WHERE key='sessionOutboxRedaction:'||outbox.id) OR error IS NULL OR error NOT GLOB '4[0-9][0-9]:*' OR substr(error,1,3) IN ('401','408','429')) ORDER BY rowid", &[&self.project])
+        let source = crate::sources::OUTBOX_SOURCE;
+        db::rows(db, &format!("SELECT json_object('sequence',o.rowid,'id',o.id,'project',o.project,'path',o.path,'value',json(o.value),'error',o.error,'sourceId',{source}) FROM outbox o WHERE o.project=? AND (EXISTS(SELECT 1 FROM meta WHERE key='sessionOutboxRedaction:'||o.id) OR o.error IS NULL OR o.error NOT GLOB '4[0-9][0-9]:*' OR substr(o.error,1,3) IN ('401','408','429')) ORDER BY o.rowid"), &[&self.project])
     }
 
     fn batch<'q>(&self, queued: &'q [Value]) -> Vec<&'q Value> {
