@@ -10,9 +10,13 @@
 - [ ] Enable private vulnerability reporting and protect the public default branch after creating the public repository.
 - [ ] Label the release alpha and document known limits. Publish only the reviewed candidate.
 
+## Binary release licensing
+
+- [ ] Make the complete corresponding source for every distributed GPLv3 binary, including alpha builds, available using the exact release revision and its build scripts.
+- [ ] Collect and distribute upstream license notices and applicable corresponding-source information for the dependencies actually shipped.
+
 ## Stable binary release
 
-- [ ] Collect and distribute upstream license notices and applicable corresponding-source information for the dependencies actually shipped.
 - [ ] Verify Apple signing/notarization and signing-environment access. Keep signing secrets unavailable to pull-request code.
 
 Do not label the build release-ready until these checks have evidence from two physical Macs and the deployed EC2 service.
