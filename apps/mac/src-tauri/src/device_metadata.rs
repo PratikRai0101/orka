@@ -9,10 +9,12 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const PROBE_BUDGET: Duration = Duration::from_secs(3);
 const MAX_OUTPUT: u64 = 64_000;
+const DEVICE_NAMESPACE: Uuid = Uuid::from_u128(0x6f726b61_6465_5669_8365_5f6964656e74);
 
 fn known(value: &str) -> Option<&'static str> {
     match value {
@@ -166,6 +168,84 @@ fn detect() -> Option<&'static str> {
     None
 }
 
+/// Isolated test homes stand in for separate Macs, so they never read this one.
+fn local_probes() -> bool {
+    !(cfg!(debug_assertions) && std::env::var_os("ORKA_TEST_HOME").is_some())
+}
+
+fn probe(program: &str, args: &[&str]) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new(program);
+        command.args(args);
+        output(command, Instant::now() + Duration::from_millis(500))
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (program, args);
+        None
+    }
+}
+
+fn platform_uuid(registry: &str) -> Option<Uuid> {
+    let line = registry
+        .lines()
+        .find(|l| l.contains("\"IOPlatformUUID\""))?;
+    Uuid::parse_str(line.rsplit('"').nth(1)?).ok()
+}
+
+fn derive_id(hardware: &Uuid, account: &Uuid, profile: &str) -> String {
+    Uuid::new_v5(
+        &DEVICE_NAMESPACE,
+        format!("{hardware}:{account}:{profile}").as_bytes(),
+    )
+    .to_string()
+}
+
+/// One identity per Mac, account and profile, so a reset or reinstall returns
+/// to its existing registration. Named development profiles stay separate
+/// devices. The hardware UUID itself never leaves this Mac.
+pub fn stable_id(account: &Uuid) -> Option<String> {
+    if !local_probes() {
+        return None;
+    }
+    let registry = probe("/usr/sbin/ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])?;
+    Some(derive_id(
+        &platform_uuid(&registry)?,
+        account,
+        crate::profiles::current(),
+    ))
+}
+
+fn display_name(reported: &str) -> Option<String> {
+    let name: String = reported.trim().chars().take(100).collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Older services include the registration name in other members' presence data.
+fn registration_with_name(
+    device: &str,
+    capabilities: &Value,
+    computer_name: impl FnOnce() -> Option<String>,
+) -> Value {
+    let mut registration = json!({"id":device,"name":"Mac"});
+    if capabilities["privateDeviceNames"] == 1 {
+        if let Some(name) = computer_name().as_deref().and_then(display_name) {
+            registration["privateName"] = json!(name);
+        }
+    }
+    registration
+}
+
+pub fn registration(device: &str, capabilities: &Value) -> Value {
+    registration_with_name(device, capabilities, || {
+        local_probes()
+            .then(|| probe("/usr/sbin/scutil", &["--get", "ComputerName"]))
+            .flatten()
+    })
+}
+
 #[derive(Default)]
 struct HardwareCache {
     family: Option<&'static str>,
@@ -263,6 +343,79 @@ pub fn update_devices(db: &Connection, reported: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn device_identity_is_stable_per_mac_and_account() {
+        let registry = "+-o J1 <class IOPlatformExpertDevice>\n    {\n      \"IOPlatformSerialNumber\" = \"X\"\n      \"IOPlatformUUID\" = \"4F9B3C1A-0000-4000-8000-0123456789AB\"\n    }\n";
+        let hardware = platform_uuid(registry).unwrap();
+        assert_eq!(hardware.to_string(), "4f9b3c1a-0000-4000-8000-0123456789ab");
+        assert!(platform_uuid("\"IOPlatformUUID\" = \"unknown\"").is_none());
+        assert!(platform_uuid("").is_none());
+        let (account, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let id = derive_id(&hardware, &account, "default");
+        assert_eq!(id, derive_id(&hardware, &account, "default"));
+        assert_ne!(id, derive_id(&hardware, &other, "default"));
+        assert_ne!(id, derive_id(&hardware, &account, "worktree"));
+        assert_ne!(id, derive_id(&Uuid::new_v4(), &account, "default"));
+        assert_eq!(Uuid::parse_str(&id).unwrap().get_version_num(), 5);
+        assert!(!id.contains(&hardware.to_string()));
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_recreated_account_store_keeps_this_macs_identity() {
+        let saved = std::env::var_os("ORKA_TEST_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let (account, other) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+        let device = |path: std::path::PathBuf| db::device(&db::open_at(&path).unwrap()).unwrap();
+        std::env::set_var("ORKA_TEST_HOME", home.path());
+        let isolated = device(home.path().join("isolated").join(&account));
+        std::env::remove_var("ORKA_TEST_HOME");
+        let first = device(home.path().join("default").join(&account));
+        let recreated = device(home.path().join("recreated").join(&account));
+        let teammate = device(home.path().join("default").join(&other));
+        let guest = device(home.path().join("default").join("guest"));
+        let reopened = device(home.path().join("default").join(&account));
+        match saved {
+            Some(value) => std::env::set_var("ORKA_TEST_HOME", value),
+            None => std::env::remove_var("ORKA_TEST_HOME"),
+        }
+        assert_eq!(first, recreated);
+        assert_eq!(first, reopened);
+        assert_eq!(Uuid::parse_str(&first).unwrap().get_version_num(), 5);
+        for separate in [isolated, teammate, guest] {
+            assert_ne!(first, separate);
+        }
+    }
+    #[test]
+    fn device_name_is_trimmed_bounded_and_never_empty() {
+        assert_eq!(display_name(" Studio Mac\n").as_deref(), Some("Studio Mac"));
+        assert_eq!(display_name("  \n"), None);
+        assert_eq!(display_name(&"é".repeat(140)).unwrap().chars().count(), 100);
+    }
+    #[test]
+    fn registration_probes_the_computer_name_only_for_owner_private_services() {
+        for caps in [
+            Value::Null,
+            json!({"deviceHardware":1}),
+            json!({"selectedSharing":1}),
+            json!({"privateDeviceNames":true}),
+            json!({"privateDeviceNames":"1"}),
+            json!({"privateDeviceNames":0}),
+        ] {
+            let registration =
+                registration_with_name("device", &caps, || panic!("unexpected probe"));
+            assert_eq!(registration, json!({"id":"device","name":"Mac"}));
+        }
+        let caps = json!({"privateDeviceNames":1});
+        let registration = registration_with_name("device", &caps, || Some("Studio Mac".into()));
+        assert_eq!(
+            registration,
+            json!({"id":"device","name":"Mac","privateName":"Studio Mac"})
+        );
+        assert_eq!(
+            registration_with_name("device", &caps, || None),
+            json!({"id":"device","name":"Mac"})
+        );
+    }
     #[test]
     fn all_mac_families_use_hardware_names_and_identifiers() {
         for (model, expected) in [
