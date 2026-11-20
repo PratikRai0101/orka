@@ -224,6 +224,92 @@ pub fn resource_id(project: &Value, kind: &str, path: &str) -> Result<String> {
     Ok(indexer::resource_id(&namespace, kind, path))
 }
 
+/// Why a folder is too broad to be one project's source, if it is: syncing it
+/// would scan a whole disk, account or system area. `root` is canonical.
+pub(crate) fn too_broad(root: &Path, home: Option<&Path>) -> Option<&'static str> {
+    if root.parent().is_none() {
+        return Some("It is the top of the disk.");
+    }
+    if let Some(home) = home {
+        if root == home {
+            return Some("It is your home folder.");
+        }
+        if home.starts_with(root) {
+            return Some("It contains your home folder.");
+        }
+        if root.starts_with(home.join("Library")) {
+            return Some("It is inside your Library folder.");
+        }
+    }
+    let depth = root.components().count();
+    if (root.starts_with("/Volumes") && depth <= 3) || is_mount_root(root) {
+        return Some("It is the top of a drive.");
+    }
+    if root.starts_with("/System")
+        || root.starts_with("/Library")
+        || [
+            "/Applications",
+            "/Users",
+            "/private",
+            "/private/var",
+            "/private/etc",
+            "/var",
+            "/usr",
+            "/opt",
+            "/etc",
+        ]
+        .iter()
+        .any(|system| root == Path::new(system))
+    {
+        return Some("It is a system folder.");
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn is_mount_root(path: &Path) -> bool {
+    use std::{
+        ffi::{CString, OsStr},
+        mem::MaybeUninit,
+        os::unix::ffi::OsStrExt,
+    };
+
+    let Ok(name) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stats = MaybeUninit::<libc::statfs>::uninit();
+    // statfs initializes the structure on success and reports the mount point
+    // even when it is outside /Volumes or shares a device with its parent.
+    if unsafe { libc::statfs(name.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let stats = unsafe { stats.assume_init() };
+    let mount: Vec<u8> = stats
+        .f_mntonname
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte as u8)
+        .collect();
+    let mount = Path::new(OsStr::from_bytes(&mount));
+    mount == path || mount.canonicalize().is_ok_and(|resolved| resolved == path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_mount_root(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    fs::metadata(path)
+        .and_then(|metadata| Ok(metadata.dev() != fs::metadata(parent)?.dev()))
+        .unwrap_or(false)
+}
+
+fn home_folder() -> Option<PathBuf> {
+    dirs::home_dir().and_then(|home| home.canonicalize().ok())
+}
+
 fn canonical(raw: &str) -> Result<PathBuf> {
     let root = PathBuf::from(raw)
         .canonicalize()
@@ -398,6 +484,15 @@ pub(crate) async fn connect_sources_locked(
         .iter()
         .map(|path| canonical(path))
         .collect::<Result<Vec<_>>>()?;
+    let home = home_folder();
+    for root in &roots {
+        if let Some(reason) = too_broad(root, home.as_deref()) {
+            return Err(format!(
+                "{} can't be a source folder. {reason} Choose the project's own folder instead.",
+                root.display()
+            ));
+        }
+    }
     let mut used = BTreeSet::new();
     for root in &roots {
         if !used.insert(root.clone()) {
@@ -601,6 +696,48 @@ mod folder_state_tests {
             registration_id(&[json!({"id":"removed-id"})], &pending, root),
             "removed-id"
         );
+    }
+
+    #[test]
+    fn whole_disks_accounts_and_system_areas_are_refused_as_source_folders() {
+        let home = Path::new("/Users/alex");
+        for broad in [
+            "/",
+            "/Users",
+            "/Users/alex",
+            "/Users/alex/Library",
+            "/Users/alex/Library/Application Support",
+            "/Volumes/Backup",
+            "/System/Library",
+            "/Library",
+            "/Applications",
+            "/private",
+            "/private/etc",
+            "/private/var",
+        ] {
+            assert!(too_broad(Path::new(broad), Some(home)).is_some(), "{broad}");
+        }
+        for project in [
+            "/Users/alex/code/api",
+            "/Users/alex/Documents/notes",
+            "/Volumes/Backup/code/api",
+            "/private/var/folders/xy/T/fixture",
+            "/Users/sam/code/api",
+        ] {
+            assert_eq!(too_broad(Path::new(project), Some(home)), None, "{project}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonical_system_aliases_and_mounts_outside_volumes_are_refused() {
+        for alias in ["/etc", "/var", "/dev"] {
+            let root = canonical(alias).unwrap();
+            assert!(too_broad(&root, None).is_some(), "{alias}: {root:?}");
+        }
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        assert_eq!(too_broad(&root, None), None);
     }
 
     #[test]
