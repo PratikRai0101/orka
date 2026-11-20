@@ -24,6 +24,7 @@ import { IconButton } from "../icon-button.js";
 import { TextField } from "../text-field.js";
 import { connectProject } from "../use-project-setup.js";
 import { activeSources } from "../project-sources.js";
+import { SourceSyncButton } from "../source-sync-button.js";
 import { useSettingsQuery } from "./use-settings-query.js";
 import { useToastNotice } from "../toasts.js";
 
@@ -295,6 +296,24 @@ export function SettingsFolder({
                         </span>
                       </div>
                       <div className="settings-folder-actions">
+                        {source.id &&
+                          source.path &&
+                          source.syncStartsAt &&
+                          folderState === "connected" && (
+                            <SourceSyncButton
+                              name={source.name}
+                              startsAt={source.syncStartsAt}
+                              disabled={busy}
+                              onStart={() =>
+                                void run(() =>
+                                  invoke("start_source_sync", {
+                                    id: project.id,
+                                    sourceId: source.id,
+                                  }),
+                                )
+                              }
+                            />
+                          )}
                         {folderState !== "connected" && (
                           <Button
                             variant={

@@ -16,6 +16,7 @@ import { projectLabel } from "./project-navigation.js";
 
 import {
   canCancel,
+  firstSyncLabel,
   lastSyncLabel,
   queueStateLabel,
   retryTime,
@@ -161,7 +162,9 @@ export function SyncMenu({
   const waitingStatus = waiting.length
     ? waiting.every((entry) => entry.state === "waiting")
       ? "Waiting to retry"
-      : "Sync queued"
+      : waiting.every((entry) => entry.state === "scheduled")
+        ? "New folder waiting"
+        : "Sync queued"
     : null;
   const visibleStatus = !running
     ? "Sync stopped"
@@ -626,8 +629,10 @@ export function SyncMenu({
                             {p.name} ·{" "}
                             {p.status === "synced"
                               ? "Synced"
-                              : p.error ||
-                                (setupRunning ? "In progress" : "Pending")}
+                              : p.status === "scheduled"
+                                ? firstSyncLabel(p.syncStartsAt ?? NaN)
+                                : p.error ||
+                                  (setupRunning ? "In progress" : "Pending")}
                           </li>
                         ))}
                       </ul>

@@ -553,3 +553,74 @@ fn only_a_folders_own_or_unattributed_uploads_block_disconnecting_it() {
     assert_eq!(sources::queued_for_source(&f.db, id, desktop).unwrap(), 2);
     assert_eq!(sources::queued_for_source(&f.db, id, backend).unwrap(), 2);
 }
+
+#[test]
+fn a_newly_connected_folder_waits_before_sync_scans_or_writes_into_it() {
+    use crate::sync_queue::{Priority, SyncQueue};
+    let f = Fixture::new();
+    let project = multi_source(&f);
+    let id = project["id"].as_str().unwrap();
+    let desktop = project["sources"][0]["id"].as_str().unwrap();
+    let backend = project["sources"][1]["id"].as_str().unwrap();
+    db::upsert(&f.db, "projects", id, id, &project).unwrap();
+    let index = |source: usize| {
+        let root = Path::new(project["sources"][source]["path"].as_str().unwrap());
+        let index = root.join(".orka/memory/index.md");
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+        fs::write(&index, "Previous memory index").unwrap();
+        index
+    };
+    let waiting_index = index(0);
+    let ready_index = index(1);
+    let now = chrono::Utc::now().timestamp_millis();
+    let at = now + sources::NEW_FOLDER_DELAY_MS;
+    db::set(
+        &f.db,
+        &format!("source-sync-after:{id}:{desktop}"),
+        &json!(at),
+    )
+    .unwrap();
+
+    // Sync sees only the folder that is not waiting.
+    let (view, earliest) = sources::without_waiting(&f.db, &project).unwrap();
+    assert_eq!(earliest, Some(at));
+    assert!(view["sources"][0]["path"].is_null());
+    assert_eq!(view["sources"][0]["firstSyncWaiting"], true);
+    assert!(view["sources"][1]["firstSyncWaiting"].is_null());
+    assert_eq!(view["sources"][1]["path"], project["sources"][1]["path"]);
+    assert_eq!(
+        sources::views(&view)
+            .iter()
+            .filter(|v| v["path"].is_string())
+            .count(),
+        1
+    );
+    assert_eq!(sources::sync_after(&f.db, id, backend).unwrap(), None);
+    // Permission refresh reloads its own project and must also honor the delay.
+    crate::governance::reset(&f.db, id, &json!([])).unwrap();
+    assert!(waiting_index.exists());
+    assert!(!ready_index.exists());
+
+    // The queue shows the held-back job as scheduled, not as a retry.
+    SyncQueue::request_at(&f.db, id, Priority::User, "new folder", at).unwrap();
+    let states = SyncQueue::states(&f.db, now).unwrap();
+    assert_eq!(states[0]["state"], "scheduled");
+    assert!(states[0]["notBefore"].is_string());
+
+    // Sync now on the folder clears the wait.
+    sources::clear_sync_after(&f.db, id, desktop).unwrap();
+    let (view, earliest) = sources::without_waiting(&f.db, &project).unwrap();
+    assert_eq!(earliest, None);
+    assert_eq!(view["sources"][0]["path"], project["sources"][0]["path"]);
+    crate::governance::reset(&f.db, id, &json!([])).unwrap();
+    assert!(!waiting_index.exists());
+
+    // An elapsed wait no longer holds the folder back.
+    db::set(
+        &f.db,
+        &format!("source-sync-after:{id}:{desktop}"),
+        &json!(now - 1),
+    )
+    .unwrap();
+    assert_eq!(sources::without_waiting(&f.db, &project).unwrap().1, None);
+}
