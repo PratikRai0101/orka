@@ -21,6 +21,8 @@ mod codex_trust_live_tests;
 mod context_sharing_tests;
 #[path = "sync_request_tests.rs"]
 mod sync_request_tests;
+#[path = "worktree_tests.rs"]
+mod worktree_tests;
 mod doctor_tests {
     use super::*;
     use crate::codex_trust::{Report, Trust};

@@ -188,6 +188,7 @@ pub fn open_at(root: &Path) -> Result<Connection> {
         END;",
     ).map_err(|e| e.to_string())?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS local_resources(id TEXT PRIMARY KEY,project TEXT NOT NULL,value TEXT NOT NULL);").map_err(|e|e.to_string())?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS worktree_routes(scope TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS worktree_sessions(tool TEXT NOT NULL,native_id TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(tool,native_id));").map_err(|e| e.to_string())?;
     // One pending sync job per project; '*' is the workspace-wide steps. Times are Unix milliseconds.
     db.execute_batch("CREATE TABLE IF NOT EXISTS sync_queue(project TEXT PRIMARY KEY,priority INTEGER NOT NULL,reason TEXT NOT NULL,requested_at INTEGER NOT NULL,not_before INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);").map_err(|e|e.to_string())?;
     Ok(db)
