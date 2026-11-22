@@ -343,7 +343,7 @@ async function fixture(page: Page, mode = "normal") {
               addCount === 1 &&
               skillId === "claude"
                 ? { skillId, error: "Global skill unavailable. Scan again." }
-                : mode === "bulk-dead" && skillId === "claude"
+                : mode === "bulk-dead"
                   ? {
                       skillId,
                       error:
@@ -668,7 +668,7 @@ test("a skill's description opens on hover and marks global imports", async ({
   const row = rows(page).first();
   await row.hover();
   const peek = row.getByRole("tooltip");
-  await expect(peek).toContainText("Imported from your global skills");
+  await expect(peek).toContainText("From your global skills");
 });
 
 test("local-only skills stay visible and a shared revision replaces the local row", async ({
@@ -733,9 +733,7 @@ test("without a folder the popover offers to connect one; an empty scan says so"
     popover(page).getByRole("heading", { name: "Nothing to add" }),
   ).toBeVisible();
   await expect(
-    popover(page).getByText(
-      "No global skills were found in Codex or Claude on this Mac.",
-    ),
+    popover(page).getByText("No global skills found in Codex or Claude."),
   ).toBeVisible();
 });
 
@@ -951,6 +949,7 @@ test("the keyboard moves through rows, ticks with Space, and adds with Return", 
 test("a stale skill stays ticked for another try while the rest are added", async ({
   page,
 }) => {
+  await page.setViewportSize({ width: 900, height: 640 });
   await fixture(page, "bulk-partial");
   await expect(rows(page)).toHaveCount(0);
   await trigger(page).click();
@@ -973,6 +972,13 @@ test("a stale skill stays ticked for another try while the rest are added", asyn
   ).toBeVisible();
   // The one that went in has left the list.
   await expect(pick(page, "Code review")).toHaveCount(0);
+  const dismiss = page.getByRole("button", { name: "Dismiss", exact: true });
+  await expect(
+    page.getByText("Code review added to Orka", { exact: true }),
+  ).toBeVisible();
+  await dismiss.click();
+  await expect(dismiss).toHaveCount(0);
+  await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Try again", exact: true }).click();
   await expect(dialog).toBeHidden();
   expect(
@@ -1029,27 +1035,52 @@ test("choosing a repository with the keyboard changes the destination without ad
   await expect(dialog).toBeVisible();
 });
 
-test("a failure that a retry cannot fix unticks the skill and explains in a toast", async ({
-  page,
-}) => {
-  await fixture(page, "bulk-dead");
-  await trigger(page).click();
-  const dialog = popover(page);
-  await pick(page, "Writing guide").check();
-  await dialog
-    .getByRole("button", { name: "Add 1 skill", exact: true })
-    .click();
-  await expect(
-    page.getByText(
-      /Writing guide wasn’t added\. A skill with this folder name/,
-    ),
-  ).toBeVisible();
-  await expect(dialog).toBeVisible();
-  await expect(pick(page, "Writing guide")).not.toBeChecked();
-  await expect(
-    dialog.getByRole("button", { name: "Try again", exact: true }),
-  ).toHaveCount(0);
-});
+for (const { skills, button, summary, dismissal } of [
+  {
+    skills: ["Writing guide"],
+    button: "Add 1 skill",
+    summary: "Writing guide wasn’t added.",
+    dismissal: "click",
+  },
+  {
+    skills: ["Writing guide", "Code review"],
+    button: "Add 2 skills",
+    summary: "2 skills weren’t added.",
+    dismissal: "Escape",
+  },
+]) {
+  test(`a folder name collision clears selection and explains the failure (${button})`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 900, height: 640 });
+    await fixture(page, "bulk-dead");
+    await trigger(page).click();
+    const dialog = popover(page);
+    for (const skill of skills) await pick(page, skill).check();
+    await dialog.getByRole("button", { name: button, exact: true }).click();
+    await expect(
+      page.getByText(
+        `${summary} A skill with the same folder name is already in this project.`,
+        { exact: true },
+      ),
+    ).toBeVisible();
+    await expect(dialog).toBeVisible();
+    for (const skill of skills)
+      await expect(pick(page, skill)).not.toBeChecked();
+    await expect(
+      dialog.getByRole("button", { name: "Try again", exact: true }),
+    ).toHaveCount(0);
+    const dismiss = page.getByRole("button", { name: "Dismiss", exact: true });
+    if (dismissal === "Escape") {
+      await dismiss.press("Escape");
+      await expect(dialog.getByRole("searchbox")).toBeFocused();
+    } else {
+      await dismiss.click();
+    }
+    await expect(dismiss).toHaveCount(0);
+    await expect(dialog).toBeVisible();
+  });
+}
 
 test("changing repositories clears the selection and scopes the add to the chosen repository", async ({
   page,
