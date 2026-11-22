@@ -1704,6 +1704,32 @@ fn preflight_project(db: &rusqlite::Connection, project: &Value, retry_only: boo
     Ok(())
 }
 
+fn scan_off_runtime<T: Send + 'static>(
+    db: &rusqlite::Connection,
+    project: &Value,
+    scan: impl FnOnce(&rusqlite::Connection, &Value) -> Result<T> + Send + 'static,
+) -> impl std::future::Future<Output = Result<T>> + Send + 'static {
+    let root = db
+        .path()
+        .and_then(|path| Path::new(path).parent())
+        .filter(|root| !root.as_os_str().is_empty());
+    let work = if let Some(root) = root {
+        // Use the job's database, not whichever account is current when the worker starts.
+        let (root, project) = (root.to_path_buf(), project.clone());
+        Ok(tokio::task::spawn_blocking(move || {
+            scan(&db::open_at(&root)?, &project)
+        }))
+    } else {
+        Err(scan(db, project))
+    };
+    async move {
+        match work {
+            Ok(worker) => worker.await.map_err(|e| e.to_string())?,
+            Err(result) => result,
+        }
+    }
+}
+
 /// Each sync stage either carries on or breaks so the cycle yields the
 /// workspace lock to a waiting foreground operation.
 type Stage = Result<ControlFlow<()>>;
@@ -1783,7 +1809,7 @@ impl<'a> SyncPass<'a> {
         if boundary(self.db, project)?.is_break()
             || self.prepare_project(p)?.is_break()
             || boundary(self.db, project)?.is_break()
-            || self.preflight(p, waiting)?.is_break()
+            || self.preflight(p, waiting).await?.is_break()
             || boundary(self.db, project)?.is_break()
         {
             return Ok(Break(()));
@@ -1816,7 +1842,7 @@ impl<'a> SyncPass<'a> {
     /// files into the outbox, with no authorization, upload, pull or other
     /// request. Governed edits become drafts whose automatic sharing waits for
     /// a restore.
-    fn capture_project(&mut self, p: &Value) -> Stage {
+    async fn capture_project(&mut self, p: &Value) -> Stage {
         let project = p["id"].as_str().ok_or("Missing project")?;
         if boundary(self.db, project)?.is_break() || self.prepare_project(p)?.is_break() {
             return Ok(Break(()));
@@ -1824,7 +1850,7 @@ impl<'a> SyncPass<'a> {
         if crate::projects::foreground_waiting()? || boundary(self.db, project)?.is_break() {
             return Ok(Break(()));
         }
-        match scan_held(self.db, p) {
+        match scan_off_runtime(self.db, p, scan_held).await {
             Ok(_) => {
                 self.db
                     .execute("DELETE FROM errors WHERE source=?", [project])
@@ -1878,7 +1904,7 @@ impl<'a> SyncPass<'a> {
     }
 
     /// Scans (or, for a retry, validates) one project's local files.
-    fn preflight(&mut self, p: &Value, waiting: Option<i64>) -> Stage {
+    async fn preflight(&mut self, p: &Value, waiting: Option<i64>) -> Stage {
         let db = &mut *self.db;
         let retry_only = self.mode == ProjectMode::RetryOnly;
         if crate::projects::foreground_waiting()? {
@@ -1891,7 +1917,7 @@ impl<'a> SyncPass<'a> {
             0,
             None,
         )?;
-        match preflight_project(db, p, retry_only) {
+        match scan_off_runtime(db, p, move |db, p| preflight_project(db, p, retry_only)).await {
             Ok(()) => {
                 if !retry_only && waiting.is_none() {
                     db::set(
@@ -2240,7 +2266,7 @@ impl<'a> SyncPass<'a> {
             None,
         )?;
         let project = p["id"].as_str().ok_or("Missing project")?;
-        let scan = preflight_project(db, p, retry_only);
+        let scan = scan_off_runtime(db, p, move |db, p| preflight_project(db, p, retry_only)).await;
         let scanned = scan.is_ok();
         record_result(db, project, scan)?;
         // A failed project preflight must not run permission-reset filesystem
@@ -2395,7 +2421,7 @@ async fn sync_workspace(
     .map(|project| sync_ready_view(pass.db, &project))
     .collect::<Result<Vec<_>>>()?;
     for (p, waiting) in &local {
-        if pass.preflight(p, *waiting)?.is_break() {
+        if pass.preflight(p, *waiting).await?.is_break() {
             return Ok(WorkspaceSync::Yielded);
         }
     }
@@ -2409,7 +2435,7 @@ async fn sync_workspace(
             &[],
         )?;
         for p in &held {
-            if pass.capture_project(p)?.is_break() {
+            if pass.capture_project(p).await?.is_break() {
                 return Ok(WorkspaceSync::Yielded);
             }
         }
@@ -2541,7 +2567,7 @@ async fn sync_job(db: &mut rusqlite::Connection, job: &crate::sync_queue::Job) -
         (Some(p), _) => pass.sync_project(p).await?,
         // Deleted but restorable: capture locally and send nothing.
         (None, Some(p)) => {
-            let flow = pass.capture_project(p)?;
+            let flow = pass.capture_project(p).await?;
             return Ok(if SyncQueue::cancelled(pass.db, &job.project)? {
                 Outcome::Cancelled
             } else if flow.is_break() {
@@ -2976,6 +3002,7 @@ async fn run_mode(foreground: bool) {
     let mut queue = SyncQueue::new(SyncQueue::now());
     let mut beat = Instant::now();
     let mut network_poll = Instant::now();
+    let _worktrees = crate::worktree_integration::Poll::start();
     let mut network = String::new();
     loop {
         if !foreground && crate::updates::installation_pending() {
