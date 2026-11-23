@@ -35,7 +35,22 @@ recipient desktops before sharing Pi sessions in a project. A pre-Pi desktop
 can fetch the readable conversation through its connector with the resource ID,
 but its local session sync can report `Unknown tool`. Updated desktops cache
 incoming Pi snapshots for reading and export without installing them into Pi.
-Automatic Pi sharing and Open in Pi are not included.
+**Open in Pi** opens a session in an installed Terminal, Warp, or iTerm2. Your
+own Pi session on this Mac resumes its original file. A teammate's session opens
+a private local copy in the Orka profile, with a new session ID and the
+connected checkout as its working directory; reopening reuses that copy. Choose
+**Fork and open in Pi** to make another copy. If there is a readable local
+session or private copy, the fork includes its later turns. If the local file is
+missing or unreadable, the fork uses the stored, redacted snapshot instead.
+If the shared session is deleted or becomes inaccessible in an active project,
+your copies stay available as local-only sessions. If you lose project membership,
+you can recover your copies through project export. Disconnecting the folder
+keeps copies so they reappear when you reconnect it. Orka does not launch a model turn
+or change a teammate's session. Orka blocks a second Orka launch of the same
+file. It cannot reliably detect Pi processes started outside Orka. If Pi uses
+Node.js, make sure `node` is on the PATH available to Orka; shell-only version
+manager setup may not be available to a Mac app launched from Finder.
+Automatic Pi sharing and cross-provider launch to or from Pi are not included.
 
 ## Codex multi-agent rollout replacements
 
