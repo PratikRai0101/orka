@@ -1108,9 +1108,9 @@ async fn deleting_a_project_during_another_projects_sync() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     db::set(&f.db, "config", &json!({"apiUrl":url})).unwrap();
     crate::env::test_support::install_memory_keychain();
+    let owner = db::get(&f.db, "user").unwrap().as_str().unwrap().to_owned();
     crate::auth::test_session(&json!({
-        "user":{"id":db::get(&f.db,"user").unwrap()},
-        "access_token":"fixture","refresh_token":"fixture"
+        "user":{"id":owner},"access_token":"expired","refresh_token":"old","expires_at":0
     }))
     .unwrap();
     let db = db::open().unwrap();
@@ -1121,9 +1121,21 @@ async fn deleting_a_project_during_another_projects_sync() {
         [a],
     )
     .unwrap();
-    let project = b.clone();
+    let project = b.to_uppercase();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let expected_request_id = request_id.clone();
+    let refreshed_session = json!({
+        "user":{"id":owner},"access_token":"fresh","refresh_token":"rotated"
+    });
+    let (refresh_started, refresh_in_flight) = tokio::sync::oneshot::channel();
     let service = tokio::spawn(async move {
-        for (expected, body) in [
+        let mut refresh_started = Some(refresh_started);
+        let mut routes = std::collections::BTreeMap::from([
+            (
+                "POST /auth/token?grant_type=refresh_token HTTP/1.1",
+                refreshed_session,
+            ),
+            ("GET /v2/sync/pull HTTP/1.1", json!({})),
             (
                 "GET /v2/projects/capabilities HTTP/1.1",
                 json!({"softDelete":1}),
@@ -1132,28 +1144,53 @@ async fn deleting_a_project_during_another_projects_sync() {
                 "POST /v2/projects/action HTTP/1.1",
                 json!({"lifecycleRevision":2}),
             ),
-        ] {
+        ]);
+        while !routes.is_empty() {
             let (stream, _) = listener.accept().await.unwrap();
             let mut stream = BufReader::new(stream);
             let mut line = String::new();
             stream.read_line(&mut line).await.unwrap();
-            assert_eq!(line.trim_end(), expected);
+            let route = line.trim_end().to_owned();
+            let body = routes
+                .remove(route.as_str())
+                .unwrap_or_else(|| panic!("Unexpected request: {route}"));
             let mut length = 0;
+            let mut bearer = None;
             loop {
                 line.clear();
                 assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
                 if line == "\r\n" {
                     break;
                 }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                let (name, value) = line.split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("content-length") {
                     length = value.trim().parse().unwrap();
+                } else if name.eq_ignore_ascii_case("authorization") {
+                    bearer = Some(value.trim().to_owned());
                 }
             }
-            if expected.starts_with("POST") {
-                let mut bytes = vec![0; length];
-                stream.read_exact(&mut bytes).await.unwrap();
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).await.unwrap();
+            if route.starts_with("POST /auth/") {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap()["refresh_token"],
+                    "old"
+                );
+                refresh_started.take().unwrap().send(()).unwrap();
+                // Keep the refresh in flight while Delete requests its own token.
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                        .await
+                        .is_err(),
+                    "a second refresh reached the service"
+                );
+            } else {
+                assert_eq!(bearer.as_deref(), Some("Bearer fresh"));
+            }
+            if route.starts_with("POST /v2/projects/action") {
                 let request: Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(request["projectId"], project);
+                assert_eq!(request["requestId"], expected_request_id);
                 assert_eq!(request["action"], "delete");
             }
             let body = body.to_string();
@@ -1172,7 +1209,7 @@ async fn deleting_a_project_during_another_projects_sync() {
     let delete = |id: &str| {
         crate::projects::project_command(
             "delete".into(),
-            json!({"projectId":id,"expectedRevision":0,"confirmation":"B"}),
+            json!({"projectId":id,"requestId":request_id,"expectedRevision":0,"confirmation":"B"}),
         )
     };
     SyncQueue::request(&db, a, Priority::User, "fixture").unwrap();
@@ -1189,15 +1226,24 @@ async fn deleting_a_project_during_another_projects_sync() {
                 &json!({"header":{"manifest":{"projectId":b}}}),
             )
             .unwrap();
-            let pending = delete(&b).await.unwrap_err();
+            let pending = delete(&b.to_uppercase()).await.unwrap_err();
             assert!(pending.contains("before deleting this project"));
             db.execute("DELETE FROM meta WHERE key='env:fixture:pending:1'", [])
                 .unwrap();
 
-            tokio::time::timeout(std::time::Duration::from_secs(5), delete(&b))
+            let sync = sync::api_as(&owner, "GET", "/v2/sync/pull", None);
+            let delete = async {
+                refresh_in_flight.await.unwrap();
+                delete(&b.to_uppercase()).await
+            };
+            let (pulled, deleted) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(sync, delete)
+                })
                 .await
-                .unwrap()
                 .unwrap();
+            pulled.unwrap();
+            deleted.unwrap();
             assert!(SyncQueue::states(db, 0)
                 .unwrap()
                 .as_array()

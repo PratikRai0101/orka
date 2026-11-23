@@ -521,25 +521,20 @@ impl SyncQueue {
 
     #[cfg(test)]
     fn claim(db: &Connection, now: i64) -> Result<Option<Job>> {
-        Ok(Self::claim_with(db, now, |_| Ok(Some(())))?.map(|(job, ())| job))
+        Self::claim_next(db, now, None)
     }
 
-    /// Locks the most urgent ready job before marking it running. Its row
-    /// remains queued for crash recovery, and its claim survives new requests.
-    fn claim_with<T>(
-        db: &Connection,
-        now: i64,
-        try_lock: impl FnOnce(&Job) -> Result<Option<T>>,
-    ) -> Result<Option<(Job, T)>> {
+    /// Claims the highest-priority ready job if it still matches the lock held
+    /// by the caller. The row remains queued for crash recovery.
+    fn claim_next(db: &Connection, now: i64, locked_project: Option<&str>) -> Result<Option<Job>> {
         let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         let Some(job) = Self::next(&tx, now)? else {
             return Ok(None);
         };
-        // Never wait for a file lock with a SQLite write transaction open.
-        let Some(guard) = try_lock(&job)? else {
+        if locked_project.is_some_and(|project| project != job.project) {
             return Ok(None);
-        };
+        }
         let claim = json!(uuid::Uuid::new_v4().to_string());
         sql(tx.execute(
             "UPDATE sync_queue SET not_before=?1 WHERE project=?2",
@@ -553,7 +548,7 @@ impl SyncQueue {
             &json!({"project":job.project,"claim":claim,"owner":PROGRESS_OWNER.as_str()}),
         )?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(Some((job, guard)))
+        Ok(Some(job))
     }
 
     /// Success removes the job and restarts the project's timer, a cancel does
@@ -645,16 +640,34 @@ impl SyncQueue {
         if crate::projects::foreground_waiting()? {
             return Ok(false);
         }
-        let mut db = db::open()?;
-        let Some((job, _guard)) = Self::claim_with(&db, Self::now(), |job| {
-            crate::projects::try_lock_scope((job.project != WORKSPACE).then_some(&job.project))
-        })?
-        else {
+        let scope = db::CacheScope::current()?;
+        let Some(candidate) = Self::next(&scope.open_read_only()?, Self::now())? else {
+            return Ok(false);
+        };
+        let Some((mut db, job, _guard)) = Self::lock_and_claim(&scope, &candidate.project)? else {
             return Ok(false);
         };
         let result = run(&mut db, &job).await;
         self.settle(&db, job, &result, Self::now(), interval)?;
         Ok(true)
+    }
+
+    fn lock_and_claim(
+        scope: &db::CacheScope,
+        project: &str,
+    ) -> Result<Option<(Connection, Job, crate::projects::OperationLock)>> {
+        let Some(guard) =
+            crate::projects::try_lock_scope((project != WORKSPACE).then_some(project))?
+        else {
+            return Ok(None);
+        };
+        // The first read only selects a lock. Check the account and service
+        // again under that lock before claiming a job or using the cache.
+        if &db::CacheScope::current()? != scope {
+            return Ok(None);
+        }
+        let db = scope.open()?;
+        Ok(Self::claim_next(&db, Self::now(), Some(project))?.map(|job| (db, job, guard)))
     }
 }
 
@@ -1737,6 +1750,34 @@ mod tests {
         assert!(!SyncQueue::running(&db, "a").unwrap());
         assert!(!SyncQueue::running(&db, "b").unwrap());
         assert!(!SyncQueue::cancelled(&db, "b").unwrap());
+    }
+
+    #[test]
+    fn a_service_switch_invalidates_a_job_selected_before_locking() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ORKA_TEST_HOME", home.path());
+        db::profile(&uuid::Uuid::new_v4().to_string()).unwrap();
+        let db = db::open().unwrap();
+        db::set(&db, "config", &json!({"apiUrl":"https://old.example"})).unwrap();
+        let scope = db::CacheScope::current().unwrap();
+        let old = scope.open().unwrap();
+        SyncQueue::enqueue(&old, "a", Priority::User, "old service", 0).unwrap();
+        let candidate = SyncQueue::next(&old, 0).unwrap().unwrap();
+        {
+            let _workspace = crate::projects::lock().unwrap();
+            db::set(&old, "config", &json!({"apiUrl":"https://new.example"})).unwrap();
+        }
+        let new = db::open().unwrap();
+        SyncQueue::enqueue(&new, "a", Priority::User, "new service", 0).unwrap();
+
+        assert!(SyncQueue::lock_and_claim(&scope, &candidate.project)
+            .unwrap()
+            .is_none());
+        assert_eq!(SyncQueue::next(&old, 0).unwrap(), Some(candidate));
+        assert_eq!(
+            SyncQueue::next(&new, 0).unwrap().unwrap().reason,
+            "new service"
+        );
     }
 
     #[tokio::test]

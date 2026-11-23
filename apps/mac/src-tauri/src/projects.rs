@@ -827,7 +827,6 @@ pub async fn project_command(action: String, input: Value) -> Result<Value> {
             }
             let mut request = input.clone();
             request["action"] = json!(action);
-            request["projectId"] = json!(id);
             let receipt =
                 sync::api_as(&owner, "POST", "/v2/projects/action", Some(&request)).await?;
             if action != "rename" {
