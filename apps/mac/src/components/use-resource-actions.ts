@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import type { Resource } from "@portable/protocol";
+import type {
+  SessionSnapshotDownload,
+  WorkspaceResource as Resource,
+} from "../types.js";
 
 /** Runs a native action with the shared busy and error handling, then refreshes. */
 export type ActionFeedback = {
@@ -16,7 +19,7 @@ export type Run = (
 ) => Promise<void>;
 export type SessionActionName = "copy" | "delete" | "keep" | "override";
 export type SessionVersion = "current" | "candidate";
-export type SessionTool = "claude" | "codex";
+export type SessionTool = "claude" | "codex" | "pi";
 export type SessionDestination = "desktop" | "terminal" | "warp" | "iterm2";
 export interface SessionLaunchOption {
   tool: SessionTool;
@@ -34,7 +37,9 @@ export interface SessionLaunchOption {
 export const sessionTool = (
   source: Resource["source"],
 ): SessionTool | undefined =>
-  source === "claude" || source === "codex" ? source : undefined;
+  source === "claude" || source === "codex" || source === "pi"
+    ? source
+    : undefined;
 export type ResourceActionHandlers = ReturnType<typeof useResourceActions>;
 
 /** The native commands behind the reading view's buttons and menu. */
@@ -152,7 +157,10 @@ export function useResourceActions({
           launching.current = false;
         });
       },
-      exportZip: () =>
+      exportZip: (
+        sessionSnapshot?: SessionSnapshotDownload,
+        onSnapshotChanged?: () => void,
+      ) =>
         act(
           async () => {
             const path = await save({
@@ -160,7 +168,23 @@ export function useResourceActions({
               filters: [{ name: "ZIP", extensions: ["zip"] }],
             });
             if (path) {
-              await invoke("export_bundle", { id, path });
+              try {
+                await invoke("export_bundle", {
+                  id,
+                  path,
+                  ...(sessionSnapshot && { sessionSnapshot }),
+                });
+              } catch (error) {
+                if (
+                  sessionSnapshot &&
+                  onSnapshotChanged &&
+                  error === "session_snapshot_changed"
+                ) {
+                  onSnapshotChanged();
+                  return;
+                }
+                throw error;
+              }
               onNotice(kind === "session" ? "Download saved" : "Export saved");
             }
           },

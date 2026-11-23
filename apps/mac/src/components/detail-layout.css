@@ -42,8 +42,9 @@
 }
 
 /* Title card */
+/* The left inset matches the index header so the sidebar toggle stays put. */
 .app > main > .workspace-header.workspace-header--detail {
-  padding-inline: 24px;
+  padding-inline: 28px 24px;
 }
 .workspace-header.workspace-header--detail .sync-status {
   padding-inline: 16px;
@@ -87,15 +88,6 @@
 .workspace-header--detail .ui-button,
 .detail-layout .ui-button {
   --control-icon-container: 14px;
-}
-/* Keep the shell control available on hover and keyboard focus without
-   displacing the detail page's Back action. A collapsed sidebar always shows it. */
-.workspace-header--detail[data-collapsed="false"] .sidebar-toggle {
-  opacity: 0;
-}
-.workspace-header--detail:hover .sidebar-toggle,
-.workspace-header--detail:focus-within .sidebar-toggle {
-  opacity: 1;
 }
 .detail-title-card {
   display: flex;
@@ -195,11 +187,6 @@
 .detail-compact-notes:empty {
   display: none;
 }
-.detail-layout[data-layout="compact"] .markdown-content pre code {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-all;
-}
 .detail-compact-actions {
   display: flex;
   flex-wrap: wrap;
@@ -286,9 +273,6 @@
   .ui-button[aria-pressed="true"]:disabled {
   color: var(--text-tertiary);
 }
-.detail-document .markdown-content {
-  line-height: 20px;
-}
 .detail-comparison {
   display: flex;
   align-items: stretch;
@@ -318,46 +302,6 @@
   content: "";
   flex: 1 1 auto;
   border-left: 1px dashed var(--border-default);
-}
-.detail-document .markdown-content h1 {
-  font-family: "Orka Display Inter", "Inter Variable", sans-serif;
-  font-optical-sizing: auto;
-  font-size: 24px;
-  line-height: 30px;
-  letter-spacing: -0.01em;
-}
-.detail-document .markdown-content h2 {
-  font-family: "Orka Display Inter", "Inter Variable", sans-serif;
-  font-optical-sizing: auto;
-  font-size: 20px;
-  line-height: 30px;
-  letter-spacing: -0.01em;
-  margin-top: 48px;
-}
-.detail-document .markdown-content pre {
-  margin: 16px 0;
-  padding: 12px 16px;
-  line-height: 20px;
-  background: var(--surface-tertiary);
-}
-.detail-document .markdown-content p + p {
-  margin-top: 32px;
-}
-.detail-document .markdown-content p + ul,
-.detail-document .markdown-content p + ol {
-  margin-top: 24px;
-}
-.detail-document .markdown-content h2 + ul,
-.detail-document .markdown-content h2 + ol {
-  margin-top: 32px;
-}
-.detail-document .markdown-content code {
-  font-size: 16px;
-  line-height: 20px;
-}
-.detail-document .markdown-content li {
-  min-height: 24px;
-  margin-block: 8px;
 }
 .skill-content-skeleton {
   display: flex;

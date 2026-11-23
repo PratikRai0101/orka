@@ -1,11 +1,19 @@
 import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
-import type { Resource, SessionConflict } from "@portable/protocol";
+import type { SessionConflict } from "@portable/protocol";
+import type { WorkspaceResource as Resource } from "../types.js";
 import type { Inspection } from "../types.js";
 
+/**
+ * The largest transcript the reader renders. WebKit lays out a single text
+ * block on the main thread: about 0.8 s at 4 MB, 3 s at 17 MB and 8 s at 44 MB
+ * of transcript text. Larger transcripts offer a download instead.
+ */
+export const TRANSCRIPT_RENDER_LIMIT = 4 * 1024 * 1024;
+
 export interface ResourceView {
-  /** The inspected file: SKILL.md for skills, otherwise the first file. */
+  /** The inspected file: SKILL.md for skills, session.jsonl for sessions, otherwise the first file. */
   file: string;
   setFile: Dispatch<SetStateAction<string>>;
   inspection: Inspection | null;
@@ -37,7 +45,11 @@ export function useResourceView(
 ): ResourceView {
   const loaded = Boolean(resource);
   const defaultFile =
-    resource?.kind === "skill" ? "SKILL.md" : (resource?.files[0]?.path ?? "");
+    resource?.kind === "skill"
+      ? "SKILL.md"
+      : resource?.kind === "session"
+        ? "session.jsonl"
+        : (resource?.files[0]?.path ?? "");
   const selectionKey = JSON.stringify([
     scope,
     deviceId,
@@ -91,11 +103,15 @@ export function useResourceView(
       conflict?.candidate.files,
     ],
     enabled,
+    // Live fork history can change without changing the catalog's file hash.
+    // Re-entering Transcript should refresh the version offered for download.
+    ...(kind === "session" && { staleTime: 0 }),
     queryFn: async ({ signal }) => {
       const result = await invoke<Inspection>("inspect_resource", {
         id,
         file,
         conflictId: preview || null,
+        maxBytes: kind === "session" ? TRANSCRIPT_RENDER_LIMIT : null,
       });
       // Native IPC itself cannot be aborted. Consuming the signal lets Query
       // discard a response after selection or scope changes.

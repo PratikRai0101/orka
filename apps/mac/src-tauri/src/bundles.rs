@@ -17,18 +17,42 @@ use uuid::Uuid;
 /// without changing a retry identity or touching the user's files.
 pub fn export_project(cache: &db::CacheScope, project: &str, path: &Path) -> Result<()> {
     let db = cache.open_read_only()?;
-    let read_blob = cache.blob_reader();
+    let cached_blob = cache.blob_reader();
     // The WAL snapshot covers both the queue and the manifests it references.
     // Release it before compression, which only reads content-addressed files.
     let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
     let saved = exportable_project(&tx, project)?;
     let policy_key = format!("policyRevision:{project}");
     let policy = db::get(&tx, &policy_key)?;
+    let mut live_copies = std::collections::HashMap::new();
     let resources = db::rows(
         &tx,
         "SELECT value FROM resources WHERE project=? AND coalesce(json_extract(value,'$.deleted'),0)=0 ORDER BY id",
         &[&project],
-    )?;
+    )?
+    .into_iter()
+    .map(|resource| {
+        // Export a private Pi copy with the turns added since it was made. Keep
+        // its bytes in memory: export reads the pinned cache and never writes
+        // into the current service's blob store.
+        let id = resource["resourceId"].as_str().ok_or("Missing resource")?;
+        let binding = indexer::binding(&tx, id)?;
+        if !crate::pi_sessions::is_private_copy(&binding) {
+            return Ok(resource);
+        }
+        let bytes = crate::pi_sessions::copy_snapshot_bytes(&binding, &resource, &cached_blob)?;
+        let hash = db::digest(&bytes);
+        let current = crate::pi_sessions::with_session_file(&resource, &bytes, &hash);
+        live_copies.insert(hash, bytes);
+        Ok(current)
+    })
+    .collect::<Result<Vec<_>>>()?;
+    let read_blob = |hash: &str| {
+        live_copies
+            .get(hash)
+            .cloned()
+            .map_or_else(|| cached_blob(hash), Ok)
+    };
     let drafts = db::rows(
         &tx,
         "SELECT value FROM drafts WHERE project=? ORDER BY id",
@@ -258,6 +282,10 @@ fn write_transcript<W: Write + Seek>(
 pub fn export(db: &rusqlite::Connection, id: &str, path: &Path) -> Result<()> {
     let r = crate::local_resources::resource(db, id)?;
     let r = crate::session_forks::current_resource(db, &r)?;
+    export_snapshot(db, &r, path)
+}
+
+pub(crate) fn export_snapshot(db: &rusqlite::Connection, r: &Value, path: &Path) -> Result<()> {
     if r["deleted"] == true {
         return Err("Deleted resources cannot be exported".into());
     }
@@ -276,8 +304,8 @@ pub fn export(db: &rusqlite::Connection, id: &str, path: &Path) -> Result<()> {
             manifest["resource"]["sourceId"] = r["sourceId"].clone();
         }
         write_json(&mut zip, "manifest.json", &manifest, options)?;
-        write_blobs(&mut zip, options, &r, "", &db::blob_read)?;
-        write_transcript(&mut zip, options, &r, "", &db::blob_read)?;
+        write_blobs(&mut zip, options, r, "", &db::blob_read)?;
+        write_transcript(&mut zip, options, r, "", &db::blob_read)?;
         zip.finish().map_err(|e| e.to_string())?;
     }
     staged.as_file().sync_all().map_err(|e| e.to_string())?;

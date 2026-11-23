@@ -19,6 +19,7 @@ use std::{
 const PLAN_REVISION_CONFLICT: &str =
     "409: Resource changed; refresh and review the exact version again";
 const PLAN_REVIEW_PENDING: &str = "Queued plan upload needs review";
+const DESKTOP_VERSION_HEADER: &str = "X-Orka-Desktop-Version";
 
 pub async fn api(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let owner = db::get(&db::open()?, "user")?;
@@ -83,7 +84,14 @@ pub(crate) async fn api_at(
     path: &str,
     body: Option<&Value>,
 ) -> Result<Value> {
-    let mut request = request_at(owner, origin, method, path).await?;
+    let request = request_at(owner, origin, method, path).await?;
+    send_api_request(request, body).await
+}
+
+async fn send_api_request(
+    mut request: reqwest::RequestBuilder,
+    body: Option<&Value>,
+) -> Result<Value> {
     if let Some(body) = body {
         request = request.json(body);
     }
@@ -116,7 +124,13 @@ async fn register_device(owner: &str, origin: &str, device: &str) -> Result<Valu
     if capabilities["deviceHardware"] == 1 {
         registration["hardwareFamily"] = json!(crate::device_metadata::local_family(&db::open()?)?);
     }
-    post_device_registration(owner, origin, registration).await?;
+    post_device_registration(
+        owner,
+        origin,
+        registration,
+        capabilities["desktopAnalytics"] == 1,
+    )
+    .await?;
     Ok(capabilities)
 }
 
@@ -124,12 +138,26 @@ pub(crate) async fn post_device_registration(
     owner: &str,
     origin: &str,
     registration: Value,
+    report_desktop_version: bool,
 ) -> Result<()> {
     send_registration(registration, async |body| {
-        api_at(owner, origin, "POST", "/v2/devices", Some(body)).await?;
+        let request = request_at(owner, origin, "POST", "/v2/devices").await?;
+        let request = with_desktop_version(request, report_desktop_version);
+        send_api_request(request, Some(body)).await?;
         Ok(())
     })
     .await
+}
+
+fn with_desktop_version(
+    request: reqwest::RequestBuilder,
+    report_desktop_version: bool,
+) -> reqwest::RequestBuilder {
+    if report_desktop_version {
+        request.header(DESKTOP_VERSION_HEADER, env!("CARGO_PKG_VERSION"))
+    } else {
+        request
+    }
 }
 
 async fn send_registration(
@@ -225,6 +253,9 @@ pub fn apply_event(db: &rusqlite::Connection, event: &Value) -> Result<()> {
         .is_none_or(|c| c["revision"].as_u64().unwrap_or(0) <= r["revision"].as_u64().unwrap_or(0))
     {
         db::upsert(db, "resources", id, project, r)?;
+        if r["source"] == "pi" && r["deleted"] == true {
+            crate::pi_sessions::detach_copies(db, project, id)?;
+        }
         db.execute(
             "DELETE FROM conflicts WHERE project=? AND json_extract(value,'$.resourceId')=?",
             params![project, id],
@@ -1131,12 +1162,19 @@ fn materialize_install(
     if crate::repair::deletion_complete(resource, &b)? {
         return crate::repair::settle_deletion(db, project, resource, b);
     }
-    if kind == "session" && resource["source"] == "codex" && resource["deleted"] != true {
+    if kind == "session"
+        && matches!(resource["source"].as_str(), Some("codex" | "pi"))
+        && resource["deleted"] != true
+    {
         // Sync keeps snapshots in Orka. Only an explicit launch creates native history.
         if b["nativeId"].is_string() {
             b["availableRevision"] = resource["revision"].clone();
         } else {
-            crate::history::History::resource(resource)?;
+            if resource["source"] == "pi" {
+                crate::history::resource_records(resource)?;
+            } else {
+                crate::history::History::resource(resource)?;
+            }
             b["previous"] = b["base"].clone();
             b["base"] = resource.clone();
             b["paths"] = json!([]);
@@ -2057,7 +2095,7 @@ impl<'a> SyncPass<'a> {
                 .iter()
                 .filter(|q| {
                     let error = q["error"].as_str().unwrap_or("");
-                    consolidation_pending(q, error) || error.starts_with("Local upload: ")
+                    defer_upload(q, error)
                 })
                 .map(|q| q["id"].clone()),
         );
@@ -2221,7 +2259,7 @@ impl<'a> SyncPass<'a> {
                         held.insert(project.to_string());
                         return Ok(Continue(()));
                     }
-                    if consolidation_pending(&q, &error) || error.starts_with("Local upload: ") {
+                    if defer_upload(&q, &error) {
                         deferred.insert(q["id"].clone());
                     } else if terminal_error(&error) {
                         deferred.remove(&q["id"]);
@@ -2729,6 +2767,15 @@ pub(crate) fn service_error(error: &str) -> bool {
         || error.starts_with("Service changed")
 }
 
+// Deferred rows stay queued without blocking the rest of the project's work.
+fn defer_upload(queued: &Value, error: &str) -> bool {
+    consolidation_pending(queued, error)
+        || error.starts_with("Local upload: ")
+        || (queued["path"] == crate::selective_sharing::QUEUE_PATH
+            && queued["value"]["resource"]["source"] == "pi"
+            && error == crate::selective_sharing::PI_SERVICE_UPGRADE)
+}
+
 // Match only the packaged backend's resource-local MemoryUnavailable contract.
 // General 503s, blob failures, auth failures and transport errors remain fatal.
 fn consolidation_pending(queued: &Value, error: &str) -> bool {
@@ -3113,6 +3160,34 @@ pub fn capture_held(db: &rusqlite::Connection, project: &str) -> Result<bool> {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+
+    #[test]
+    fn device_registration_only_reports_version_when_advertised() {
+        let client = reqwest::Client::new();
+        for (capabilities, expected) in [
+            (
+                json!({ "desktopAnalytics": 1 }),
+                Some(env!("CARGO_PKG_VERSION")),
+            ),
+            (json!({}), None),
+            (json!(null), None),
+            (json!({ "desktopAnalytics": 2 }), None),
+        ] {
+            let request = with_desktop_version(
+                client.post("http://localhost/v2/devices"),
+                capabilities["desktopAnalytics"] == 1,
+            )
+            .build()
+            .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get(DESKTOP_VERSION_HEADER)
+                    .map(|version| version.to_str().unwrap()),
+                expected,
+            );
+        }
+    }
 
     #[tokio::test]
     async fn mixed_replica_registration_retries_once_with_only_public_fields() {
@@ -3738,6 +3813,21 @@ mod queue_tests {
 
     fn queued(sequence: i64, resource: &str) -> Value {
         json!({"sequence":sequence,"id":format!("request-{sequence}"),"project":"project","path":"/v2/sync/push","value":{"resource":{"resourceId":resource,"kind":"memory"}}})
+    }
+
+    #[test]
+    fn only_selected_pi_shares_defer_when_the_server_needs_an_upgrade() {
+        let mut pi = queued(1, "session");
+        pi["path"] = json!(crate::selective_sharing::QUEUE_PATH);
+        pi["value"]["resource"]["source"] = json!("pi");
+        let upgrade = crate::selective_sharing::PI_SERVICE_UPGRADE;
+        assert!(defer_upload(&pi, upgrade));
+        assert!(!defer_upload(&pi, "Service unreachable"));
+        pi["path"] = json!("/v2/sync/push");
+        assert!(!defer_upload(&pi, upgrade));
+        pi["path"] = json!(crate::selective_sharing::QUEUE_PATH);
+        pi["value"]["resource"]["source"] = json!("codex");
+        assert!(!defer_upload(&pi, upgrade));
     }
 
     #[test]

@@ -43,6 +43,9 @@ impl Host for FakeHost {
         } else if self.fork_change == Some("account") {
             db::set(db, "user", &json!(uuid::Uuid::new_v4().to_string()))?;
         }
+        if resource["source"] == "pi" {
+            return crate::pi_sessions::fork(db, project, resource);
+        }
         let native_id = uuid::Uuid::new_v4().to_string();
         let home = if resource["source"] == "codex" {
             native::codex_home()?
@@ -125,6 +128,9 @@ impl Host for FakeHost {
             LaunchIntent::Resume(id) => {
                 json!({"destination":destination,"tool":tool,"id":id,"root":root})
             }
+            LaunchIntent::PiSession { path, lock } => {
+                json!({"destination":destination,"tool":tool,"path":path,"lock":lock,"root":root})
+            }
             LaunchIntent::Handoff(prompt) => {
                 json!({"destination":destination,"tool":tool,"prompt":prompt,"root":root})
             }
@@ -182,6 +188,11 @@ fn session(f: &Fixture, source: &str, teammate: bool) -> Value {
             json!({"type":"session_meta","payload":{"id":native_id,"cwd":f.root}}),
             json!({"type":"event_msg","payload":{"type":"user_message","message":"Continue this task"}}),
         ]
+    } else if source == "pi" {
+        vec![
+            json!({"type":"session","version":3,"id":native_id,"cwd":"/another/mac/project","parentSession":"/another/mac/private.jsonl"}),
+            json!({"type":"message","id":"request","parentId":null,"message":{"role":"user","content":"Continue in Pi"}}),
+        ]
     } else {
         vec![
             json!({"type":"user","sessionId":native_id,"cwd":f.root,"message":{"role":"user","content":"Continue this task"}}),
@@ -201,6 +212,589 @@ fn session(f: &Fixture, source: &str, teammate: bool) -> Value {
     .unwrap();
     db::upsert(&f.db,"bindings",id,f.project["id"].as_str().unwrap(),&json!({"nativeId":native_id,"base":resource,"paths":[f.root.join("original.jsonl")],"copyRequest":"existing-request"})).unwrap();
     resource
+}
+
+#[test]
+fn open_in_pi_retains_a_private_copy_and_reuses_its_exact_path() {
+    let f = Fixture::new();
+    let resource = session(&f, "pi", true);
+    let id = resource["resourceId"].as_str().unwrap();
+    let original = crate::history::resource_records(&resource).unwrap();
+    let host = FakeHost::default();
+    assert!(session_launcher::resume_with(id, Tool::Pi, Destination::Desktop, &host).is_err());
+    assert!(session_launcher::resume_with(id, Tool::Claude, Destination::Terminal, &host).is_err());
+    let options = json!(session_launcher::options_with(id, &host).unwrap());
+    assert_eq!(options[0]["tool"], "pi");
+    assert_eq!(options[0]["mode"], "fork");
+    assert!(options
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|option| option["destination"] != "desktop"));
+
+    let lock = crate::projects::lock().unwrap();
+    let first = session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    let second = session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    assert_eq!(first["forked"], true);
+    assert_eq!(second["forked"], false);
+    assert_eq!(first["nativeId"], second["nativeId"]);
+    assert_eq!(host.forks.borrow().len(), 1);
+    let calls = host.calls.borrow();
+    assert_eq!(calls[0], calls[1]);
+    let path = PathBuf::from(calls[0]["path"].as_str().unwrap());
+    drop(calls);
+    let local = native::complete_records(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(local[0]["id"], first["nativeId"]);
+    assert_eq!(local[0]["cwd"], json!(f.root));
+    assert!(local[0].get("parentSession").is_none());
+    assert_eq!(&local[1..], &original[1..]);
+    assert_eq!(
+        crate::history::resource_records(&resource).unwrap(),
+        original
+    );
+    if let Some(binary) = std::env::var_os("ORKA_TEST_PI_BINARY") {
+        let rpc = f.root.join("pi-rpc.jsonl");
+        fs::write(
+            &rpc,
+            "{\"type\":\"get_state\"}\n{\"type\":\"get_messages\"}\n",
+        )
+        .unwrap();
+        let output = session_launcher::output(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "exec \"$1\" --mode rpc --session \"$2\" < \"$3\"",
+                    "sh",
+                ])
+                .arg(binary)
+                .arg(&path)
+                .arg(&rpc)
+                .current_dir(&f.root)
+                .env("HOME", f._home.path())
+                .env(
+                    "PI_CODING_AGENT_DIR",
+                    crate::pi_sessions::agent_directory().unwrap(),
+                ),
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let responses = native::complete_records(&output.stdout).unwrap();
+        assert!(
+            responses.iter().any(|r| r["command"] == "get_state"
+                && r["success"] == true
+                && r["data"]["sessionId"] == first["nativeId"]),
+            "{responses:?}"
+        );
+        assert!(
+            responses.iter().any(|r| r["command"] == "get_messages"
+                && r["success"] == true
+                && r["data"]["messages"][0]["content"] == "Continue in Pi"),
+            "{responses:?}"
+        );
+    }
+    fs::remove_file(&path).unwrap();
+    assert!(session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).is_err());
+    assert_eq!(host.forks.borrow().len(), 1);
+    let next =
+        session_launcher::launch_with(id, Tool::Pi, Destination::Terminal, true, &host).unwrap();
+    assert_ne!(next["nativeId"], first["nativeId"]);
+    assert!(f.outbox().is_empty());
+    drop(lock);
+}
+
+#[test]
+fn pi_copy_survives_an_authorized_feed_reset_and_never_queues_a_delete() {
+    let mut f = Fixture::new();
+    f.project["sharing"]["session"] = json!(true);
+    let project = f.project["id"].as_str().unwrap();
+    db::upsert(&f.db, "projects", project, project, &f.project).unwrap();
+    fs::create_dir_all(native::codex_home().unwrap().join("sessions")).unwrap();
+    fs::create_dir_all(native::claude_home().unwrap().join("projects")).unwrap();
+    let mut source = session(&f, "pi", true);
+    source["title"] = json!("Shared Pi session");
+    source["logicalPath"] = json!(format!("pi/{}", source["resourceId"].as_str().unwrap()));
+    let id = source["resourceId"].as_str().unwrap();
+    db::upsert(&f.db, "resources", id, project, &source).unwrap();
+    let host = FakeHost::default();
+    let first = session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    let child = session_launcher::launch_with(
+        first["resourceId"].as_str().unwrap(),
+        Tool::Pi,
+        Destination::Terminal,
+        true,
+        &host,
+    )
+    .unwrap();
+    crate::governance::reset(&f.db, project, &json!([{"resource":source}])).unwrap();
+    let reopened =
+        session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    assert_eq!(reopened["nativeId"], first["nativeId"]);
+    let reopened_child = session_launcher::resume_with(
+        child["resourceId"].as_str().unwrap(),
+        Tool::Pi,
+        Destination::Terminal,
+        &host,
+    )
+    .unwrap();
+    assert_eq!(reopened_child["nativeId"], child["nativeId"]);
+    let path = PathBuf::from(host.calls.borrow()[0]["path"].as_str().unwrap());
+    assert_eq!(
+        crate::resource_commands::paths(
+            &f.db,
+            &f.project,
+            &json!({"resourceId":first["resourceId"]})
+        )
+        .unwrap(),
+        [path.canonicalize().unwrap()]
+    );
+    fs::remove_file(path).unwrap();
+    indexer::scan(&f.db, &f.project).unwrap();
+    assert!(f.outbox().is_empty(), "{:?}", f.outbox());
+    crate::governance::reset(&f.db, project, &json!([])).unwrap();
+    let child_id = child["resourceId"].as_str().unwrap();
+    assert!(crate::local_resources::resource(&f.db, child_id).is_ok());
+    assert_eq!(
+        indexer::binding(&f.db, child_id)
+            .unwrap()
+            .get("piCopyOrigin"),
+        Some(&Value::Null)
+    );
+    let reopened_child =
+        session_launcher::resume_with(child_id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    assert_eq!(reopened_child["nativeId"], child["nativeId"]);
+    assert!(f.outbox().is_empty(), "{:?}", f.outbox());
+    assert!(host.calls.borrow()[1]["path"]
+        .as_str()
+        .is_some_and(|p| Path::new(p).is_file()));
+}
+
+#[test]
+fn own_pi_session_resumes_in_place_and_forks_every_raw_turn() {
+    let f = Fixture::new();
+    let folder = crate::pi_sessions::directory().unwrap();
+    fs::create_dir_all(&folder).unwrap();
+    let native_id = uuid::Uuid::new_v4();
+    let original = folder.join(format!("{native_id}.jsonl"));
+    let secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let bytes = native::encode(&[
+        json!({"type":"session","version":3,"id":native_id,"cwd":f.root}),
+        json!({"type":"message","id":"start","parentId":null,"message":{"role":"user","content":format!("Private Pi task using {secret}")}}),
+    ]);
+    fs::write(&original, &bytes).unwrap();
+    let row = indexer::discover(&f.db, &f.project, "session")
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry["resource"]["source"] == "pi")
+        .unwrap();
+    let id = row["resource"]["resourceId"].as_str().unwrap();
+    let host = FakeHost::default();
+    let options = json!(session_launcher::options_with(id, &host).unwrap());
+    assert_eq!(options[0]["mode"], "resume");
+    assert_eq!(options[0]["available"], true);
+
+    let opened = session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    assert_eq!(opened["forked"], false);
+    assert_eq!(opened["nativeId"], json!(native_id.to_string()));
+    let call = host.calls.borrow()[0].clone();
+    assert_eq!(call["path"], json!(original));
+    let lock = PathBuf::from(call["lock"].as_str().unwrap());
+    assert_eq!(lock, crate::pi_sessions::lock_file(&original).unwrap());
+    assert!(!lock.starts_with(crate::pi_sessions::agent_directory().unwrap()));
+    assert!(lock.parent().unwrap().is_dir());
+    assert!(host.forks.borrow().is_empty());
+
+    // Continue in Pi, then fork: the copy carries every raw turn.
+    let mut continued = bytes.clone();
+    continued.extend(native::encode(&[json!({"type":"message","id":"later","parentId":"start","message":{"role":"assistant","content":"Later turn"}})]));
+    fs::write(&original, &continued).unwrap();
+    let fork =
+        session_launcher::launch_with(id, Tool::Pi, Destination::Terminal, true, &host).unwrap();
+    assert_eq!(fork["forked"], true);
+    let copy = PathBuf::from(host.calls.borrow()[1]["path"].as_str().unwrap());
+    assert!(copy.starts_with(crate::pi_sessions::copy_directory().unwrap()));
+    let raw = native::complete_records(&continued).unwrap();
+    let copied = native::complete_records(&fs::read(&copy).unwrap()).unwrap();
+    assert_eq!(copied[0]["id"], fork["nativeId"]);
+    assert_eq!(&copied[1..], &raw[1..]);
+    assert_eq!(fs::read(&original).unwrap(), continued);
+    let fork_id = fork["resourceId"].as_str().unwrap();
+    // The new Pi file keeps the raw turns; Orka's stored snapshot is redacted
+    // and no raw session bytes reach its blob store.
+    assert!(fs::read_to_string(&copy).unwrap().contains(secret));
+    let stored = crate::local_resources::resource(&f.db, fork_id).unwrap();
+    let snapshot = json!(crate::history::resource_records(&stored).unwrap()).to_string();
+    assert!(!snapshot.contains(secret), "{snapshot}");
+    assert!(snapshot.contains("Later turn"));
+    for raw in [continued.clone(), fs::read(&copy).unwrap()] {
+        assert!(!db::blob_path(&db::digest(&raw)).unwrap().exists());
+    }
+    assert_eq!(
+        crate::resource_commands::paths(&f.db, &f.project, &json!({"resourceId":fork_id})).unwrap(),
+        [copy.canonicalize().unwrap()]
+    );
+
+    // A copy that no longer matches the checkout cannot reopen, but forking it
+    // still keeps the turns added in Pi.
+    let mut moved = copied.clone();
+    moved[0]["cwd"] = json!("/moved/checkout");
+    moved.push(json!({"type":"message","id":"copy-turn","parentId":"later","message":{"role":"user","content":"Turn in the copy"}}));
+    fs::write(&copy, native::encode(&moved)).unwrap();
+    let options = json!(session_launcher::options_with(fork_id, &host).unwrap());
+    assert_eq!(options[0]["available"], false);
+    assert_eq!(options[0]["forkAvailable"], true);
+    let refork =
+        session_launcher::launch_with(fork_id, Tool::Pi, Destination::Terminal, true, &host)
+            .unwrap();
+    let refork_path = PathBuf::from(host.calls.borrow()[2]["path"].as_str().unwrap());
+    let reforked = native::complete_records(&fs::read(&refork_path).unwrap()).unwrap();
+    assert_eq!(reforked[0]["id"], refork["nativeId"]);
+    assert_eq!(reforked[0]["cwd"], json!(f.root));
+    assert_eq!(&reforked[1..], &moved[1..]);
+
+    // A copy with an invalid Pi tree or exceeding the size cap falls back to
+    // the stored snapshot on explicit fork instead of copying invalid data.
+    fs::write(
+        &copy,
+        native::encode(&[
+            copied[0].clone(),
+            json!({"type":"message","id":"broken","parentId":"missing","message":{"role":"user","content":"Dangling branch"}}),
+        ]),
+    )
+    .unwrap();
+    let snapshot = crate::local_resources::resource(&f.db, fork_id).unwrap();
+    let current = crate::session_forks::current_resource(&f.db, &snapshot).unwrap();
+    assert_eq!(current["files"], snapshot["files"]);
+    let recovered_tree =
+        session_launcher::launch_with(fork_id, Tool::Pi, Destination::Terminal, true, &host)
+            .unwrap();
+    let recovered_tree_path = PathBuf::from(
+        host.calls.borrow().last().unwrap()["path"]
+            .as_str()
+            .unwrap(),
+    );
+    let recovered_tree_records =
+        native::complete_records(&fs::read(&recovered_tree_path).unwrap()).unwrap();
+    assert!(native::validate_session_import("pi", &recovered_tree_records).is_ok());
+    assert_ne!(recovered_tree["nativeId"], fork["nativeId"]);
+
+    fs::File::create(&copy)
+        .unwrap()
+        .set_len(crate::history::MAX_FILE + 1)
+        .unwrap();
+    assert!(
+        session_launcher::resume_with(fork_id, Tool::Pi, Destination::Terminal, &host).is_err()
+    );
+    let current = crate::session_forks::current_resource(&f.db, &snapshot).unwrap();
+    assert_eq!(current["files"], snapshot["files"]);
+    let recovered_oversized =
+        session_launcher::launch_with(fork_id, Tool::Pi, Destination::Terminal, true, &host)
+            .unwrap();
+    assert_ne!(recovered_oversized["nativeId"], fork["nativeId"]);
+
+    // A corrupt copy is preserved and an explicit fork recovers from the snapshot.
+    fs::write(&copy, "invalid JSON\n").unwrap();
+    let recovered =
+        session_launcher::launch_with(fork_id, Tool::Pi, Destination::Terminal, true, &host)
+            .unwrap();
+    assert_ne!(recovered["nativeId"], fork["nativeId"]);
+    assert_eq!(fs::read_to_string(&copy).unwrap(), "invalid JSON\n");
+
+    // An oversized own file cannot resume, but Fork still recovers from the snapshot.
+    fs::File::create(&original)
+        .unwrap()
+        .set_len(crate::history::MAX_FILE + 1)
+        .unwrap();
+    let options = json!(session_launcher::options_with(id, &host).unwrap());
+    assert_eq!(options[0]["available"], false);
+    assert_eq!(options[0]["forkAvailable"], true);
+    assert!(session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).is_err());
+    let rescued_oversized =
+        session_launcher::launch_with(id, Tool::Pi, Destination::Terminal, true, &host).unwrap();
+    assert_eq!(rescued_oversized["forked"], true);
+
+    // A corrupt own file cannot resume, but Fork still recovers from the snapshot.
+    fs::write(&original, "invalid JSON\n").unwrap();
+    let options = json!(session_launcher::options_with(id, &host).unwrap());
+    assert_eq!(options[0]["available"], false);
+    assert_eq!(options[0]["forkAvailable"], true);
+    assert!(session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).is_err());
+    let rescued =
+        session_launcher::launch_with(id, Tool::Pi, Destination::Terminal, true, &host).unwrap();
+    assert_eq!(rescued["forked"], true);
+    assert_eq!(fs::read_to_string(&original).unwrap(), "invalid JSON\n");
+
+    // MacHost's overlap check and the launch script share one Orka-owned lock.
+    let held = fs::File::create(crate::pi_sessions::prepare_lock(&copy).unwrap()).unwrap();
+    use std::os::fd::AsRawFd;
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(crate::pi_sessions::launch_in_use(&copy));
+    drop(held);
+    assert!(!crate::pi_sessions::launch_in_use(&copy));
+    assert!(f.outbox().is_empty());
+}
+
+#[test]
+fn pi_origin_tombstone_keeps_descendants_as_local_only_copies() {
+    let f = Fixture::new();
+    let source = session(&f, "pi", true);
+    let id = source["resourceId"].as_str().unwrap();
+    let host = FakeHost::default();
+    let first = session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    let first_id = first["resourceId"].as_str().unwrap();
+    let parent = crate::local_resources::resource(&f.db, first_id).unwrap();
+    let nested =
+        session_launcher::launch_with(first_id, Tool::Pi, Destination::Terminal, true, &host)
+            .unwrap();
+    let pending = crate::pi_sessions::fork(&f.db, &f.project, &parent).unwrap();
+    let mut deletion = source.clone();
+    deletion["revision"] = json!(2);
+    deletion["deleted"] = json!(true);
+    deletion["files"] = json!([]);
+    sync::apply_event(&f.db, &json!({"resource":deletion,"conflicts":[]})).unwrap();
+    for copy in [&first, &nested] {
+        let copy_id = copy["resourceId"].as_str().unwrap();
+        assert!(crate::local_resources::resource(&f.db, copy_id).is_ok());
+        assert_eq!(
+            indexer::binding(&f.db, copy_id)
+                .unwrap()
+                .get("piCopyOrigin"),
+            Some(&Value::Null)
+        );
+        let reopened =
+            session_launcher::resume_with(copy_id, Tool::Pi, Destination::Terminal, &host).unwrap();
+        assert_eq!(reopened["nativeId"], copy["nativeId"]);
+    }
+    assert!(crate::session_forks::record(&f.db, &parent, &pending, "terminal").is_ok());
+    assert!(host
+        .calls
+        .borrow()
+        .iter()
+        .all(|call| Path::new(call["path"].as_str().unwrap()).is_file()));
+    assert!(f.outbox().is_empty());
+}
+
+#[test]
+fn pi_copies_survive_a_folder_disconnect_and_purge_and_read_from_the_snapshot() {
+    let f = Fixture::new();
+    let project = f.project["id"].as_str().unwrap();
+    let mut source = session(&f, "pi", true);
+    source["logicalPath"] = json!(format!("pi/{}", source["resourceId"].as_str().unwrap()));
+    let id = source["resourceId"].as_str().unwrap();
+    db::upsert(&f.db, "resources", id, project, &source).unwrap();
+    let host = FakeHost::default();
+    let first = session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    let copy_id = first["resourceId"].as_str().unwrap();
+    let copy = PathBuf::from(host.calls.borrow()[0]["path"].as_str().unwrap());
+
+    crate::commands::disconnect_project(project.into()).unwrap();
+    assert_eq!(indexer::binding(&f.db, id).unwrap(), json!({}));
+    assert!(crate::pi_sessions::is_private_copy(
+        &indexer::binding(&f.db, copy_id).unwrap()
+    ));
+    crate::governance::reset(&f.db, project, &json!([{"resource":source}])).unwrap();
+    assert!(crate::local_resources::resource(&f.db, copy_id).is_ok());
+
+    // Reconnecting the same folder reopens the same copy.
+    db::upsert(&f.db, "projects", project, project, &f.project).unwrap();
+    let reopened =
+        session_launcher::resume_with(copy_id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    assert_eq!(reopened["nativeId"], first["nativeId"]);
+
+    // Reading a copy uses its file even after the checkout moved, and falls
+    // back to the stored snapshot only when the file is unreadable.
+    let stored = crate::local_resources::resource(&f.db, copy_id).unwrap();
+    let mut records = native::complete_records(&fs::read(&copy).unwrap()).unwrap();
+    records[0]["cwd"] = json!("/moved/checkout");
+    records.push(json!({"type":"message","id":"copy-turn","parentId":"request","message":{"role":"user","content":"Turn in the copy"}}));
+    fs::write(&copy, native::encode(&records)).unwrap();
+    let current = crate::session_forks::current_resource(&f.db, &stored).unwrap();
+    assert_eq!(
+        crate::history::resource_records(&current)
+            .unwrap()
+            .last()
+            .unwrap()["message"]["content"],
+        "Turn in the copy"
+    );
+    let capped =
+        crate::commands::inspect_resource(copy_id.into(), "session.jsonl".into(), None, Some(0))
+            .unwrap();
+    assert_eq!(capped["tooLarge"], true);
+    let download = |path: &Path| {
+        crate::commands::export_bundle(
+            copy_id.into(),
+            path.to_string_lossy().into(),
+            Some(serde_json::from_value(capped["sessionSnapshot"].clone()).unwrap()),
+        )
+    };
+    let copy_zip = f._home.path().join("pi-copy.zip");
+    download(&copy_zip).unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(copy_zip).unwrap()).unwrap();
+    let mut transcript = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("transcript.md").unwrap(), &mut transcript)
+        .unwrap();
+    assert!(transcript.contains("Turn in the copy"), "{transcript}");
+    let live = fs::read(&copy).unwrap();
+    fs::write(&copy, "invalid JSON\n").unwrap();
+    assert_eq!(
+        crate::session_forks::current_resource(&f.db, &stored).unwrap(),
+        stored
+    );
+    let changed_zip = f._home.path().join("changed-pi-copy.zip");
+    assert_eq!(
+        download(&changed_zip).unwrap_err(),
+        "session_snapshot_changed"
+    );
+    assert!(!changed_zip.exists());
+    fs::write(&copy, &live).unwrap();
+
+    // A purge with a grace period keeps the project while a copy remains.
+    let mut doomed = f.project.clone();
+    doomed["purgeAfter"] = json!(db::now());
+    db::upsert(&f.db, "projects", project, project, &doomed).unwrap();
+    f.db.purge_local(project).unwrap();
+    // Like local drafts, the copy's records and file are kept for recovery.
+    assert!(crate::pi_sessions::is_private_copy(
+        &indexer::binding(&f.db, copy_id).unwrap()
+    ));
+    assert_eq!(
+        db::rows(&f.db, "SELECT value FROM resources WHERE id=?", &[&copy_id])
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(copy.is_file());
+    // The recovery export carries the copy's later turns, read straight from
+    // the file rather than from a blob an earlier read stored.
+    let mut records = native::complete_records(&fs::read(&copy).unwrap()).unwrap();
+    records.push(json!({"type":"message","id":"export-turn","parentId":"copy-turn","message":{"role":"user","content":"Turn only on disk"}}));
+    fs::write(&copy, native::encode(&records)).unwrap();
+    let path = f._home.path().join("purged-project.zip");
+    crate::bundles::export_project(&db::CacheScope::current().unwrap(), project, &path).unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+    let mut transcript = String::new();
+    std::io::Read::read_to_string(
+        &mut zip
+            .by_name(&format!("resources/{copy_id}/transcript.md"))
+            .unwrap(),
+        &mut transcript,
+    )
+    .unwrap();
+    assert!(transcript.contains("Turn only on disk"), "{transcript}");
+    let prefix = format!("resources/{copy_id}/blobs/");
+    let exported: Vec<String> = (0..zip.len())
+        .filter_map(|index| {
+            let name = zip.by_index(index).unwrap().name().unwrap().into_owned();
+            name.strip_prefix(&prefix).map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(exported.len(), 1, "{exported:?}");
+    assert!(!db::blob_path(&exported[0]).unwrap().exists());
+    // An oversized copy falls back to its stored snapshot instead of aborting export.
+    fs::File::create(&copy)
+        .unwrap()
+        .set_len(crate::history::MAX_FILE + 1)
+        .unwrap();
+    let fallback_zip = f._home.path().join("purged-project-fallback.zip");
+    crate::bundles::export_project(&db::CacheScope::current().unwrap(), project, &fallback_zip)
+        .unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(fallback_zip).unwrap()).unwrap();
+    let mut fallback_transcript = String::new();
+    std::io::Read::read_to_string(
+        &mut zip
+            .by_name(&format!("resources/{copy_id}/transcript.md"))
+            .unwrap(),
+        &mut fallback_transcript,
+    )
+    .unwrap();
+    assert!(
+        fallback_transcript.contains("Continue in Pi"),
+        "{fallback_transcript}"
+    );
+    assert!(f.outbox().is_empty());
+}
+
+#[test]
+fn pi_terminal_script_opens_the_exact_copy_and_blocks_an_overlapping_launch() {
+    let f = Fixture::new();
+    let input = f.root.join("copy 'with spaces'.jsonl");
+    fs::write(&input, "synthetic session").unwrap();
+    let binary = f.root.join("pi stub");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$PI_CODING_AGENT_DIR\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let home = f.root.join("pi home");
+    let lock_path = f.root.join("session.lock");
+    let marker = f.root.join("started");
+    let script = f.root.join("launch.command");
+    let tab = f.root.join("tab.toml");
+    let legacy = f.root.join("launch.yaml");
+    let launch = || {
+        for config in [&tab, &legacy] {
+            fs::write(config, "fixture configuration").unwrap();
+        }
+        fs::write(
+            &script,
+            session_launcher::terminal_script(
+                &binary,
+                Tool::Pi,
+                LaunchIntent::PiSession {
+                    path: &input,
+                    lock: &lock_path,
+                },
+                &f.root,
+                &home,
+                &[&tab, &legacy],
+                Some(&marker),
+            ),
+        )
+        .unwrap();
+        Command::new("/bin/sh").arg(&script).output().unwrap()
+    };
+    let result = launch();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(marker.is_file());
+    assert!(!script.exists());
+    assert!(!tab.exists());
+    assert!(!legacy.exists());
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        format!(
+            "{}\n{}\n--session\n{}\n",
+            f.root.display(),
+            home.display(),
+            input.display()
+        )
+    );
+    fs::remove_file(&marker).unwrap();
+    let lock = fs::File::open(&lock_path).unwrap();
+    use std::os::fd::AsRawFd;
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(!launch().status.success());
+    assert!(!marker.exists());
+    assert!(
+        script.is_file(),
+        "a denied lock must not consume the startup token"
+    );
+    assert!(tab.is_file());
+    assert!(legacy.is_file());
 }
 
 #[test]
@@ -1118,7 +1712,7 @@ fn cached_session_download_keeps_original_bytes_and_complete_context_without_a_r
         .unwrap();
         let binding = indexer::binding(&f.db, id).unwrap();
         let path = f._home.path().join(format!("{source}.zip"));
-        crate::commands::export_bundle(id.into(), path.to_string_lossy().into()).unwrap();
+        crate::commands::export_bundle(id.into(), path.to_string_lossy().into(), None).unwrap();
         let mut zip = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
         let mut manifest = String::new();
         zip.by_name("manifest.json")
@@ -1373,7 +1967,7 @@ fn codex_trust_launcher_starts_without_a_prompt_in_the_connected_folder() {
             LaunchIntent::Start,
             &root,
             &home,
-            None,
+            &[],
             None,
         ),
     )
@@ -1405,16 +1999,23 @@ fn terminal_scripts_preserve_arguments_working_directory_and_native_home_literal
                 .join("launcher exec ' $USER\nexec script.command");
             let config = temp.path().join("config exec ' $USER\nexec config.yaml");
             let started = temp.path().join("started exec ' $USER\nexec marker");
+            let legacy = temp.path().join("legacy exec ' $USER\nexec config.yaml");
             if cleanup_config {
                 fs::write(&config, "temporary launcher config").unwrap();
+                fs::write(&legacy, "temporary legacy launcher config").unwrap();
             }
+            let cleanup = if cleanup_config {
+                vec![config.as_path(), legacy.as_path()]
+            } else {
+                Vec::new()
+            };
             let script = session_launcher::terminal_script(
                 &binary,
                 tool,
                 LaunchIntent::Resume("exact-session-id"),
                 &root,
                 &home,
-                cleanup_config.then_some(config.as_path()),
+                &cleanup,
                 track_startup.then_some(started.as_path()),
             );
             fs::write(&path, &script).unwrap();
@@ -1437,14 +2038,19 @@ fn terminal_scripts_preserve_arguments_working_directory_and_native_home_literal
             assert!(!script.contains("--continue"));
             assert!(!path.exists());
             assert!(!config.exists());
+            assert!(!legacy.exists());
             assert_eq!(started.exists(), track_startup);
             if track_startup {
                 fs::remove_file(started).unwrap();
             }
         }
     }
-    let config: Value =
-        serde_json::from_str(&session_launcher::warp_config(&binary, &root)).unwrap();
+    let config: Value = serde_json::from_str(&session_launcher::warp_config(
+        "orka_fixture",
+        &binary,
+        &root,
+    ))
+    .unwrap();
     assert_eq!(
         config["windows"][0]["tabs"][0]["layout"]["commands"][0]["exec"],
         format!(
@@ -1456,6 +2062,170 @@ fn terminal_scripts_preserve_arguments_working_directory_and_native_home_literal
         config["windows"][0]["tabs"][0]["layout"]["cwd"],
         json!(root)
     );
+    let tab: toml::Table = session_launcher::warp_tab_config(&binary, &root)
+        .parse()
+        .unwrap();
+    let pane = &tab["panes"].as_array().unwrap()[0];
+    assert_eq!(pane["type"].as_str(), Some("terminal"));
+    assert_eq!(pane["directory"].as_str(), Some(&*root.to_string_lossy()));
+    assert_eq!(
+        pane["commands"].as_array().unwrap()[0].as_str().unwrap(),
+        format!(
+            "/bin/sh {}",
+            session_launcher::shell_quote(&binary.to_string_lossy())
+        )
+    );
+}
+
+#[test]
+fn warp_uses_each_config_when_the_other_directory_is_unsafe() {
+    for (blocked, route) in [
+        ("tab_configs", "warp://launch/orka_fixture"),
+        (
+            "launch_configurations",
+            "warp://tab_config/orka_fixture?new_window=true",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let warp = home.join(".warp");
+        fs::create_dir(&warp).unwrap();
+        let other = home.join("other");
+        fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&other, warp.join(blocked)).unwrap();
+        let script = home.join("launch.command");
+        let started = home.join("launch.started");
+        let configs =
+            session_launcher::prepare_warp_configs(home, "orka_fixture", &script, home).unwrap();
+        assert_eq!(configs.iter().filter(|config| config.is_ok()).count(), 1);
+        let mut opens = Vec::new();
+        session_launcher::open_warp(&configs, &started, Duration::ZERO, |url| {
+            opens.push(url.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(opens, [route]);
+        assert!(fs::read_dir(other).unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn warp_falls_back_after_rejected_or_silent_dispatch_and_stops_after_start() {
+    for (tab_starts, tab_rejected, legacy_rejected) in [
+        (true, false, false),
+        (false, false, false),
+        (false, true, false),
+        (false, true, true),
+        (false, false, true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let script = home.join("launch.command");
+        let started = home.join("launch.started");
+        fs::write(&script, "fixture launch token").unwrap();
+        let configs =
+            session_launcher::prepare_warp_configs(home, "orka_fixture", &script, home).unwrap();
+        let mut opens = Vec::new();
+        let result = session_launcher::open_warp(&configs, &started, Duration::ZERO, |url| {
+            opens.push(url.to_owned());
+            if url == "warp://tab_config/orka_fixture?new_window=true" {
+                if tab_starts {
+                    fs::rename(&script, &started).unwrap();
+                }
+                if tab_rejected {
+                    return Err("Tab Config dispatch failed".into());
+                }
+            } else {
+                assert_eq!(url, "warp://launch/orka_fixture");
+                let config =
+                    fs::read_to_string(home.join(".warp/launch_configurations/orka_fixture.yaml"))
+                        .unwrap();
+                // Warp matches the URI stem against the YAML name field.
+                let config: Value = serde_json::from_str(&config).unwrap();
+                assert_eq!(config["name"], "orka_fixture");
+                if legacy_rejected {
+                    return Err("Legacy dispatch failed".into());
+                }
+                fs::rename(&script, &started).unwrap();
+            }
+            Ok(())
+        });
+        assert_eq!(opens.len(), if tab_starts { 1 } else { 2 });
+        assert_eq!(result.is_err(), tab_rejected && legacy_rejected);
+        assert_eq!(
+            session_launcher::finish_terminal_launch(&script, &started).unwrap(),
+            tab_starts || !legacy_rejected
+        );
+        assert!(!script.exists());
+        assert!(!started.exists());
+    }
+}
+
+#[test]
+fn warp_starts_at_most_once_even_with_preopened_scripts() {
+    for cancel in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let script = root.join("launch.command");
+        let started = root.join("launch.started");
+        let tab = root.join("tab.toml");
+        let legacy = root.join("launch.yaml");
+        let binary = root.join("codex");
+        fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        for config in [&tab, &legacy] {
+            fs::write(config, "fixture configuration").unwrap();
+        }
+        fs::write(
+            &script,
+            session_launcher::terminal_script(
+                &binary,
+                Tool::Codex,
+                LaunchIntent::Resume("session-1"),
+                root,
+                root,
+                &[&tab, &legacy],
+                Some(&started),
+            ),
+        )
+        .unwrap();
+
+        // Both shells already have the script open when startup or
+        // cancellation is decided. Deleting the source alone cannot stop them.
+        let preopened = [
+            fs::File::open(&script).unwrap(),
+            fs::File::open(&script).unwrap(),
+        ];
+        if cancel {
+            assert!(!session_launcher::finish_terminal_launch(&script, &started).unwrap());
+        }
+        let processes = preopened.map(|file| {
+            Command::new("/bin/sh")
+                .args(["-c", ". /dev/fd/0"])
+                .arg(&script)
+                .stdin(file)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        });
+        let outputs = processes.map(|process| process.wait_with_output().unwrap());
+        for output in &outputs {
+            assert!(output.status.success(), "{output:?}");
+        }
+        let launches = outputs.iter().filter(|output| !output.stdout.is_empty());
+        assert_eq!(launches.clone().count(), usize::from(!cancel));
+        for output in launches {
+            assert_eq!(output.stdout, b"resume\nsession-1\n");
+        }
+        assert_eq!(
+            session_launcher::finish_terminal_launch(&script, &started).unwrap(),
+            !cancel
+        );
+        assert!(!script.exists());
+        assert!(!started.exists());
+        assert_eq!(tab.exists(), cancel);
+        assert_eq!(legacy.exists(), cancel);
+    }
 }
 
 #[test]
@@ -1785,7 +2555,7 @@ fn cross_provider_cli_receives_one_literal_prompt_without_a_resume_id() {
             LaunchIntent::Handoff(prompt),
             temp.path(),
             temp.path(),
-            None,
+            &[],
             None,
         );
         fs::write(&path, script).unwrap();
@@ -1892,4 +2662,97 @@ fn claude_desktop_capability_rejects_api_auth_and_missing_subscription_without_e
             assert!(!message.contains("private-address"));
         }
     }
+}
+
+#[test]
+fn forking_a_shared_pi_session_reuses_an_existing_copy_turns() {
+    let f = Fixture::new();
+    let resource = session(&f, "pi", true);
+    let id = resource["resourceId"].as_str().unwrap();
+    let host = FakeHost::default();
+    let first =
+        session_launcher::launch_with(id, Tool::Pi, Destination::Terminal, false, &host).unwrap();
+    let path = std::path::PathBuf::from(host.calls.borrow()[0]["path"].as_str().unwrap());
+    let mut records = native::complete_records(&fs::read(&path).unwrap()).unwrap();
+    let leaf = records.last().unwrap()["id"].as_str().unwrap().to_owned();
+    records.push(json!({"type":"message","id":"copy-turn","parentId":leaf,"message":{"role":"user","content":"Turn in the existing copy"}}));
+    fs::write(&path, native::encode(&records)).unwrap();
+    let forked =
+        session_launcher::launch_with(id, Tool::Pi, Destination::Terminal, true, &host).unwrap();
+    assert_ne!(forked["nativeId"], first["nativeId"]);
+    let forked_path = std::path::PathBuf::from(host.calls.borrow()[1]["path"].as_str().unwrap());
+    let forked_records = native::complete_records(&fs::read(&forked_path).unwrap()).unwrap();
+    assert!(
+        forked_records
+            .iter()
+            .any(|r| r["message"]["content"] == "Turn in the existing copy"),
+        "fork lost the existing copy turn: {forked_records:?}"
+    );
+}
+
+#[test]
+fn pi_recovery_export_redacts_new_and_legacy_snapshots() {
+    let f = Fixture::new();
+    let project = f.project["id"].as_str().unwrap();
+    let resource = session(&f, "pi", true);
+    let id = resource["resourceId"].as_str().unwrap();
+    let host = FakeHost::default();
+    let first = session_launcher::resume_with(id, Tool::Pi, Destination::Terminal, &host).unwrap();
+    let copy = PathBuf::from(host.calls.borrow()[0]["path"].as_str().unwrap());
+    let mut records = native::complete_records(&fs::read(&copy).unwrap()).unwrap();
+    const TOKEN: &str = "synthetic-pi-token-for-recovery-test";
+    records.push(json!({
+        "type":"message","id":"note","parentId":"request",
+        "message":{"role":"user","content":format!("Bearer {TOKEN}")}
+    }));
+    fs::write(&copy, native::encode(&records)).unwrap();
+    let fork = session_launcher::launch_with(
+        first["resourceId"].as_str().unwrap(),
+        Tool::Pi,
+        Destination::Terminal,
+        true,
+        &host,
+    )
+    .unwrap();
+    let fork_id = fork["resourceId"].as_str().unwrap();
+    let fork_path = PathBuf::from(host.calls.borrow()[1]["path"].as_str().unwrap());
+    let raw = fs::read(&fork_path).unwrap();
+    assert!(String::from_utf8_lossy(&raw).contains(TOKEN));
+
+    let stored = crate::local_resources::resource(&f.db, fork_id).unwrap();
+    let snapshot = db::blob_read(stored["files"][0]["hash"].as_str().unwrap()).unwrap();
+    assert!(!String::from_utf8_lossy(&snapshot).contains(TOKEN));
+    assert!(String::from_utf8_lossy(&snapshot).contains("[REDACTED]"));
+
+    // Simulate a private copy created by the earlier build with a raw cache.
+    let legacy = crate::pi_sessions::with_session_file(&stored, &raw, &db::blob(&raw).unwrap());
+    db::upsert(&f.db, "resources", fork_id, project, &legacy).unwrap();
+    fs::remove_file(fork_path).unwrap();
+    let current = crate::session_forks::current_resource(&f.db, &legacy).unwrap();
+    assert_eq!(current, stored);
+
+    let path = f._home.path().join("recovery.zip");
+    crate::bundles::export_project(&db::CacheScope::current().unwrap(), project, &path).unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+    let manifest: Value = serde_json::from_reader(
+        zip.by_name(&format!("resources/{fork_id}/resource.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["files"], stored["files"]);
+    assert_eq!(manifest["hash"], stored["hash"]);
+    let raw_hash = legacy["files"][0]["hash"].as_str().unwrap();
+    assert!(zip
+        .by_name(&format!("resources/{fork_id}/blobs/{raw_hash}"))
+        .is_err());
+    let expected_hash = stored["files"][0]["hash"].as_str().unwrap();
+    let mut exported = Vec::new();
+    std::io::Read::read_to_end(
+        &mut zip
+            .by_name(&format!("resources/{fork_id}/blobs/{expected_hash}"))
+            .unwrap(),
+        &mut exported,
+    )
+    .unwrap();
+    assert_eq!(exported, snapshot);
 }
