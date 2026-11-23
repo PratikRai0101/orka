@@ -713,7 +713,12 @@ fn pi_terminal_script_opens_the_exact_copy_and_blocks_an_overlapping_launch() {
     let lock_path = f.root.join("session.lock");
     let marker = f.root.join("started");
     let script = f.root.join("launch.command");
+    let tab = f.root.join("tab.toml");
+    let legacy = f.root.join("launch.yaml");
     let launch = || {
+        for config in [&tab, &legacy] {
+            fs::write(config, "fixture configuration").unwrap();
+        }
         fs::write(
             &script,
             session_launcher::terminal_script(
@@ -725,7 +730,7 @@ fn pi_terminal_script_opens_the_exact_copy_and_blocks_an_overlapping_launch() {
                 },
                 &f.root,
                 &home,
-                None,
+                &[&tab, &legacy],
                 Some(&marker),
             ),
         )
@@ -739,6 +744,9 @@ fn pi_terminal_script_opens_the_exact_copy_and_blocks_an_overlapping_launch() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(marker.is_file());
+    assert!(!script.exists());
+    assert!(!tab.exists());
+    assert!(!legacy.exists());
     assert_eq!(
         String::from_utf8(result.stdout).unwrap(),
         format!(
@@ -757,6 +765,12 @@ fn pi_terminal_script_opens_the_exact_copy_and_blocks_an_overlapping_launch() {
     );
     assert!(!launch().status.success());
     assert!(!marker.exists());
+    assert!(
+        script.is_file(),
+        "a denied lock must not consume the startup token"
+    );
+    assert!(tab.is_file());
+    assert!(legacy.is_file());
 }
 
 #[test]
@@ -1929,7 +1943,7 @@ fn codex_trust_launcher_starts_without_a_prompt_in_the_connected_folder() {
             LaunchIntent::Start,
             &root,
             &home,
-            None,
+            &[],
             None,
         ),
     )
@@ -1961,16 +1975,23 @@ fn terminal_scripts_preserve_arguments_working_directory_and_native_home_literal
                 .join("launcher exec ' $USER\nexec script.command");
             let config = temp.path().join("config exec ' $USER\nexec config.yaml");
             let started = temp.path().join("started exec ' $USER\nexec marker");
+            let legacy = temp.path().join("legacy exec ' $USER\nexec config.yaml");
             if cleanup_config {
                 fs::write(&config, "temporary launcher config").unwrap();
+                fs::write(&legacy, "temporary legacy launcher config").unwrap();
             }
+            let cleanup = if cleanup_config {
+                vec![config.as_path(), legacy.as_path()]
+            } else {
+                Vec::new()
+            };
             let script = session_launcher::terminal_script(
                 &binary,
                 tool,
                 LaunchIntent::Resume("exact-session-id"),
                 &root,
                 &home,
-                cleanup_config.then_some(config.as_path()),
+                &cleanup,
                 track_startup.then_some(started.as_path()),
             );
             fs::write(&path, &script).unwrap();
@@ -1993,14 +2014,19 @@ fn terminal_scripts_preserve_arguments_working_directory_and_native_home_literal
             assert!(!script.contains("--continue"));
             assert!(!path.exists());
             assert!(!config.exists());
+            assert!(!legacy.exists());
             assert_eq!(started.exists(), track_startup);
             if track_startup {
                 fs::remove_file(started).unwrap();
             }
         }
     }
-    let config: Value =
-        serde_json::from_str(&session_launcher::warp_config(&binary, &root)).unwrap();
+    let config: Value = serde_json::from_str(&session_launcher::warp_config(
+        "orka_fixture",
+        &binary,
+        &root,
+    ))
+    .unwrap();
     assert_eq!(
         config["windows"][0]["tabs"][0]["layout"]["commands"][0]["exec"],
         format!(
@@ -2012,6 +2038,170 @@ fn terminal_scripts_preserve_arguments_working_directory_and_native_home_literal
         config["windows"][0]["tabs"][0]["layout"]["cwd"],
         json!(root)
     );
+    let tab: toml::Table = session_launcher::warp_tab_config(&binary, &root)
+        .parse()
+        .unwrap();
+    let pane = &tab["panes"].as_array().unwrap()[0];
+    assert_eq!(pane["type"].as_str(), Some("terminal"));
+    assert_eq!(pane["directory"].as_str(), Some(&*root.to_string_lossy()));
+    assert_eq!(
+        pane["commands"].as_array().unwrap()[0].as_str().unwrap(),
+        format!(
+            "/bin/sh {}",
+            session_launcher::shell_quote(&binary.to_string_lossy())
+        )
+    );
+}
+
+#[test]
+fn warp_uses_each_config_when_the_other_directory_is_unsafe() {
+    for (blocked, route) in [
+        ("tab_configs", "warp://launch/orka_fixture"),
+        (
+            "launch_configurations",
+            "warp://tab_config/orka_fixture?new_window=true",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let warp = home.join(".warp");
+        fs::create_dir(&warp).unwrap();
+        let other = home.join("other");
+        fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&other, warp.join(blocked)).unwrap();
+        let script = home.join("launch.command");
+        let started = home.join("launch.started");
+        let configs =
+            session_launcher::prepare_warp_configs(home, "orka_fixture", &script, home).unwrap();
+        assert_eq!(configs.iter().filter(|config| config.is_ok()).count(), 1);
+        let mut opens = Vec::new();
+        session_launcher::open_warp(&configs, &started, Duration::ZERO, |url| {
+            opens.push(url.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(opens, [route]);
+        assert!(fs::read_dir(other).unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn warp_falls_back_after_rejected_or_silent_dispatch_and_stops_after_start() {
+    for (tab_starts, tab_rejected, legacy_rejected) in [
+        (true, false, false),
+        (false, false, false),
+        (false, true, false),
+        (false, true, true),
+        (false, false, true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let script = home.join("launch.command");
+        let started = home.join("launch.started");
+        fs::write(&script, "fixture launch token").unwrap();
+        let configs =
+            session_launcher::prepare_warp_configs(home, "orka_fixture", &script, home).unwrap();
+        let mut opens = Vec::new();
+        let result = session_launcher::open_warp(&configs, &started, Duration::ZERO, |url| {
+            opens.push(url.to_owned());
+            if url == "warp://tab_config/orka_fixture?new_window=true" {
+                if tab_starts {
+                    fs::rename(&script, &started).unwrap();
+                }
+                if tab_rejected {
+                    return Err("Tab Config dispatch failed".into());
+                }
+            } else {
+                assert_eq!(url, "warp://launch/orka_fixture");
+                let config =
+                    fs::read_to_string(home.join(".warp/launch_configurations/orka_fixture.yaml"))
+                        .unwrap();
+                // Warp matches the URI stem against the YAML name field.
+                let config: Value = serde_json::from_str(&config).unwrap();
+                assert_eq!(config["name"], "orka_fixture");
+                if legacy_rejected {
+                    return Err("Legacy dispatch failed".into());
+                }
+                fs::rename(&script, &started).unwrap();
+            }
+            Ok(())
+        });
+        assert_eq!(opens.len(), if tab_starts { 1 } else { 2 });
+        assert_eq!(result.is_err(), tab_rejected && legacy_rejected);
+        assert_eq!(
+            session_launcher::finish_terminal_launch(&script, &started).unwrap(),
+            tab_starts || !legacy_rejected
+        );
+        assert!(!script.exists());
+        assert!(!started.exists());
+    }
+}
+
+#[test]
+fn warp_starts_at_most_once_even_with_preopened_scripts() {
+    for cancel in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let script = root.join("launch.command");
+        let started = root.join("launch.started");
+        let tab = root.join("tab.toml");
+        let legacy = root.join("launch.yaml");
+        let binary = root.join("codex");
+        fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        for config in [&tab, &legacy] {
+            fs::write(config, "fixture configuration").unwrap();
+        }
+        fs::write(
+            &script,
+            session_launcher::terminal_script(
+                &binary,
+                Tool::Codex,
+                LaunchIntent::Resume("session-1"),
+                root,
+                root,
+                &[&tab, &legacy],
+                Some(&started),
+            ),
+        )
+        .unwrap();
+
+        // Both shells already have the script open when startup or
+        // cancellation is decided. Deleting the source alone cannot stop them.
+        let preopened = [
+            fs::File::open(&script).unwrap(),
+            fs::File::open(&script).unwrap(),
+        ];
+        if cancel {
+            assert!(!session_launcher::finish_terminal_launch(&script, &started).unwrap());
+        }
+        let processes = preopened.map(|file| {
+            Command::new("/bin/sh")
+                .args(["-c", ". /dev/fd/0"])
+                .arg(&script)
+                .stdin(file)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        });
+        let outputs = processes.map(|process| process.wait_with_output().unwrap());
+        for output in &outputs {
+            assert!(output.status.success(), "{output:?}");
+        }
+        let launches = outputs.iter().filter(|output| !output.stdout.is_empty());
+        assert_eq!(launches.clone().count(), usize::from(!cancel));
+        for output in launches {
+            assert_eq!(output.stdout, b"resume\nsession-1\n");
+        }
+        assert_eq!(
+            session_launcher::finish_terminal_launch(&script, &started).unwrap(),
+            !cancel
+        );
+        assert!(!script.exists());
+        assert!(!started.exists());
+        assert_eq!(tab.exists(), cancel);
+        assert_eq!(legacy.exists(), cancel);
+    }
 }
 
 #[test]
@@ -2341,7 +2531,7 @@ fn cross_provider_cli_receives_one_literal_prompt_without_a_resume_id() {
             LaunchIntent::Handoff(prompt),
             temp.path(),
             temp.path(),
-            None,
+            &[],
             None,
         );
         fs::write(&path, script).unwrap();
