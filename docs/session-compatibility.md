@@ -11,6 +11,32 @@ The implementation follows four boundaries:
 3. **Translate on native import.** Source snapshots remain unchanged. Known execution coordinates are remapped in the receiving copy. Claude keeps message UUIDs, parent links, tool IDs, content, and version provenance. Codex keeps its validated inherited prefix, response payloads, compaction, and retained metadata while remapping session references and execution folders.
 4. **Negotiate the receiving server.** Codex initialization establishes the configured native home, rather than matching a user-agent version. A direct child explicitly receives `CODEX_HOME`; an older direct server may omit the home response, but a proxy must prove its home. Standard `app-server` stdio startup works without the newer `--stdio` flag. Version commands are bounded to ten seconds.
 
+## Pi session discovery and sharing
+
+Orka lists Pi's version 2 and 3 JSONL sessions with standard UUIDs in the private
+Sessions collection for their recorded working directory. It scans
+`~/.pi/agent/sessions` by default. Set `PI_CODING_AGENT_DIR` in Orka's environment
+for a different Pi agent directory, or `PI_CODING_AGENT_SESSION_DIR` to override
+its `sessions` subdirectory. Orka expands a leading `~` in both paths. It does
+not read Pi's `sessionDir` setting or per-invocation `--session-dir` flags; set
+the session-directory override to scan those locations. Custom non-UUID
+`--session-id` values are not discovered.
+
+The reader follows the last complete entry's branch and omits tool and setup
+records. Snapshots retain all complete branches and apply Orka's existing
+secret redaction. Discovery does not modify Pi files or enable sharing.
+Deleting a shared Pi snapshot removes only the shared history entry. The Pi
+session stays readable and private on the Mac that owns it.
+
+Use the existing snapshot preview to share one Pi session. The uploader checks
+for `piSessions: 1` before transferring any files. An older service leaves the
+selected snapshot queued locally. Deploy the compatible API and upgrade
+recipient desktops before sharing Pi sessions in a project. A pre-Pi desktop
+can fetch the readable conversation through its connector with the resource ID,
+but its local session sync can report `Unknown tool`. Updated desktops cache
+incoming Pi snapshots for reading and export without installing them into Pi.
+Automatic Pi sharing and Open in Pi are not included.
+
 ## Codex multi-agent rollout replacements
 
 Codex can enter multi-agent v2 by writing a replacement rollout with the same
