@@ -7,7 +7,7 @@ use crate::{
     projects::CAPTURE_ONLY,
     sync_schedule::{jitter, Interval},
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
@@ -647,6 +647,11 @@ impl SyncQueue {
         let Some((mut db, job, _guard)) = Self::lock_and_claim(&scope, &candidate.project)? else {
             return Ok(false);
         };
+        if job.project != WORKSPACE {
+            // Another project's deletion can commit to the same WAL database.
+            // Acquire the writer before reading so a write transaction can wait.
+            db.set_transaction_behavior(TransactionBehavior::Immediate);
+        }
         let result = run(&mut db, &job).await;
         self.settle(&db, job, &result, Self::now(), interval)?;
         Ok(true)
@@ -1805,6 +1810,48 @@ mod tests {
                 .await
                 .unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn a_project_sync_records_its_receipt_during_another_projects_deletion() {
+        use crate::projects::{self, ProjectLifecycle};
+
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ORKA_TEST_HOME", home.path());
+        let db = db::open().unwrap();
+        for id in ["a", "b"] {
+            db::upsert(&db, "projects", id, id, &json!({"id":id})).unwrap();
+        }
+        SyncQueue::enqueue(&db, "a", Priority::User, "fixture", 0).unwrap();
+        let deletion = db::open().unwrap();
+        let ran = SyncQueue::new(0)
+            .run_next(&interval(), async |db, job| {
+                assert_eq!(job.project, "a");
+                let _delete = projects::try_lock_scope(Some("b")).unwrap().unwrap();
+                deletion.execute_batch("BEGIN IMMEDIATE").unwrap();
+                deletion.mark_deleted("b", &json!({})).unwrap();
+                // Finish the deletion when sync requests the writer lock. A
+                // deferred read-to-write upgrade can instead fail immediately.
+                db.busy_handler(Some(move |attempt| {
+                    attempt == 0 && deletion.execute_batch("COMMIT").is_ok()
+                }))
+                .unwrap();
+                let tx = db.transaction().unwrap();
+                let receipt = json!({"resource":{"resourceId":"uploaded","projectId":"a","revision":1},"conflicts":[]});
+                crate::sync::apply_event(&tx, &receipt).unwrap();
+                tx.commit().unwrap();
+                Ok(Outcome::Synced)
+            })
+            .await
+            .unwrap();
+        assert!(ran);
+        assert!(projects::active(&db, "a").is_ok());
+        assert!(projects::active(&db, "b").is_err());
+        assert_eq!(
+            db::rows(&db, "SELECT value FROM resources WHERE id='uploaded'", &[]).unwrap()[0]
+                ["revision"],
+            1
+        );
     }
 
     #[tokio::test]
