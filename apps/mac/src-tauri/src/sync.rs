@@ -2468,8 +2468,8 @@ async fn sync_workspace(
     ))
 }
 
-/// Runs ready queue jobs one at a time, releasing the shared sync slot and the
-/// workspace lock between jobs, until none is ready or foreground work waits.
+/// Runs ready queue jobs one at a time, releasing the shared sync slot and
+/// each job's locks before moving on or yielding to foreground work.
 async fn drain_queue(queue: &mut SyncQueue, interval: &Interval) {
     let Ok(base) = db::base_root() else { return };
     loop {

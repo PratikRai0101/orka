@@ -1095,6 +1095,130 @@ fn deleting_a_project_with_queued_changes_is_refused() {
     assert_eq!(f.outbox().len(), 1);
 }
 
+#[tokio::test]
+async fn deleting_a_project_during_another_projects_sync() {
+    use crate::sync_queue::{Outcome, Priority, SyncQueue};
+    use crate::sync_schedule::Interval;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let f = Fixture::new();
+    let a = f.project["id"].as_str().unwrap();
+    let b = uuid::Uuid::new_v4().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    db::set(&f.db, "config", &json!({"apiUrl":url})).unwrap();
+    crate::env::test_support::install_memory_keychain();
+    crate::auth::test_session(&json!({
+        "user":{"id":db::get(&f.db,"user").unwrap()},
+        "access_token":"fixture","refresh_token":"fixture"
+    }))
+    .unwrap();
+    let db = db::open().unwrap();
+    db::upsert(&db, "projects", a, a, &f.project).unwrap();
+    db::upsert(&db, "projects", &b, &b, &json!({"id":b,"name":"B"})).unwrap();
+    db.execute(
+        "INSERT INTO outbox VALUES('a-pending',?,'/test','{}',NULL)",
+        [a],
+    )
+    .unwrap();
+    let project = b.clone();
+    let service = tokio::spawn(async move {
+        for (expected, body) in [
+            (
+                "GET /v2/projects/capabilities HTTP/1.1",
+                json!({"softDelete":1}),
+            ),
+            (
+                "POST /v2/projects/action HTTP/1.1",
+                json!({"lifecycleRevision":2}),
+            ),
+        ] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim_end(), expected);
+            let mut length = 0;
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            if expected.starts_with("POST") {
+                let mut bytes = vec![0; length];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(request["projectId"], project);
+                assert_eq!(request["action"], "delete");
+            }
+            let body = body.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+
+    let delete = |id: &str| {
+        crate::projects::project_command(
+            "delete".into(),
+            json!({"projectId":id,"expectedRevision":0,"confirmation":"B"}),
+        )
+    };
+    SyncQueue::request(&db, a, Priority::User, "fixture").unwrap();
+    let ran = SyncQueue::new(0)
+        .run_next(&Interval::from_config(&json!({})), async |db, job| {
+            assert_eq!(job.project, a);
+            let same_project = delete(a).await.unwrap_err();
+            assert!(same_project.starts_with("A sync or project operation is in progress"));
+            assert!(crate::projects::try_lock().unwrap().is_none());
+
+            db::set(
+                db,
+                "env:fixture:pending:1",
+                &json!({"header":{"manifest":{"projectId":b}}}),
+            )
+            .unwrap();
+            let pending = delete(&b).await.unwrap_err();
+            assert!(pending.contains("before deleting this project"));
+            db.execute("DELETE FROM meta WHERE key='env:fixture:pending:1'", [])
+                .unwrap();
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), delete(&b))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(SyncQueue::states(db, 0)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["projectId"] == a && row["state"] == "running"));
+            assert!(crate::projects::active(db, a).is_ok());
+            assert!(crate::projects::active(db, &b).is_err());
+            assert_eq!(
+                db::rows(db, "SELECT value FROM projects WHERE id=?", &[&b]).unwrap()[0]
+                    ["lifecycleRevision"],
+                2
+            );
+            Ok(Outcome::Synced)
+        })
+        .await
+        .unwrap();
+    assert!(ran);
+    service.await.unwrap();
+}
+
 #[test]
 fn leaving_a_project_with_queued_changes_is_refused() {
     let f = Fixture::new();
