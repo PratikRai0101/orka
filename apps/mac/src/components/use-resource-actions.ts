@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import type { WorkspaceResource as Resource } from "../types.js";
+import type {
+  SessionSnapshotDownload,
+  WorkspaceResource as Resource,
+} from "../types.js";
 
 /** Runs a native action with the shared busy and error handling, then refreshes. */
 export type ActionFeedback = {
@@ -154,7 +157,10 @@ export function useResourceActions({
           launching.current = false;
         });
       },
-      exportZip: () =>
+      exportZip: (
+        sessionSnapshot?: SessionSnapshotDownload,
+        onSnapshotChanged?: () => void,
+      ) =>
         act(
           async () => {
             const path = await save({
@@ -162,7 +168,23 @@ export function useResourceActions({
               filters: [{ name: "ZIP", extensions: ["zip"] }],
             });
             if (path) {
-              await invoke("export_bundle", { id, path });
+              try {
+                await invoke("export_bundle", {
+                  id,
+                  path,
+                  ...(sessionSnapshot && { sessionSnapshot }),
+                });
+              } catch (error) {
+                if (
+                  sessionSnapshot &&
+                  onSnapshotChanged &&
+                  error === "session_snapshot_changed"
+                ) {
+                  onSnapshotChanged();
+                  return;
+                }
+                throw error;
+              }
               onNotice(kind === "session" ? "Download saved" : "Export saved");
             }
           },

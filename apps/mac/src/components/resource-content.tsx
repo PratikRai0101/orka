@@ -102,6 +102,10 @@ type ResourceContentProps = {
   onRetry?: () => void;
   /** Replaces the plain error message, for readers with illustrated states. */
   errorState?: React.ReactNode;
+  /** Shown instead of content the reader declined to render. */
+  tooLarge?: (
+    inspection: Extract<Inspection, { tooLarge: true }>,
+  ) => React.ReactNode;
 };
 
 export function ResourceContent(props: ResourceContentProps) {
@@ -137,7 +141,14 @@ function LoadedResourceContent({
   inspection,
   changes,
   markdown,
+  tooLarge,
 }: ResourceContentProps & { inspection: Inspection }) {
+  if (inspection.tooLarge)
+    return tooLarge ? (
+      tooLarge(inspection)
+    ) : (
+      <p className="content-message">Too large to show here.</p>
+    );
   if (inspection.content === null)
     return (
       <p className="content-message">Binary file. Open it in your editor.</p>

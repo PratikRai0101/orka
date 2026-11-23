@@ -804,7 +804,7 @@ interface CommandPreview {
   paths?: string[];
 }
 
-function fileSize(bytes: number) {
+export function fileSize(bytes: number) {
   for (const [size, unit] of [
     [1e9, "GB"],
     [1e6, "MB"],

@@ -9,6 +9,7 @@ import { ConflictPanel } from "./conflict-panel.js";
 import { CopyLinkButton } from "./copy-link-button.js";
 import {
   ResourceMenuButton,
+  fileSize,
   resourceViewMenuActions,
 } from "./resource-menu.js";
 import { useDetailLayout } from "./detail-layout.js";
@@ -19,6 +20,7 @@ import { SessionLauncher } from "./session-launcher.js";
 import { SessionView } from "./session-view.js";
 import { useMemberLabel } from "./member-names.js";
 import { SkillActionTooltip } from "./skill-action-tooltip.js";
+import { useToasts } from "./toasts.js";
 import type { ResourceView } from "./use-resource-view.js";
 import type { ResourceActionHandlers } from "./use-resource-actions.js";
 
@@ -56,6 +58,7 @@ export function SessionDetail({
   onError,
 }: SessionDetailProps) {
   const layout = useDetailLayout();
+  const { notify } = useToasts();
   const author = useMemberLabel(user)(resource.updatedBy);
   const shared = !resource.local && resource.revision > 0;
   const menuActions = resourceViewMenuActions(view, true);
@@ -84,6 +87,33 @@ export function SessionDetail({
           onRetry={view.retryInspection}
           changes={false}
           markdown={false}
+          tooLarge={({ size, sessionSnapshot }) => (
+            <ReaderState
+              illustration="preview-unavailable"
+              title="Transcript too large to show here"
+              message={`This transcript is ${fileSize(size)}. Download the ${sessionSnapshot.conflictId ? "incoming version" : "session"} to read the full transcript.`}
+              action={
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={busy}
+                  onClick={() =>
+                    void actions.exportZip(sessionSnapshot, () =>
+                      notify({
+                        kind: "error",
+                        title:
+                          "Session changed. Reopen the transcript to download.",
+                      }),
+                    )
+                  }
+                >
+                  {sessionSnapshot.conflictId
+                    ? "Download incoming version"
+                    : "Download session"}
+                </Button>
+              }
+            />
+          )}
           errorState={
             <ReaderState
               tone={offline ? "status" : "alert"}

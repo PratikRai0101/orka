@@ -186,12 +186,26 @@ export interface LocalDraft {
   dismissalReason?: string;
   archivedAt?: string;
 }
-export interface Inspection {
+export interface SessionSnapshotDownload {
+  conflictId?: string;
+  snapshotHash: string;
+}
+
+export type Inspection = {
   conversation?: string | null;
   content: string | null;
   previous: string | null;
   paths: string[] | null;
-}
+} & (
+  | { tooLarge?: false }
+  | {
+      /** An oversized transcript sends its size in bytes and a download selector. */
+      tooLarge: true;
+      content: null;
+      size: number;
+      sessionSnapshot: SessionSnapshotDownload;
+    }
+);
 export interface SessionMessage {
   index: number;
   role: "user" | "assistant";
