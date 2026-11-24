@@ -1,10 +1,38 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
 import { AxeBuilder } from "@axe-core/playwright";
 import { readFileSync } from "node:fs";
 import {
   resourceLibraryFixture,
   type LibraryWindow,
 } from "./fixtures/resource-library.js";
+
+/** Scrolls the list, as a person would, until a row not drawn yet is in view. */
+async function reveal(page: Page, target: Locator) {
+  const body = page.locator(".resource-index-body");
+  while (!(await target.count()))
+    await body.evaluate((element) => {
+      element.scrollTop += element.clientHeight / 2;
+    });
+  await target.scrollIntoViewIfNeeded();
+}
+
+const kinds = [
+  { kind: "memory", label: "Memories" },
+  { kind: "session", label: "Sessions" },
+  { kind: "plan", label: "Plans" },
+] as const;
+const nouns = { memory: "Memory", session: "Session", plan: "Plan" };
+const personLabel = (kind: string) =>
+  kind === "memory" ? "Updated by" : "Owner";
+const pick = async (page: Page, category: string, option: string) => {
+  await page.getByRole("button", { name: /^Filter/ }).click();
+  await page.getByRole("menuitem", { name: category }).click();
+  await page
+    .getByRole("menuitemcheckbox", { name: option, exact: true })
+    .click();
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+};
 
 for (const width of [1160, 900]) {
   test(`Pi sessions keep their source identity in the catalog and reader at ${width}px`, async ({
@@ -13,11 +41,13 @@ for (const width of [1160, 900]) {
     await page.setViewportSize({ width, height: width === 900 ? 640 : 800 });
     await resourceLibraryFixture(page, { piSession: true });
     await page.getByRole("button", { name: /^Sessions/ }).click();
-    const source = page.getByRole("group", { name: "Filter by source" });
-    await source.getByRole("button", { name: "Pi", exact: true }).click();
+    await pick(page, "Agent", "Pi");
     const table = page.getByRole("table");
     await expect(table.locator("tbody tr")).toHaveCount(1);
-    await expect(table.getByRole("img", { name: "Pi · You" })).toBeVisible();
+    await expect(table.locator(".index-table-agent")).toHaveAttribute(
+      "title",
+      "Pi",
+    );
     await table
       .getByRole("button", { name: "Private Pi session", exact: true })
       .click();
@@ -38,88 +68,54 @@ for (const width of [1160, 900]) {
   });
 }
 
-const kinds = [
-  { kind: "memory", label: "Memories" },
-  { kind: "session", label: "Sessions" },
-  { kind: "plan", label: "Plans" },
-] as const;
-
 for (const width of [1160, 900]) {
-  test(`collection sort stays at the right edge across ownership filters at ${width}px`, async ({
+  test(`the index toolbar keeps refresh at its right edge while filtering and sorting at ${width}px`, async ({
     page,
   }) => {
     await page.setViewportSize({ width, height: 800 });
     await resourceLibraryFixture(page);
-    for (const [label, noun, singular] of [
-      ["Sessions", "sessions", "session"],
-      ["Memories", "memories", "memory"],
-      ["Plans", "plans", "plan"],
-    ]) {
+    for (const { kind, label } of kinds) {
       await page.getByRole("button", { name: new RegExp(`^${label}`) }).click();
-      const toolbar = page.getByRole("group", { name: `${noun} tools` });
-      const ownership = page.getByRole("group", {
-        name: "Filter by ownership",
+      const toolbar = page.getByRole("group", {
+        name: `${label.toLowerCase()} tools`,
       });
-      for (const [tab, count] of [
-        ["All", null],
-        ["Mine", 3],
-        ["Shared with me", 1],
+      const rows = page.locator("tbody tr");
+      const person = personLabel(kind);
+      await expect(rows).toHaveCount(4);
+      for (const [option, count] of [
+        ["You", 3],
+        ["Mira", 1],
       ] as const) {
-        const selectedTab = ownership.getByRole("button", {
-          name: tab,
-          exact: true,
-        });
-        await selectedTab.click();
-        await expect(selectedTab).toHaveAttribute("aria-pressed", "true");
-        await expect(selectedTab).toHaveCSS(
-          "background-color",
-          "rgba(0, 0, 0, 0)",
-        );
-        expect(
-          await selectedTab.evaluate(
-            (button) => getComputedStyle(button, "::after").height,
-          ),
-        ).toBe("2px");
-        const resultCount = toolbar.locator(".index-toolbar-count");
-        if (count === null) await expect(resultCount).toHaveCount(0);
-        else {
-          await expect(resultCount).toHaveText(
-            `${count} ${count === 1 ? singular : noun}`,
-          );
-          await expect(resultCount).toBeVisible();
-        }
-        const right = await toolbar.evaluate((element) => ({
+        await pick(page, person, option);
+        await expect(rows).toHaveCount(count);
+        const edges = await toolbar.evaluate((element) => ({
           toolbar: element.getBoundingClientRect().right,
-          sort: element
-            .querySelector(".index-toolbar-sort")!
+          refresh: element
+            .querySelector('[aria-label="Refresh local items"]')!
             .getBoundingClientRect().right,
+          overflow: element.scrollWidth - element.clientWidth,
         }));
-        expect(Math.abs(right.toolbar - right.sort)).toBeLessThanOrEqual(1);
-        expect(
-          await toolbar.evaluate(
-            (element) => element.scrollWidth - element.clientWidth,
-          ),
-        ).toBeLessThanOrEqual(1);
-        const refreshRight = await page
-          .getByRole("button", { name: "Refresh local items", exact: true })
-          .evaluate((button) => button.getBoundingClientRect().right);
-        expect(Math.abs(right.toolbar - refreshRight)).toBeLessThanOrEqual(1);
+        expect(Math.abs(edges.toolbar - edges.refresh)).toBeLessThanOrEqual(1);
+        expect(edges.overflow).toBeLessThanOrEqual(1);
+        await page
+          .getByRole("group", { name: "Active filters" })
+          .getByRole("button", { name: `Remove ${person} filter` })
+          .click();
       }
-      await toolbar
-        .getByRole("button", { name: "Sort by Recently updated", exact: true })
-        .click();
+      await expect(rows).toHaveCount(4);
+      await page.getByRole("button", { name: /^Sort/ }).click();
       await page
-        .getByRole("menuitemradio", { name: "Title", exact: true })
+        .getByRole("menuitemradio", { name: "Name", exact: true })
         .click();
       await expect(
-        toolbar.getByRole("button", { name: "Sort by Title", exact: true }),
-      ).toBeVisible();
+        page.getByRole("columnheader", { name: nouns[kind], exact: true }),
+      ).toHaveAttribute("aria-sort", "ascending");
     }
   });
 }
 
 for (const width of [1160, 900]) {
-  test(`session identities and quiet ownership tabs align at ${width}px`, async ({
+  test(`session rows show where they live, their agent, and their owner at ${width}px`, async ({
     page,
   }) => {
     await page.setViewportSize({ width, height: 800 });
@@ -127,96 +123,40 @@ for (const width of [1160, 900]) {
     await page.getByRole("button", { name: /^Sessions/ }).click();
     const table = page.getByRole("table");
     await expect(table.locator("tbody tr")).toHaveCount(4);
-    const local = table.locator("tr").filter({
-      has: page.getByRole("button", {
-        name: "Private session notes",
-        exact: true,
-      }),
-    });
-    await expect(local).toContainText("Local Only");
-    await expect(table).not.toContainText("On this Mac");
+    const row = (title: string) =>
+      table.getByRole("row", { name: new RegExp(title) });
+    const local = row("Private session notes");
     await expect(
-      table.locator(".resource-source-pill, .resource-table-author"),
-    ).toHaveCount(0);
-    const identity = local.getByRole("img", {
-      name: "Codex · You",
-      exact: true,
-    });
-    await expect(
-      identity.locator(".resource-identity-avatar img"),
+      local.getByLabel("On this Mac", { exact: true }),
     ).toBeVisible();
-    const geometry = await local.evaluate((row) => {
-      const tool = row.querySelector(".resource-identity-tool")!;
-      const avatar = row.querySelector(".resource-identity-avatar")!;
-      const toolBox = tool.getBoundingClientRect();
-      const avatarBox = avatar.getBoundingClientRect();
-      return {
-        height: row.getBoundingClientRect().height,
-        overlap: toolBox.right - avatarBox.left,
-        toolLeft: toolBox.left < avatarBox.left,
-        front: Number(getComputedStyle(tool).zIndex),
-        cells: row.children.length,
-      };
-    });
-    expect(geometry).toEqual({
-      height: 56,
-      overlap: 4,
-      toolLeft: true,
-      front: 1,
-      cells: 5,
-    });
-    await identity.hover();
-    await expect(identity.locator('[role="tooltip"]')).toHaveText(
-      "Codex · You",
+    await expect(table).not.toContainText("Local Only");
+    await expect(local.locator(".index-table-agent")).toHaveAttribute(
+      "title",
+      "Codex",
     );
-    await expect(identity.locator('[role="tooltip"]')).toBeVisible();
-    const tooltipBox = (await identity
-      .locator('[role="tooltip"]')
-      .boundingBox())!;
-    await page.mouse.move(
-      tooltipBox.x + tooltipBox.width / 2,
-      tooltipBox.y + tooltipBox.height / 2,
-      { steps: 60 },
+    await expect(local.locator(".index-table-person")).toHaveAttribute(
+      "title",
+      "You",
     );
-    await expect(identity.locator('[role="tooltip"]')).toBeVisible();
-    await page.keyboard.press("Escape");
-    await expect(identity.locator('[role="tooltip"]')).toHaveCount(0);
-    await page.mouse.move(0, 0);
-    await local.locator(".resource-table-open").focus();
-    await page.keyboard.press("Tab");
-    await expect(identity).toBeFocused();
-    await expect(identity.locator('[role="tooltip"]')).toBeVisible();
-    await page.keyboard.press("Escape");
-    await expect(identity).toBeFocused();
-    await expect(identity.locator('[role="tooltip"]')).toHaveCount(0);
-    const teammate = table.getByRole("img", {
-      name: "Claude · Mira",
-      exact: true,
-    });
+    const teammate = row("Mira's session");
     await expect(
-      teammate.locator(".resource-identity-avatar svg"),
+      teammate.getByLabel("Shared with team", { exact: true }),
     ).toBeVisible();
-    const tabs = page.getByRole("group", { name: "Filter by ownership" });
-    const all = tabs.getByRole("button", { name: "All", exact: true });
-    await expect(all).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+    await expect(teammate.locator(".index-table-agent")).toHaveAttribute(
+      "title",
+      "Claude",
+    );
+    await expect(teammate.locator(".index-table-person")).toHaveAttribute(
+      "title",
+      "Mira",
+    );
     expect(
-      await all.evaluate(
-        (button) => getComputedStyle(button, "::after").height,
-      ),
-    ).toBe("2px");
-    await tabs
-      .getByRole("button", { name: "Shared with me", exact: true })
-      .click();
-    await expect(table.locator("tbody tr")).toHaveCount(1);
-    await expect(teammate).toBeVisible();
+      await local.evaluate((element) => element.getBoundingClientRect().height),
+    ).toBe(44);
     const results = await new AxeBuilder({ page })
       .include(".resource-index")
       .analyze();
     expect(results.violations).toEqual([]);
-    await page.getByRole("button", { name: /^Memories/ }).click();
-    await expect(
-      tabs.getByRole("button", { name: "All", exact: true }),
-    ).toBeVisible();
   });
 }
 
@@ -255,11 +195,8 @@ test("GitHub teammate photos obey the packaged image policy and failures keep a 
   });
   await resourceLibraryFixture(page, { teammateAvatar: avatar });
   await page.getByRole("button", { name: /^Sessions/ }).click();
-  const identity = page.getByRole("img", {
-    name: "Claude · Mira",
-    exact: true,
-  });
-  const photo = identity.locator(".resource-identity-avatar img");
+  const person = page.locator('.index-table-person[title="Mira"]');
+  const photo = person.locator("img");
   await expect
     .poll(() => photo.evaluate((img: HTMLImageElement) => img.naturalWidth))
     .toBe(1);
@@ -268,7 +205,7 @@ test("GitHub teammate photos obey the packaged image policy and failures keep a 
   await page.reload();
   await page.getByRole("button", { name: /^Sessions/ }).click();
   await expect(photo).toBeHidden();
-  await expect(identity.locator(".resource-identity-avatar svg")).toBeVisible();
+  await expect(person.locator(".index-table-avatar")).toHaveText("M");
 });
 
 for (const { kind, label } of kinds)
@@ -359,47 +296,34 @@ test("cached revalidation during a manual refresh waits for discovery feedback",
   await expect(refresh).toBeEnabled();
 });
 
-for (const { kind, label } of kinds) {
-  test(`${label} include private content with sharing off and filter by stable ownership`, async ({
+for (const { kind, label } of kinds)
+  test(`${label} include private content with sharing off and filter by person`, async ({
     page,
   }) => {
     await resourceLibraryFixture(page);
     await page.getByRole("button", { name: new RegExp(`^${label}`) }).click();
-    const ownership = page.getByRole("group", { name: "Filter by ownership" });
     const table = page.getByRole("table");
-    await expect(
-      ownership.getByRole("button", {
-        name: "All",
-        exact: true,
-      }),
-    ).toHaveAttribute("aria-pressed", "true");
     await expect(
       table.getByRole("button", { name: `Private ${kind} notes`, exact: true }),
     ).toBeVisible();
     await expect(table.locator("tbody tr")).toHaveCount(4);
-    await ownership.getByRole("button", { name: "Mine", exact: true }).click();
-    await expect(table.locator("tbody tr")).toHaveCount(3);
-    await expect(table).toContainText(`My shared ${kind}`);
-    await expect(table).not.toContainText(`Mira's ${kind}`);
-    await ownership
-      .getByRole("button", { name: "Shared with me", exact: true })
-      .click();
+    const person = personLabel(kind);
+    // Memories credit whoever last updated them, other lists their owner.
+    const teammate = kind === "memory" ? `My shared ${kind}` : `Mira's ${kind}`;
+    await pick(page, person, "Mira");
     await expect(table.locator("tbody tr")).toHaveCount(1);
-    await expect(table).toContainText(`Mira's ${kind}`);
-    if (kind === "session")
-      await expect(
-        table.getByRole("img", { name: "Claude · Mira", exact: true }),
-      ).toBeVisible();
-    else await expect(table).toContainText("Owner: Mira");
-    await table
-      .getByRole("button", { name: `Mira's ${kind}`, exact: true })
-      .click();
+    const row = table.getByRole("row", { name: new RegExp(teammate) });
+    await expect(row).toContainText("Mira");
+    await row.getByRole("button", { name: teammate, exact: true }).click();
     await page
       .getByRole("button", { name: `Back to ${label}`, exact: true })
       .click();
     await expect(
-      ownership.getByRole("button", { name: "Shared with me", exact: true }),
-    ).toHaveAttribute("aria-pressed", "true");
+      page.getByRole("group", { name: "Active filters" }),
+    ).toHaveText(`${person}Mira`);
+    await expect(
+      table.getByRole("button", { name: teammate, exact: true }),
+    ).toBeFocused();
     const calls = await page.evaluate(
       () => (window as unknown as LibraryWindow).library.calls,
     );
@@ -415,6 +339,7 @@ for (const { kind, label } of kinds) {
     ).toEqual([]);
   });
 
+for (const { kind, label } of kinds) {
   test(`${label} private detail remains readable offline without shared history actions`, async ({
     page,
   }) => {
@@ -449,44 +374,37 @@ for (const { kind, label } of kinds) {
   });
 }
 
-test("ownership composes with repository, provider, and search filters", async ({
+test("person, repository, agent, and search filters compose", async ({
   page,
 }) => {
   await resourceLibraryFixture(page);
   await page.getByRole("button", { name: /^Sessions/ }).click();
-  await page
-    .getByRole("group", { name: "Filter by ownership" })
-    .getByRole("button", { name: "Mine", exact: true })
-    .click();
-  await page.getByRole("combobox", { name: "Filter by repository" }).click();
-  await page.getByRole("option", { name: "backend", exact: true }).click();
+  await pick(page, "Owner", "You");
+  await pick(page, "Repository", "backend");
   await page.getByRole("searchbox", { name: "Search sessions" }).fill("notes");
   const table = page.getByRole("table");
   await expect(table.locator("tbody tr")).toHaveCount(1);
   await expect(table).toContainText("Backend session notes");
-  await page
-    .getByRole("group", { name: "Filter by source" })
-    .getByRole("button", { name: "Codex", exact: true })
-    .click();
+  await pick(page, "Agent", "Codex");
   await expect(
-    page.getByText("No sessions match", { exact: true }),
+    page.getByRole("heading", {
+      name: "No sessions match “notes” with these filters",
+    }),
   ).toBeVisible();
-  await expect(
-    page.getByRole("group", { name: "Filter by ownership" }),
-  ).toBeVisible();
+  await expect(page.getByRole("button", { name: /^Filter/ })).toBeVisible();
 });
 
-test("ownership controls remain available in empty collections", async ({
+test("an empty collection shows its empty state without tools", async ({
   page,
 }) => {
   await resourceLibraryFixture(page, { emptyShared: true, emptyLocal: true });
   await page.getByRole("button", { name: /^Sessions/ }).click();
-  const ownership = page.getByRole("group", { name: "Filter by ownership" });
-  await expect(ownership.getByRole("button")).toHaveCount(3);
-  await ownership
-    .getByRole("button", { name: "Shared with me", exact: true })
-    .click();
-  await expect(page.getByText(/No sessions.*shared with you/i)).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "No sessions yet", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("searchbox", { name: "Search sessions" }),
+  ).toHaveCount(0);
   const results = await new AxeBuilder({ page }).analyze();
   expect(results.violations).toEqual([]);
 });
@@ -630,13 +548,13 @@ for (const { kind, label } of kinds) {
       expect(geometry.border).toBe("1px");
       expect(Math.abs(geometry.left - geometry.button)).toBeLessThanOrEqual(1);
       expect(geometry.overflow).toBe(false);
-      for (const name of ["Mine", "Shared with me", "All"]) {
-        await page
-          .getByRole("group", { name: "Filter by ownership" })
-          .getByRole("button", { name, exact: true })
-          .click();
-        await expect(banner).toBeVisible();
-      }
+      const search = page.getByRole("searchbox", {
+        name: `Search ${label.toLowerCase()}`,
+      });
+      await search.fill("Mira");
+      await expect(banner).toBeVisible();
+      await search.clear();
+      await expect(banner).toBeVisible();
       await page.evaluate(() => {
         (window as unknown as LibraryWindow).library.deferCatalog = true;
       });
@@ -707,13 +625,18 @@ test("empty discovery failures explain the error and offer a retry", async ({
   await page.getByRole("button", { name: /^Plans/ }).click();
   const plans = page.getByRole("region", { name: "plans", exact: true });
   const empty = plans.getByRole("heading", { name: "No plans yet" });
-  await expect(plans.getByRole("alert")).toContainText(
-    "Couldn’t check local plans",
+  await expect(
+    plans.getByRole("heading", { name: "Couldn’t load plans" }),
+  ).toBeVisible();
+  await expect(plans.getByRole("status")).toContainText(
+    "Orka couldn’t check this Mac for plans.",
   );
-  await expect(plans.getByRole("alert")).toContainText(
-    "Could not read the project folder.",
-  );
+  await plans.getByText("Details", { exact: true }).click();
+  await expect(
+    plans.getByText("Could not read the project folder."),
+  ).toBeVisible();
   await expect(plans.getByText("Previously discovered items")).toHaveCount(0);
+  await expect(plans.getByRole("searchbox")).toHaveCount(0);
   await expect(empty).toHaveCount(0);
 
   await page.evaluate(() => {
@@ -721,7 +644,9 @@ test("empty discovery failures explain the error and offer a retry", async ({
   });
   await plans.getByRole("button", { name: "Try again", exact: true }).click();
   await expect(empty).toBeVisible();
-  await expect(plans.getByRole("alert")).toHaveCount(0);
+  await expect(
+    plans.getByRole("heading", { name: "Couldn’t load plans" }),
+  ).toHaveCount(0);
 });
 
 test("partial discovery errors wrap inside the banner with the sidebar collapsed", async ({
@@ -763,12 +688,8 @@ test("restricted shared access does not suppress independent local content", asy
   await expect(
     page.getByRole("button", { name: "Private memory notes", exact: true }),
   ).toBeVisible();
-  await page
-    .getByRole("group", { name: "Filter by ownership" })
-    .getByRole("button", { name: "Shared with me", exact: true })
-    .click();
   await expect(
-    page.getByText("Access to shared memories is restricted.", { exact: true }),
+    page.getByRole("searchbox", { name: "Search memories" }),
   ).toBeVisible();
 });
 
@@ -877,8 +798,8 @@ test("configured sync timing refreshes local-only rows without clearing collecti
   await expect(sessions).toContainText("4");
 });
 
-for (const { kind, label } of kinds) {
-  test(`${label} keeps large collections navigable a page at a time`, async ({
+for (const { kind, label } of kinds)
+  test(`${label} lists a large collection in one scrolling list`, async ({
     page,
   }) => {
     await resourceLibraryFixture(page, {
@@ -888,45 +809,32 @@ for (const { kind, label } of kinds) {
     });
     await page.getByRole("button", { name: new RegExp(`^${label}`) }).click();
     const table = page.getByRole("table");
-    const pages = page.getByRole("navigation", {
-      name: kind === "memory" ? "Memory pages" : `${label.slice(0, -1)} pages`,
-    });
-    const rows = table.locator(".resource-table-open");
-    const next = pages.getByRole("button", { name: "Next page" });
-    const previous = pages.getByRole("button", { name: "Previous page" });
-
-    await expect(rows).toHaveCount(40);
-    await expect(pages).toContainText("Page 1 of 2");
-    await expect(previous).toBeDisabled();
-
-    await next.press("Enter");
-    await expect(pages).toContainText("Page 2 of 2");
-    await expect(rows).toHaveCount(12);
-    await expect(next).toBeDisabled();
+    const rows = table.locator("tbody tr");
+    await expect(table).toHaveAttribute("aria-rowcount", "53");
+    await expect(page.getByRole("navigation", { name: /pages$/ })).toHaveCount(
+      0,
+    );
     const item = table.getByRole("button", {
       name: `Archive ${kind} 49`,
       exact: true,
     });
-    await expect(rows.first()).toBeFocused();
+    await reveal(page, item);
     await item.press("Enter");
     await page
       .getByRole("button", { name: `Back to ${label}`, exact: true })
       .click();
-    await expect(pages).toContainText("Page 2 of 2");
     await expect(item).toBeFocused();
-
+    await expect(item).toBeInViewport();
     const search = page.getByRole("searchbox", {
       name: `Search ${label.toLowerCase()}`,
     });
     await search.fill(`Archive ${kind} 1`);
     await expect(rows).toHaveCount(11);
-    await expect(pages).toHaveCount(0);
     await search.clear();
-    await expect(pages).toContainText("Page 1 of 2");
+    await expect(table).toHaveAttribute("aria-rowcount", "53");
   });
-}
 
-test("expanded session forks stay with the parent at the page boundary", async ({
+test("a session fork lists flat with a marker after its title", async ({
   page,
 }) => {
   await resourceLibraryFixture(page, {
@@ -935,24 +843,25 @@ test("expanded session forks stay with the parent at the page boundary", async (
     boundaryFork: true,
   });
   await page.getByRole("button", { name: /^Sessions/ }).click();
-  const pages = page.getByRole("navigation", { name: "Session pages" });
-  const toggle = page.getByRole("button", {
-    name: "Expand 1 fork of Archive session 37",
-  });
-  await toggle.click();
   const fork = page.getByRole("button", {
     name: "Archived session fork",
     exact: true,
   });
-  await expect(fork).toBeVisible();
-  await expect(pages).toContainText("Page 1 of 2");
+  const row = page.getByRole("row", { name: /Archived session fork/ });
+  await reveal(page, row);
+  await expect(row.getByRole("img", { name: "Forked session" })).toBeVisible();
+  await expect(
+    page.getByRole("row", { name: /Archive session 37/ }).getByRole("img", {
+      name: "Forked session",
+    }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^Expand/ })).toHaveCount(0);
   await fork.click();
   await page.getByRole("button", { name: "Back to Sessions" }).click();
   await expect(fork).toBeFocused();
-  await expect(pages).toContainText("Page 1 of 2");
 });
 
-test("a focused session stays reachable when its display title changes pages", async ({
+test("a focused session stays focused when its display title moves it", async ({
   page,
 }) => {
   await resourceLibraryFixture(page, {
@@ -961,13 +870,11 @@ test("a focused session stays reachable when its display title changes pages", a
     deferredTitleId: "session-extra-0",
   });
   await page.getByRole("button", { name: /^Sessions/ }).click();
-  await page.getByRole("button", { name: "Sort by Recently updated" }).click();
-  await page.getByRole("menuitemradio", { name: "Title", exact: true }).click();
+  await page.getByRole("button", { name: /^Sort/ }).click();
+  await page.getByRole("menuitemradio", { name: "Name", exact: true }).click();
   const item = page.locator('[data-resource-id="session-extra-0"]');
-  const pages = page.getByRole("navigation", { name: "Session pages" });
   await item.focus();
   await expect(item).toBeFocused();
-  await expect(pages).toContainText("Page 1 of 2");
   await page.waitForFunction(
     () => (window as unknown as LibraryWindow).library.finishTitle,
   );
@@ -975,7 +882,9 @@ test("a focused session stays reachable when its display title changes pages", a
     (window as unknown as LibraryWindow).library.finishTitle?.("Zulu Page B"),
   );
   await expect(item).toHaveText("Zulu Page B");
-  await expect(pages).toContainText("Page 2 of 2");
+  await expect(page.locator(".index-table-open").last()).toHaveText(
+    "Zulu Page B",
+  );
   await expect(item).toBeFocused();
 });
 
@@ -1010,7 +919,7 @@ for (const mode of ["keyboard focus", "an open menu"] as const) {
     await page.evaluate(() =>
       (window as unknown as LibraryWindow).library.finishCatalog?.(),
     );
-    await expect(row).toContainText("Local changes");
+    await expect(row).toContainText("Local edits");
     if (mode === "keyboard focus") {
       await expect(fork).toBeFocused();
     } else {
@@ -1019,16 +928,14 @@ for (const mode of ["keyboard focus", "an open menu"] as const) {
       await expect(menu).toBeHidden();
     }
     await page.getByRole("searchbox", { name: "Search sessions" }).focus();
-    const toggle = page.getByRole("button", {
-      name: "Expand 1 fork of Archive session 0",
-    });
-    await toggle.click();
-    await expect(row).toHaveClass("session-fork-row");
+    await expect(
+      row.getByRole("img", { name: "Forked session" }),
+    ).toBeVisible();
   });
 }
 
 for (const mode of ["button", "context menu"] as const) {
-  test(`an open resource ${mode} stays available when its session changes pages`, async ({
+  test(`an open resource ${mode} stays available when its session moves`, async ({
     page,
   }) => {
     await resourceLibraryFixture(page, {
@@ -1037,11 +944,9 @@ for (const mode of ["button", "context menu"] as const) {
       deferredTitleId: "session-extra-0",
     });
     await page.getByRole("button", { name: /^Sessions/ }).click();
+    await page.getByRole("button", { name: /^Sort/ }).click();
     await page
-      .getByRole("button", { name: "Sort by Recently updated" })
-      .click();
-    await page
-      .getByRole("menuitemradio", { name: "Title", exact: true })
+      .getByRole("menuitemradio", { name: "Name", exact: true })
       .click();
     const item = page.locator('[data-resource-id="session-extra-0"]');
     if (mode === "button")
@@ -1063,9 +968,6 @@ for (const mode of ["button", "context menu"] as const) {
     );
     await expect(item).toHaveText("Zulu Page B");
     await expect(menu).toBeVisible();
-    await expect(
-      page.getByRole("navigation", { name: "Session pages" }),
-    ).toContainText("Page 2 of 2");
     await menu.getByRole("menuitem", { name: "Open", exact: true }).click();
     await expect(
       page.getByRole("button", { name: "Back to Sessions" }),

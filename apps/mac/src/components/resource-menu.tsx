@@ -28,6 +28,7 @@ import React, {
   useState,
 } from "react";
 import { Channel } from "@tauri-apps/api/core";
+import { useQuery } from "@tanstack/react-query";
 import { invoke } from "./product-command.js";
 import type {
   Project,
@@ -53,6 +54,7 @@ import { skillReviewState } from "./skill-review-state.js";
 import { useResourceActions, type Run } from "./use-resource-actions.js";
 import { QueuedUploadReview } from "./queued-upload-review.js";
 import { ArtifactLinkDialog } from "./artifact-link-dialog.js";
+import { useWorkspaceScope } from "./workspace-cache.js";
 
 type ResourceRequest =
   "share" | "delete" | "launch" | "retry-upload" | "public-link";
@@ -340,6 +342,44 @@ export function useQueuedUploadReview() {
   return useContext(ResourceMenuContext)?.reviewUpload;
 }
 
+/**
+ * Where an item lives on this Mac: its repository folder, and, when asked
+ * for, the files Copy local path reports. Neither exists off this Mac.
+ */
+export function useLocalLocation(resource: ProjectResource, files: boolean) {
+  const context = useContext(ResourceMenuContext);
+  const scope = useWorkspaceScope();
+  const project = context?.state.projects.find(
+    (item) => item.id === resource.projectId,
+  );
+  const folder =
+    (project && sourcePath(project, resource.sourceId)) || undefined;
+  const { data } = useQuery({
+    queryKey: [
+      "local-paths",
+      scope,
+      resource.projectId,
+      resource.resourceId,
+      resource.hash,
+      folder,
+    ],
+    enabled: files && Boolean(context && folder),
+    queryFn: async () =>
+      (
+        await invoke<{ paths: string[] }>("resource_command", {
+          action: "paths",
+          input: {
+            accountId: context?.state.user,
+            serviceOrigin: context?.state.config?.apiUrl,
+            projectId: resource.projectId,
+            resourceId: resource.resourceId,
+          },
+        })
+      ).paths,
+  });
+  return { folder, files: data };
+}
+
 export function resourceViewMenuActions(
   view: ResourceView,
   session: boolean,
@@ -439,6 +479,22 @@ function ResourceMenuTarget({
       onSelect: () => context.onOpen(resource),
     },
   ];
+  if (
+    (resource.local || resource.localChanges) &&
+    resource.sharing !== "queued" &&
+    resource.sharing !== "approval" &&
+    (resource.kind === "skill" || resource.owner === context.state.user)
+  )
+    items.push({
+      id: "share",
+      icon: UploadIcon,
+      label: "Share with team…",
+      disabled: context.busy || !connected,
+      reason: !connected
+        ? "Connect this repository on this Mac first"
+        : undefined,
+      onSelect: () => context.request("share", resource),
+    });
   if (resource.kind === "session") {
     items.push({
       id: "launch",
@@ -560,22 +616,6 @@ function ResourceMenuTarget({
         ),
     });
   }
-  if (
-    (resource.local || resource.localChanges) &&
-    resource.sharing !== "queued" &&
-    resource.sharing !== "approval" &&
-    (resource.kind === "skill" || resource.owner === context.state.user)
-  )
-    items.push({
-      id: "share",
-      icon: UploadIcon,
-      label: "Share snapshot with project…",
-      disabled: context.busy || !connected,
-      reason: !connected
-        ? "Connect this repository on this Mac first"
-        : undefined,
-      onSelect: () => context.request("share", resource),
-    });
   if (queuedUpload)
     items.push({
       id: "review-upload",

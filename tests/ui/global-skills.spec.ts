@@ -395,7 +395,7 @@ const pick = (page: Page, name: string) =>
     name: `Select skill: ${name}`,
     exact: true,
   });
-const rows = (page: Page) => page.locator(".skill-table tbody tr");
+const rows = (page: Page) => page.locator(".index-table tbody tr");
 const calls = (page: Page, name: string) =>
   page.evaluate(
     (name) =>
@@ -689,7 +689,7 @@ test("local-only skills stay visible and a shared revision replaces the local ro
   await page.evaluate(() => (window as any).publishSkill());
   await expect(rows(page)).toHaveCount(1);
   await expect(rows(page).getByLabel("On this Mac")).toHaveCount(0);
-  await expect(rows(page).getByLabel("Shared with the project")).toBeVisible();
+  await expect(rows(page).getByLabel("Shared with team")).toBeVisible();
 });
 
 test("a new local import remains visible over an older shared deletion", async ({
@@ -859,7 +859,7 @@ test("first approval keeps one status pill and the local editor action", async (
   page,
 }) => {
   await fixture(page, "approval");
-  await expect(rows(page).locator(".skill-status-pill")).toHaveText([
+  await expect(rows(page).locator(".index-status-pill")).toHaveText([
     "Awaiting approval",
   ]);
   await rows(page)
@@ -884,7 +884,7 @@ test("first approval keeps one status pill and the local editor action", async (
 for (const mode of ["paused", "blocked"]) {
   test(`import sharing ${mode} has clear status`, async ({ page }) => {
     await fixture(page, mode);
-    await expect(rows(page).locator(".skill-status-pill")).toHaveText([
+    await expect(rows(page).locator(".index-status-pill")).toHaveText([
       mode === "paused" ? "Sharing paused" : "Sharing blocked",
     ]);
     await rows(page)
