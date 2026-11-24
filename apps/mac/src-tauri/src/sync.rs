@@ -9,12 +9,22 @@ use fs2::FileExt;
 use rusqlite::{params, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     ops::ControlFlow::{self, Break, Continue},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+thread_local! {
+    static PULL_APPLIED_RESOURCES: std::cell::RefCell<std::collections::BTreeMap<String, usize>> = Default::default();
+}
+
+#[cfg(test)]
+pub(crate) fn pull_applied_resources(project: &str) -> usize {
+    PULL_APPLIED_RESOURCES.with_borrow(|counts| counts.get(project).copied().unwrap_or(0))
+}
 
 const PLAN_REVISION_CONFLICT: &str =
     "409: Resource changed; refresh and review the exact version again";
@@ -1078,6 +1088,7 @@ fn materialize_install(
         return Err("Skill installation recovery pending; local copies preserved".into());
     }
     let mut b = crate::repair::binding(db, resource, indexer::binding(db, id)?)?;
+    let original_binding = b.clone();
     if resource["kind"] == "skill" && b["mirrorReview"] == true {
         return Err(indexer::SKILL_MIRROR_REVIEW.into());
     }
@@ -1096,7 +1107,10 @@ fn materialize_install(
         && b["reviewedRevision"] != resource["revision"]
     {
         if let Some(current) = crate::attention::matching_instruction(db, project, resource, &b)? {
-            return db::upsert(db, "bindings", id, project_id, &current);
+            if current != original_binding {
+                db::upsert(db, "bindings", id, project_id, &current)?;
+            }
+            return Ok(());
         }
         b["availableRevision"] = resource["revision"].clone();
         b["installationState"] = json!(if b["base"]["revision"].is_null() {
@@ -1104,13 +1118,16 @@ fn materialize_install(
         } else {
             "update_available"
         });
-        return db::upsert(
-            db,
-            "bindings",
-            id,
-            project["id"].as_str().ok_or("Missing project")?,
-            &b,
-        );
+        if b != original_binding {
+            db::upsert(
+                db,
+                "bindings",
+                id,
+                project["id"].as_str().ok_or("Missing project")?,
+                &b,
+            )?;
+        }
+        return Ok(());
     }
     if project["governed"] == true
         && resource["kind"] == "memory"
@@ -1148,7 +1165,10 @@ fn materialize_install(
         if kind == "skill" {
             crate::codex_skills::queue(db, project, false)?;
         }
-        return db::upsert(db, "bindings", id, project_id, &b);
+        if b != original_binding {
+            db::upsert(db, "bindings", id, project_id, &b)?;
+        }
+        return Ok(());
     }
     let pending:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE json_extract(value,'$.resource.resourceId')=? OR json_extract(value,'$.resourceId')=?)",params![id,id],|r|r.get(0)).map_err(|e|e.to_string())?;
     if kind == "plan" && pending && plan_upload_needs_review(db, project_id, id)? {
@@ -1373,8 +1393,25 @@ fn materialize_install(
                 check_claude_memory_claim(db, project_id, id, &path)?;
             }
             guard_unbound_destinations(&b, resource, &root, std::slice::from_ref(&path))?;
-            fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-            packages::write_file(&base, &path, files.first().ok_or("Missing memory file")?)?;
+            let accepted_file = files.first().ok_or("Missing memory file")?;
+            let blobs = db::BlobStore::current()?;
+            let already_matches = fs::symlink_metadata(&path)
+                .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+                && path
+                    .parent()
+                    .is_some_and(|parent| packages::safe_directory(&base, parent).is_ok())
+                && blobs.all_present(std::slice::from_ref(accepted_file))
+                && crate::scan_cache::package_file(db, &blobs, &path, "content.md").is_ok_and(
+                    |local| {
+                        local["hash"] == accepted_file["hash"]
+                            && local["size"] == accepted_file["size"]
+                            && local["executable"] == accepted_file["executable"]
+                    },
+                );
+            if !already_matches {
+                fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+                packages::write_file(&base, &path, accepted_file)?;
+            }
             vec![path]
         };
         b["paths"] = json!(paths);
@@ -1801,6 +1838,199 @@ enum ProjectMode {
     RetryOnly,
 }
 
+struct PullApplyState {
+    blobs: db::BlobStore,
+    bindings: HashMap<String, Value>,
+    conflicts: HashSet<String>,
+    errors: HashSet<String>,
+    installations: HashSet<String>,
+    codex_skill_refreshed: HashSet<String>,
+    valid_sources: HashMap<Option<String>, bool>,
+}
+
+impl PullApplyState {
+    fn load(db: &rusqlite::Connection, project: &Value) -> Result<Self> {
+        let project_id = project["id"].as_str().ok_or("Missing project")?;
+        let mut bindings = HashMap::new();
+        {
+            let mut stmt = db
+                .prepare("SELECT id, value FROM bindings WHERE project=?")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([project_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (id, raw) = row.map_err(|e| e.to_string())?;
+                let value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                bindings.insert(id, value);
+            }
+        }
+        let mut conflicts = HashSet::new();
+        {
+            let mut stmt = db
+                .prepare("SELECT DISTINCT json_extract(value,'$.resourceId') FROM conflicts WHERE project=?")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([project_id], |row| row.get::<_, Option<String>>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                if let Some(id) = row.map_err(|e| e.to_string())? {
+                    conflicts.insert(id);
+                }
+            }
+        }
+        let mut errors = HashSet::new();
+        {
+            let mut stmt = db
+                .prepare("SELECT source FROM errors")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                errors.insert(row.map_err(|e| e.to_string())?);
+            }
+        }
+        let mut installations = HashSet::new();
+        {
+            let mut stmt = db
+                .prepare("SELECT substr(key, 14) FROM meta WHERE key LIKE 'installation:%' AND value <> 'null'")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                installations.insert(row.map_err(|e| e.to_string())?);
+            }
+        }
+        let mut codex_skill_refreshed = HashSet::new();
+        {
+            let prefix = format!("codex-skill-refresh:{project_id}:%");
+            let mut stmt = db
+                .prepare("SELECT key FROM meta WHERE key LIKE ? AND value <> 'null'")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([&prefix], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                codex_skill_refreshed.insert(row.map_err(|e| e.to_string())?);
+            }
+        }
+        let mut valid_sources = HashMap::new();
+        for view in crate::sources::views(project) {
+            let key = view["sourceId"].as_str().map(str::to_owned);
+            valid_sources.insert(key, crate::sources::validate(&view).is_ok());
+        }
+        Ok(Self {
+            blobs: db::BlobStore::current()?,
+            bindings,
+            conflicts,
+            errors,
+            installations,
+            codex_skill_refreshed,
+            valid_sources,
+        })
+    }
+
+    fn is_current(&self, project: &Value, resource: &Value) -> bool {
+        let Some(id) = resource["resourceId"].as_str() else {
+            return false;
+        };
+        if self.conflicts.contains(id)
+            || self.errors.contains(id)
+            || self.installations.contains(id)
+        {
+            return false;
+        }
+        let Some(files) = resource["files"].as_array() else {
+            return false;
+        };
+        let kind = resource["kind"].as_str().unwrap_or("");
+        if kind == "skill" && packages::reject_env_files(files).is_err() {
+            return false;
+        }
+        if !self.blobs.all_present(files) {
+            return false;
+        }
+        let Some(source) = crate::sources::for_resource(project, resource) else {
+            return true;
+        };
+        let source_key = source["sourceId"].as_str().map(str::to_owned);
+        if !self
+            .valid_sources
+            .get(&source_key)
+            .copied()
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if !crate::projects::sharing_allowed(&source, kind) {
+            return true;
+        }
+        let Some(b) = self.bindings.get(id) else {
+            return false;
+        };
+        if b["base"]["revision"] != resource["revision"]
+            || b["base"]["deleted"] != resource["deleted"]
+            || b["base"]["files"] != resource["files"]
+        {
+            return false;
+        }
+        if kind == "session" && resource["source"] == "codex" {
+            if let (Some(_), Some(path)) = (b["nativeId"].as_str(), b["paths"][0].as_str()) {
+                if !Path::new(path).try_exists().unwrap_or(false) {
+                    return false;
+                }
+            }
+        }
+        if kind == "skill" {
+            if b["mirrorReview"] == true {
+                return false;
+            }
+            if source["governed"] == true
+                && resource["revision"].as_u64().unwrap_or(0) > 0
+                && b["reviewedRevision"] != resource["revision"]
+            {
+                return false;
+            }
+            let Ok(refresh_key) = crate::codex_skills::refresh_key(&source) else {
+                return false;
+            };
+            if !self.codex_skill_refreshed.contains(&refresh_key) {
+                return false;
+            }
+            if let Some(paths) = b["paths"].as_array() {
+                for path in paths {
+                    let Some(path) = path.as_str().map(Path::new) else {
+                        return false;
+                    };
+                    if path.exists() && packages::check_skill_directory(path).is_err() {
+                        return false;
+                    }
+                }
+            }
+        }
+        if source["governed"] == true
+            && crate::governance::protected(resource)
+            && b["reviewedRevision"] != resource["revision"]
+        {
+            return false;
+        }
+        if source["governed"] == true
+            && kind == "memory"
+            && !crate::governance::protected(resource)
+            && !project_memory(&source, resource)
+                .ok()
+                .is_some_and(|(_, destination)| b["paths"][0].as_str() == destination.to_str())
+        {
+            return false;
+        }
+        true
+    }
+}
+
 /// One sync cycle. `sync_workspace_global` holds the workspace-wide stages and
 /// `sync_project` one project's stages. A whole-workspace cycle interleaves the
 /// same stages stage by stage across projects, in `sync_workspace`.
@@ -1813,6 +2043,7 @@ struct SyncPass<'a> {
     blocked: HashSet<String>,
     held: HashSet<String>,
     deferred: HashSet<Value>,
+    preflight_at: HashMap<String, Instant>,
 }
 
 impl<'a> SyncPass<'a> {
@@ -1834,6 +2065,7 @@ impl<'a> SyncPass<'a> {
             blocked: HashSet::new(),
             held: HashSet::new(),
             deferred: HashSet::new(),
+            preflight_at: HashMap::new(),
         }
     }
 
@@ -1968,18 +2200,25 @@ impl<'a> SyncPass<'a> {
         )?;
         match scan_off_runtime(db, p, move |db, p| preflight_project(db, p, retry_only)).await {
             Ok(()) => {
-                if !retry_only && waiting.is_none() {
-                    db::set(
-                        db,
-                        &format!("firstScan:{}", p["id"].as_str().unwrap_or("")),
-                        &json!(db::now()),
-                    )?;
+                if !retry_only {
+                    if let Some(id) = p["id"].as_str() {
+                        self.preflight_at.insert(id.to_string(), Instant::now());
+                    }
+                    if waiting.is_none() {
+                        db::set(
+                            db,
+                            &format!("firstScan:{}", p["id"].as_str().unwrap_or("")),
+                            &json!(db::now()),
+                        )?;
+                    }
                 }
-                db.execute("DELETE FROM errors WHERE source=?", [p["id"].as_str()])
-                    .map_err(|e| e.to_string())?;
+                record_result(db, p["id"].as_str().unwrap_or(""), Ok(()))?;
             }
             Err(error) => {
-                db.execute("INSERT INTO errors VALUES(?,?) ON CONFLICT(source) DO UPDATE SET error=excluded.error",params![p["id"].as_str(),error]).map_err(|e|e.to_string())?;
+                if let Some(id) = p["id"].as_str() {
+                    self.preflight_at.remove(id);
+                }
+                record_result(db, p["id"].as_str().unwrap_or(""), Err(error))?;
             }
         }
         Ok(Continue(()))
@@ -2307,15 +2546,24 @@ impl<'a> SyncPass<'a> {
         {
             return Ok(Continue(()));
         }
-        progress(
-            db,
-            "Checking for new local changes",
-            crate::projects::display_name(p),
-            0,
-            None,
-        )?;
         let project = p["id"].as_str().ok_or("Missing project")?;
-        let scan = scan_off_runtime(db, p, move |db, p| preflight_project(db, p, retry_only)).await;
+        let preflight_fresh = !retry_only
+            && self
+                .preflight_at
+                .get(project)
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(2));
+        let scan = if preflight_fresh {
+            preflight_project(db, p, true)
+        } else {
+            progress(
+                db,
+                "Checking for new local changes",
+                crate::projects::display_name(p),
+                0,
+                None,
+            )?;
+            scan_off_runtime(db, p, move |db, p| preflight_project(db, p, retry_only)).await
+        };
         let scanned = scan.is_ok();
         record_result(db, project, scan)?;
         // A failed project preflight must not run permission-reset filesystem
@@ -2364,7 +2612,17 @@ impl<'a> SyncPass<'a> {
             "SELECT value FROM resources WHERE project=?",
             &[&project],
         )?;
-        for (index, r) in resources.iter().enumerate() {
+        let apply_state = PullApplyState::load(db, p)?;
+        let pending: Vec<&Value> = resources
+            .iter()
+            .filter(|r| !apply_state.is_current(p, r))
+            .collect();
+        #[cfg(test)]
+        PULL_APPLIED_RESOURCES.with_borrow_mut(|counts| {
+            *counts.entry(project.to_owned()).or_default() += pending.len();
+        });
+        let mut last_progress: Option<Instant> = None;
+        for (index, r) in pending.iter().enumerate() {
             if crate::projects::foreground_waiting()? || SyncQueue::cancelled(db, project)? {
                 return Ok(Break(()));
             }
@@ -2376,13 +2634,16 @@ impl<'a> SyncPass<'a> {
                     .or(r["logicalPath"].as_str())
                     .unwrap_or("Update")
             );
-            progress(
-                db,
-                "Applying updates on this Mac",
-                Some(&detail),
-                index,
-                Some(resources.len()),
-            )?;
+            if last_progress.is_none_or(|at| at.elapsed() >= Duration::from_millis(100)) {
+                progress(
+                    db,
+                    "Applying updates on this Mac",
+                    Some(&detail),
+                    index,
+                    Some(pending.len()),
+                )?;
+                last_progress = Some(Instant::now());
+            }
             let id = r["resourceId"].as_str().ok_or("Missing resource")?;
             let result: Result<()> = async {
                 download(owner, r).await?;
@@ -2398,13 +2659,18 @@ impl<'a> SyncPass<'a> {
                 return result.map(Continue);
             }
             record_result(db, id, result)?;
-            progress(
-                db,
-                "Applying updates on this Mac",
-                Some(&detail),
-                index + 1,
-                Some(resources.len()),
-            )?;
+            if index + 1 == pending.len()
+                || last_progress.is_none_or(|at| at.elapsed() >= Duration::from_millis(100))
+            {
+                progress(
+                    db,
+                    "Applying updates on this Mac",
+                    Some(&detail),
+                    index + 1,
+                    Some(pending.len()),
+                )?;
+                last_progress = Some(Instant::now());
+            }
         }
         record_result(
             db,
@@ -2751,13 +3017,27 @@ pub(crate) fn record_result(
     result: Result<()>,
 ) -> Result<()> {
     match result {
-        Ok(()) => db.execute("DELETE FROM errors WHERE source=?", [source]),
-        Err(error) => db.execute(
-            "INSERT INTO errors VALUES(?,?) ON CONFLICT(source) DO UPDATE SET error=excluded.error",
-            params![source, error],
-        ),
+        Ok(()) => {
+            let exists: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM errors WHERE source=?)",
+                    [source],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if exists {
+                db.execute("DELETE FROM errors WHERE source=?", [source])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Err(error) => {
+            db.execute(
+                "INSERT INTO errors VALUES(?,?) ON CONFLICT(source) DO UPDATE SET error=excluded.error",
+                params![source, error],
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
-    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

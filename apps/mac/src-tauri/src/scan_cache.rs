@@ -20,6 +20,7 @@ thread_local! {
     static PLAN_FILE_READS: std::cell::RefCell<std::collections::BTreeMap<PathBuf, usize>> = Default::default();
     static SKILL_DIR_READS: std::cell::RefCell<std::collections::BTreeMap<PathBuf, usize>> = Default::default();
     static CODEX_SUMMARY_READS: std::cell::RefCell<std::collections::BTreeMap<PathBuf, usize>> = Default::default();
+    static MEMORY_INDEX_BUILDS: std::cell::RefCell<std::collections::BTreeMap<String, usize>> = Default::default();
 }
 
 #[cfg(test)]
@@ -40,6 +41,17 @@ pub(crate) fn skill_dir_reads(path: &Path) -> usize {
 #[cfg(test)]
 pub(crate) fn codex_summary_reads(path: &Path) -> usize {
     CODEX_SUMMARY_READS.with_borrow(|counts| counts.get(path).copied().unwrap_or(0))
+}
+
+#[cfg(test)]
+pub(crate) fn memory_index_builds(memory_id: &str) -> usize {
+    MEMORY_INDEX_BUILDS.with_borrow(|counts| counts.get(memory_id).copied().unwrap_or(0))
+}
+
+#[cfg(test)]
+pub(crate) fn record_memory_index_build(memory_id: &str) {
+    MEMORY_INDEX_BUILDS
+        .with_borrow_mut(|counts| *counts.entry(memory_id.to_owned()).or_default() += 1);
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -398,6 +410,60 @@ pub(crate) fn save_session(db: &Connection, key: &str, cached: &CachedSession) -
         if let Ok(value) = serde_json::to_value(cached) {
             db::set(db, key, &value)?;
         }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct CachedMemoryIndexTarget {
+    pub(crate) path: PathBuf,
+    pub(crate) stamp: FileStamp,
+    pub(crate) hash: String,
+    pub(crate) size: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct CachedMemoryIndex {
+    pub(crate) fingerprint: String,
+    pub(crate) index_stamp: FileStamp,
+    pub(crate) targets: Vec<CachedMemoryIndexTarget>,
+    pub(crate) sources: Vec<Value>,
+}
+
+pub(crate) fn memory_index_key(memory_id: &str) -> String {
+    cache_key("memoryIndex", &json!([memory_id]))
+}
+
+pub(crate) fn load_memory_index(db: &Connection, key: &str) -> Result<Option<CachedMemoryIndex>> {
+    let raw = db::get(db, key)?;
+    if raw.is_null() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value(raw).ok())
+}
+
+pub(crate) fn save_memory_index(
+    db: &Connection,
+    key: &str,
+    cached: &CachedMemoryIndex,
+) -> Result<()> {
+    if let Ok(value) = serde_json::to_value(cached) {
+        db::set(db, key, &value)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn clear_memory_index(db: &Connection, key: &str) -> Result<()> {
+    let exists: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?)",
+            [key],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if exists {
+        db.execute("DELETE FROM meta WHERE key=?", [key])
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
