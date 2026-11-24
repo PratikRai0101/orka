@@ -237,7 +237,7 @@ test("host sharing creates and revokes a link without starting browser sign-in",
   chmodSync(
     write(
       "bin/git",
-      `#!/bin/sh\n[ -z "\${ORKA_HANDOFF_HOST_TOKEN+x}" ] || exit 1\n[ "$1" = -c ] && [ "$2" = core.fsmonitor=false ] || exit 1\nprintf checked > "$GIT_CHECK_MARKER"\nexec "$REAL_GIT" "$@"\n`,
+      `#!/bin/sh\n[ -z "\${ORKA_HANDOFF_HOST_TOKEN+x}" ] || exit 1\n[ "$1" = -c ] && [ "$2" = core.fsmonitor=false ] || exit 1\nprintf '%s\\n' "$*" >> "$GIT_CHECK_MARKER"\nexec "$REAL_GIT" "$@"\n`,
     ),
     0o755,
   );
@@ -264,7 +264,11 @@ test("host sharing creates and revokes a link without starting browser sign-in",
     extra,
   });
   assert.equal(result.code, 0, result.err);
-  assert.equal(readFileSync(marker, "utf8"), "checked");
+  const gitCalls = readFileSync(marker, "utf8");
+  assert.match(gitCalls, /rev-parse --show-toplevel/);
+  assert.doesNotMatch(gitCalls, / status --porcelain/);
+  assert.match(seen.creates[0].repository.commit, /^[a-f0-9]{40,64}$/);
+  assert.equal(Object.hasOwn(seen.creates[0].repository, "uncommitted"), false);
   assert.equal(
     seen.creates[0].messages[0].text,
     "Session notes: [REDACTED] [REDACTED]",

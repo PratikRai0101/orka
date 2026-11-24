@@ -232,7 +232,7 @@ async function share(origin, options, hostToken) {
     : collectContext(session, space, homes);
   if (options.title?.trim()) session.title = options.title.trim();
   if (options.items !== undefined) selectNumbers(items, options.items);
-  const repo = repository(space);
+  const repo = repository(space, { inspectWorktree: !hostToken });
   const days = options.days === undefined ? undefined : Number(options.days);
   if (
     days !== undefined &&

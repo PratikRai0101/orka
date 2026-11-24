@@ -157,7 +157,7 @@ function remoteName(remote) {
   return name && /^[\w.-]+(?:\/[\w.-]+)?$/.test(name) ? name : undefined;
 }
 
-export function repository(space) {
+export function repository(space, { inspectWorktree = true } = {}) {
   if (!space.git) return undefined;
   const remote = git(space.root, "remote", "get-url", "origin");
   const name = (remoteName(remote) ?? basename(space.main)).slice(0, 200);
@@ -169,11 +169,16 @@ export function repository(space) {
     name,
     ...(branch && branch.length <= 255 ? { branch } : {}),
     ...(/^[0-9a-f]{40,64}$/.test(commit) ? { commit } : {}),
-    // If status can't be read, warn instead of calling the checkout clean.
-    uncommitted: attempt(
-      () => Boolean(runGit(space.root, "status", "--porcelain")),
-      true,
-    ),
+    // Git status can run repository-configured filters. Host sharing omits
+    // this field instead of claiming it checked the working tree.
+    ...(inspectWorktree
+      ? {
+          uncommitted: attempt(
+            () => Boolean(runGit(space.root, "status", "--porcelain")),
+            true,
+          ),
+        }
+      : {}),
   };
 }
 
