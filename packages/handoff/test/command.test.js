@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -128,7 +129,10 @@ function fixture(t) {
   return { home, project, write, git, claude, run };
 }
 
-async function service(t, { handoffs = 1, failures = 0 } = {}) {
+async function service(
+  t,
+  { handoffs = 1, failures = 0, cut = 0, revoked = true, error = "Busy" } = {},
+) {
   const seen = { creates: [], polls: 0, starts: 0, tokens: [], paths: [] };
   let valid = "orka_handoff_first";
   const server = createServer(async (request, response) => {
@@ -167,7 +171,12 @@ async function service(t, { handoffs = 1, failures = 0 } = {}) {
       return send(401, { error: "Sign in required" });
     if (request.url === "/v2/handoffs" && request.method === "POST") {
       seen.creates.push(body);
-      if (seen.creates.length <= failures) return send(503, { error: "Busy" });
+      if (seen.creates.length <= failures) return send(503, { error });
+      if (seen.creates.length <= cut) {
+        response.writeHead(200, { "Content-Length": 500 });
+        response.write('{"url":"https');
+        return setTimeout(() => response.destroy(), 20);
+      }
       return send(200, {
         id: ID,
         url: "https://dashboard.example.test/handoff/abc",
@@ -184,6 +193,7 @@ async function service(t, { handoffs = 1, failures = 0 } = {}) {
           },
         ],
       });
+    if (request.url === "/v2/handoffs/revoke") return send(200, { revoked });
     return send(200, {});
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -212,7 +222,7 @@ test("sharing signs in once, sends related context and never sends secrets or pe
       ["memory", "AGENTS.md"],
       ["memory", "Memory: build.md"],
       ["skill", "review"],
-      ["plan", "Approved plan"],
+      ["plan", "Plan"],
       ["session", "Earlier work"],
     ],
   );
@@ -341,50 +351,90 @@ test("a Codex fork includes only the inherited turns, and a missing parent is re
   const { origin, seen } = await service(t);
   const parent = "66666666-6666-4666-8666-666666666666";
   const child = "77777777-7777-4777-8777-777777777777";
-  const lines = (records) =>
-    records.map((record) => JSON.stringify(record)).join("\n") + "\n";
-  const user = (value) => ({
-    type: "response_item",
-    payload: {
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text: value }],
-    },
-  });
-  const kept = lines([
-    { type: "session_meta", payload: { id: parent, cwd: project } },
-    user("Kept é"),
-  ]);
-  const path = write(
-    `.codex/sessions/rollout-${parent}.jsonl`,
-    kept + lines([user("After the fork")]),
-  );
-  const forked = write(
-    `.codex/sessions/rollout-${child}.jsonl`,
-    lines([
+  const session = (id, cwd, first, texts, base) =>
+    [
       {
         type: "session_meta",
-        payload: {
-          id: child,
-          cwd: project,
-          history_base: {
-            thread_id: parent,
-            end_byte_offset: Buffer.byteLength(kept),
-          },
-        },
+        payload: { id, cwd, ...(base ? { history_base: base } : {}) },
       },
-      user("Child"),
-    ]),
+      ...texts.map((text) => ({
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text }],
+        },
+      })),
+    ]
+      .map((record, index) =>
+        JSON.stringify({ ...record, ordinal: first + index }),
+      )
+      .join("\n") + "\n";
+  const kept = session(parent, project, 0, ["Kept é"]);
+  const path = write(
+    `.codex/sessions/rollout-${parent}.jsonl`,
+    session(parent, project, 0, ["Kept é", "After the fork"]),
   );
-  assert.equal(
-    (await run(["--yes", "--no-context", "--session", forked], { origin }))
-      .code,
-    0,
+  const base = {
+    thread_id: parent,
+    end_ordinal_exclusive: 2,
+    end_byte_offset: Buffer.byteLength(kept),
+  };
+  const fork = (value, first = value.end_ordinal_exclusive) =>
+    write(
+      `.codex/sessions/rollout-${child}.jsonl`,
+      session(child, project, first, ["Child"], value),
+    );
+  const texts = async (file) => {
+    const result = await run(["--yes", "--no-context", "--session", file], {
+      origin,
+    });
+    assert.equal(result.code, 0, result.err);
+    return seen.creates.at(-1).messages.map((message) => message.text);
+  };
+  const forked = fork(base);
+  assert.deepEqual(await texts(forked), ["Kept é", "Child"]);
+
+  // A thread can continue in further segments that share its ID.
+  const second = session(parent, project, 2, ["Second"], base);
+  const segment = write(
+    `.codex/sessions/rollout-${parent}_88888888-8888-4888-8888-888888888888.jsonl`,
+    second,
   );
-  assert.deepEqual(
-    seen.creates.at(-1).messages.map((message) => message.text),
-    ["Kept é", "Child"],
+  assert.deepEqual(await texts(parent), ["Kept é", "Second"]);
+  fork({
+    thread_id: parent,
+    end_ordinal_exclusive: 4,
+    end_byte_offset: Buffer.byteLength(second),
+  });
+  assert.deepEqual(await texts(forked), ["Kept é", "Second", "Child"]);
+  rmSync(segment);
+
+  // Turns are never dropped or added when a boundary doesn't match.
+  for (const change of [
+    { end_byte_offset: -5 },
+    { end_byte_offset: 3 },
+    { end_byte_offset: 1_000_000 },
+    { end_ordinal_exclusive: 3 },
+  ]) {
+    fork({ ...base, ...change });
+    const refused = await run(["--yes", "--session", forked], { origin });
+    assert.equal(refused.code, 1, JSON.stringify(change));
+  }
+  fork(base, 7);
+  assert.equal((await run(["--yes", "--session", forked])).code, 1);
+
+  fork(base);
+  const other = join(home, "other");
+  mkdirSync(other);
+  write(
+    `.codex/sessions/rollout-${parent}.jsonl`,
+    session(parent, other, 0, ["Kept é"]),
   );
+  const elsewhere = await run(["--yes", "--session", forked], { origin });
+  assert.equal(elsewhere.code, 1);
+
+  const count = seen.creates.length;
   rmSync(path);
   const missing = await run(["--yes", "--no-context", "--session", forked], {
     origin,
@@ -393,6 +443,7 @@ test("a Codex fork includes only the inherited turns, and a missing parent is re
   assert.ok(
     missing.err.includes("history is missing") && !missing.err.includes(home),
   );
+  assert.equal(seen.creates.length, count);
 });
 
 test(
@@ -465,4 +516,302 @@ test("plain HTTP is only accepted on this computer", () => {
     apiOrigin("http://127.0.0.1:3000/path"),
     "http://127.0.0.1:3000",
   );
+});
+
+const selected = (err) =>
+  err
+    .split("\n")
+    .filter((line) => line.includes("[x]"))
+    .map((line) => line.replace(/^\s*\[x\]\s+\d+\s+/, ""));
+const has = (err, text) => selected(err).some((line) => line.includes(text));
+
+test("paths printed by tools don't select another project's plans", async (t) => {
+  const { run, write, claude, home } = fixture(t);
+  write(".claude/plans/client.md", "Client plan");
+  write(".claude/plans/mine.md", "My plan");
+  const listing = (id, input) =>
+    claude(id, [
+      ["user", "Look"],
+      ["assistant", [{ type: "tool_use", name: "Bash", input }]],
+      [
+        "user",
+        [{ type: "tool_result", content: `${home}/.claude/plans/client.md` }],
+      ],
+      ["assistant", "Done"],
+    ]);
+  const file = listing(ID, { command: "ls ~/.claude/plans/*.md" });
+  const listed = await run(["--preview", "--session", file]);
+  assert.ok(
+    !listed.err.includes("client.md") && !listed.err.includes("mine.md"),
+  );
+  listing(ID, { command: "cat ~/.claude/plans/mine.md" });
+  const used = await run(["--preview", "--session", file]);
+  assert.ok(has(used.err, "mine.md") && !used.err.includes("client.md"));
+});
+
+test("a rejected plan is not shared", async (t) => {
+  const { run, claude } = fixture(t);
+  const plan = (id, text) => [
+    "assistant",
+    [{ type: "tool_use", id, name: "ExitPlanMode", input: { plan: text } }],
+  ];
+  const result = (id, is_error) => [
+    "user",
+    [{ type: "tool_result", tool_use_id: id, is_error, content: "x" }],
+  ];
+  const file = claude(ID, [
+    ["user", "Plan it"],
+    plan("a", "First plan"),
+    result("a", false),
+    plan("b", "Second plan"),
+    result("b", true),
+  ]);
+  const { out } = await run(["--preview", "--json", "--session", file]);
+  assert.equal(
+    JSON.parse(out).items.find((item) => item.kind === "plan").files[0].text,
+    "First plan",
+  );
+});
+
+test("only sessions and files from this project are chosen", async (t) => {
+  const { run, write, claude, project, home } = fixture(t);
+  // A folder above the project is not the project.
+  const parent = await run(["--preview"], { cwd: home });
+  assert.equal(parent.code, 1);
+
+  // A newer session in a nested repository belongs to that repository.
+  const nested = join(project, "vendor/nested");
+  mkdirSync(nested, { recursive: true });
+  execFileSync("git", ["init", "-q", nested]);
+  claude(
+    "99999999-9999-4999-8999-999999999999",
+    [["user", "Nested work"]],
+    undefined,
+    nested,
+  );
+  assert.ok((await run(["--preview"])).err.includes("Fix it"));
+
+  // Instructions in the home folder are personal.
+  write(".claude/CLAUDE.md", "Personal rules");
+  write("CLAUDE.md", "Home rules");
+  const own = claude(
+    "aaaaaaaa-9999-4999-8999-999999999999",
+    [["user", "Home work"]],
+    undefined,
+    home,
+  );
+  const inHome = await run(["--preview", "--session", own], { cwd: home });
+  assert.ok(inHome.err.includes("Home work"));
+  assert.ok(!has(inHome.err, "CLAUDE.md"), inHome.err);
+
+  // A linked folder can point outside the project.
+  write("outside/CLAUDE.md", "Outside rules");
+  write("outside/plans/outside.md", "Outside plan");
+  symlinkSync(join(home, "outside"), join(project, ".claude"));
+  const linked = await run(["--preview"]);
+  assert.ok(!linked.err.includes(".claude/CLAUDE.md"));
+  assert.ok(!linked.err.includes("outside.md"));
+});
+
+test("a home folder kept in Git doesn't claim the projects below it", async (t) => {
+  const { run, claude, write, home } = fixture(t);
+  execFileSync("git", ["init", "-q", home]);
+  write("CLAUDE.md", "Home rules");
+  const notes = join(home, "notes");
+  mkdirSync(notes);
+  claude(
+    "bbbbbbbb-9999-4999-8999-999999999999",
+    [["user", "Private notes"]],
+    undefined,
+    notes,
+  );
+  assert.equal((await run(["--preview"], { cwd: home })).code, 1);
+  claude(
+    "cccccccc-9999-4999-8999-999999999999",
+    [["user", "Home work"]],
+    undefined,
+    home,
+  );
+  const { err } = await run(["--preview"], { cwd: home });
+  assert.ok(err.includes("Home work") && !has(err, "CLAUDE.md"), err);
+});
+
+test("a session whose folder is gone takes no context from the current one", async (t) => {
+  const { run, claude, home } = fixture(t);
+  const file = claude(
+    "dddddddd-9999-4999-8999-999999999999",
+    [["user", "Client work"]],
+    undefined,
+    join(home, "deleted-client"),
+  );
+  const { out } = await run(["--preview", "--json", "--session", file]);
+  const bundle = JSON.parse(out);
+  assert.equal(bundle.title, "Client work");
+  assert.equal(bundle.repository, undefined);
+  assert.deepEqual(bundle.items, []);
+});
+
+test("a large first message doesn't hide the newest session", async (t) => {
+  const { run, claude } = fixture(t);
+  claude("eeeeeeee-9999-4999-8999-999999999999", [
+    [
+      "user",
+      [
+        { type: "image", source: { data: "A".repeat(3_000_000) } },
+        { type: "text", text: "Newest work" },
+      ],
+    ],
+  ]);
+  assert.ok((await run(["--preview"])).err.includes("Newest work"));
+});
+
+test("only memories marked as about the project start selected", async (t) => {
+  const { run, write, project } = fixture(t);
+  const slug = project.replace(/[^a-zA-Z0-9]/g, "-");
+  const note = (name, matter) =>
+    write(
+      `.claude/projects/${slug}/memory/${name}.md`,
+      `---\n${matter}\n---\nNote ${name}\n`,
+    );
+  note("quoted", 'type: "user"');
+  note("upper", "type: User");
+  note("inline", "metadata: {type: feedback}");
+  note("mixed", "type: project\nmetadata:\n  type: user");
+  note("untyped", "name: x\n# type: project is in the text");
+  note("body", "name: x\n---\ntype: project");
+  note("good", 'metadata: { name: x, type: "Project" }');
+  note("link", "metadata:\n  node_type: memory\n  type: reference");
+  const { err } = await run(["--preview"]);
+  assert.deepEqual(
+    selected(err)
+      .filter((line) => line.includes("Memory:"))
+      .map((line) => line.match(/Memory: (\w+)/)[1]),
+    ["build", "good", "link"],
+  );
+});
+
+test("the review shows a skill's files, leaves credentials out and can print everything", async (t) => {
+  const { run, write, home } = fixture(t);
+  rmSync(join(home, ".claude/skills/review"), { recursive: true });
+  write("checkout/SKILL.md", "Review");
+  write("checkout/customers.csv", "a,b");
+  write("checkout/secrets.md", "How to handle them");
+  write("checkout/config/credentials.json", '{"refresh":"abc123"}');
+  write("checkout/server.pem", "x");
+  symlinkSync(join(home, "checkout"), join(home, ".claude/skills/review"));
+  const { err, out } = await run(["--preview", "--json"]);
+  assert.ok(
+    err.includes("SKILL.md, customers.csv, secrets.md, 2 left out"),
+    err,
+  );
+  const bundle = JSON.parse(out);
+  assert.ok(!out.includes("abc123"));
+  assert.ok(bundle.items.some((item) => item.kind === "skill"));
+  assert.ok(out.includes("How to handle them"));
+});
+
+test("defaults never exceed what can be shared", async (t) => {
+  const { run, write, claude, project } = fixture(t);
+  const slug = project.replace(/[^a-zA-Z0-9]/g, "-");
+  for (let index = 0; index < 65; index++)
+    write(
+      `.claude/projects/${slug}/memory/n${index}.md`,
+      `---\ntype: project\n---\nNote ${index}`,
+    );
+  claude(RELATED, [["user", `Earlier work ${"x".repeat(4_000_000)}`]]);
+  const file = claude(ID, [["user", `Carry on from ${RELATED}`]]);
+  const result = await run(["--preview", "--json", "--session", file]);
+  assert.equal(result.code, 0, result.err);
+  assert.equal(JSON.parse(result.out).items.length, 60);
+});
+
+test("sessions are found by ID and not by part of a file name", async (t) => {
+  const { run, claude } = fixture(t);
+  const a = "12345678-1111-4111-8111-111111111111";
+  claude(a, [["user", "First"]], `2026-11-24-${a}`);
+  claude("12345678-2222-4222-8222-222222222222", [["user", "Second"]]);
+  const date = await run(["--preview", "--session", "2026-11-24"]);
+  assert.ok(date.err.includes("wasn’t found"));
+  const short = await run(["--preview", "--session", "12345678"]);
+  assert.ok(short.err.includes("More than one"));
+  const exact = await run(["--preview", "--session", a.slice(0, 13)]);
+  assert.ok(exact.err.includes("First"));
+});
+
+test("a session the person names starts selected, and linked folders are searched", async (t) => {
+  const { run, claude, home, project } = fixture(t);
+  const slug = project.replace(/[^a-zA-Z0-9]/g, "-");
+  const file = claude(ID, [["user", `Carry on from ${RELATED}`]]);
+  assert.ok(
+    has((await run(["--preview", "--session", file])).err, "Earlier work"),
+  );
+  const folder = join(home, ".claude/projects", slug);
+  renameSync(folder, join(home, "moved"));
+  symlinkSync(join(home, "moved"), folder);
+  assert.equal((await run(["--preview"])).code, 0);
+});
+
+test("a remote's host, query and local path stay out of the repository name", async (t) => {
+  const { run, git } = fixture(t);
+  for (const [remote, name] of [
+    ["https://git.corp.example.test/repo.git", "repo"],
+    ["https://u:p@git.example.test/team/repo?access_token=abcd", "team/repo"],
+    ["ssh://git@git.example.test:22/team/repo.git/", "team/repo"],
+    ["git@git.example.test:group/team/repo.git", "team/repo"],
+    ["file:///Users/jane/client/repo.git", "project"],
+    ["/Users/jane/client/repo.git", "project"],
+    ["git.example.test:team", "project"],
+  ]) {
+    git("remote", "set-url", "origin", remote);
+    const { out } = await run(["--preview", "--json"]);
+    assert.equal(JSON.parse(out).repository.name, name, remote);
+  }
+});
+
+test("an unclear reply is retried and never reported as a link", async (t) => {
+  const { run } = fixture(t);
+  const once = await service(t, { cut: 1 });
+  const ok = await run(["--yes"], { origin: once.origin });
+  assert.equal(ok.code, 0, ok.err);
+  assert.equal(ok.out, "https://dashboard.example.test/handoff/abc\n");
+  assert.equal(once.seen.creates[0].requestId, once.seen.creates[1].requestId);
+  const always = await service(t, { cut: 9 });
+  const failed = await run(["--yes"], { origin: always.origin });
+  assert.equal(failed.code, 1);
+  assert.equal(failed.out, "");
+  assert.ok(failed.err.includes("may have been created"));
+  const blank = await service(t, { failures: 9, error: "" });
+  assert.ok(
+    (await run(["--yes"], { origin: blank.origin })).err.includes("503"),
+  );
+  const hostile = await service(t, { failures: 9, error: "x\u001b[2Jy" });
+  assert.ok(
+    !(await run(["--yes"], { origin: hostile.origin })).err.includes("\u001b"),
+  );
+});
+
+test("revoke reports a link that was not found, and older services are explained", async (t) => {
+  const { run } = fixture(t);
+  const { origin } = await service(t, { revoked: false });
+  const result = await run(["revoke", ID], { origin });
+  assert.equal(result.code, 1);
+  assert.ok(!result.err.includes("no longer works"));
+  assert.equal((await run(["revoke", ID, RELATED], { origin })).code, 1);
+  const older = await service(t, { handoffs: 0 });
+  for (const args of [["list"], ["revoke", ID]])
+    assert.ok(
+      (await run(args, { origin: older.origin })).err.includes(
+        "doesn’t support handoffs",
+      ),
+    );
+});
+
+test("a sign-in that can't be saved still shares", async (t) => {
+  const { run, write } = fixture(t);
+  const { origin, seen } = await service(t);
+  write(".config", "not a folder");
+  const result = await run(["--yes"], { origin });
+  assert.equal(result.code, 0, result.err);
+  assert.equal(seen.creates.length, 1);
+  assert.equal((await run(["--yes"], { origin: "not an address" })).code, 1);
 });

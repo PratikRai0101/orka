@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   closeSync,
+  existsSync,
   lstatSync,
   openSync,
   readFileSync,
@@ -11,9 +12,19 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import zlib from "node:zlib";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import {
   HandoffError,
+  LIMITS,
+  credentialFile,
   decodeLines,
   itemSize,
   readSession,
@@ -23,7 +34,10 @@ import {
 const FILE_LIMIT = 256_000;
 const SKILL_LIMIT = 400_000;
 const SESSION_LIMIT = 512_000_000;
+// A first message can hold several pasted images before any record names its folder.
+const HEADER_LIMIT = 64_000_000;
 const RECENT_SESSIONS = 8;
+const UUIDS = /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/gi;
 
 function expand(path) {
   return path === "~" || path.startsWith("~/")
@@ -34,6 +48,7 @@ function expand(path) {
 export function toolHomes(env = process.env) {
   const pi = expand(env.PI_CODING_AGENT_DIR || "~/.pi/agent");
   return {
+    user: homedir(),
     claude: expand(env.CLAUDE_CONFIG_DIR || "~/.claude"),
     codex: expand(env.CODEX_HOME || "~/.codex"),
     pi,
@@ -86,19 +101,46 @@ export function workspace(directory) {
   };
 }
 
-/** Never includes a remote's host, user or credentials. */
+/** The nearest checkout, found from the path alone so a deleted folder still works. */
+function checkout(path) {
+  for (let folder = path; ; folder = dirname(folder)) {
+    if (existsSync(join(folder, ".git"))) return folder;
+    if (folder === dirname(folder)) return undefined;
+  }
+}
+
+/** A nested repository, or a project below a plain folder, is a different project. */
+function belongs(cwd, space) {
+  if (cwd === space.cwd) return true;
+  // A repository at the home folder would otherwise claim everything below it.
+  if (!space.git || inside(real(homedir()), space.root)) return false;
+  const root = checkout(cwd);
+  return Boolean(root) && space.roots.includes(root);
+}
+
+/** `owner/name` or `name`. Never a remote's host, sign-in, query or local path. */
+function remoteName(remote) {
+  let path;
+  if (/^(?:https?|ssh|git):\/\//i.test(remote))
+    path = attempt(() => new URL(remote).pathname);
+  else path = remote.match(/^[^/:\s]+@[^/:\s]+:(.+)$/)?.[1];
+  const name = path
+    ?.replace(/\/+$/, "")
+    .replace(/\.git$/, "")
+    .split("/")
+    .filter(Boolean)
+    .slice(-2)
+    .join("/");
+  return name && /^[\w.-]+(?:\/[\w.-]+)?$/.test(name) ? name : undefined;
+}
+
 export function repository(space) {
   if (!space.git) return undefined;
-  const remote = git(space.root, "remote", "get-url", "origin")
-    .replace(/\/+$/, "")
-    .replace(/\.git$/, "");
-  const name =
-    /^(?:[a-z+]+:\/\/|[^/]+@)/i.test(remote) &&
-    remote.match(/[:/]([^/:@]+\/[^/:@]+)$/)?.[1];
+  const remote = git(space.root, "remote", "get-url", "origin");
   const branch = git(space.root, "branch", "--show-current");
   const commit = git(space.root, "rev-parse", "HEAD");
   return {
-    name: name || basename(space.main),
+    name: remoteName(remote) ?? basename(space.main),
     ...(branch ? { branch } : {}),
     ...(/^[0-9a-f]{40,64}$/.test(commit) ? { commit } : {}),
     uncommitted: Boolean(git(space.root, "status", "--porcelain")),
@@ -121,16 +163,35 @@ function readSessionBytes(path) {
   return path.endsWith(".zst") ? decompress(raw) : raw;
 }
 
-function firstLines(path, limit = 1_000_000) {
-  if (path.endsWith(".zst"))
-    return [readSessionBytes(path).toString("utf8").split("\n", 1)[0]];
+/** Complete lines from the start of a file, read only as far as they are needed. */
+function* leadingLines(path) {
+  if (path.endsWith(".zst")) {
+    // Only Codex compresses sessions, and its first record is the header.
+    yield* readSessionBytes(path).toString("utf8").split("\n", 1);
+    return;
+  }
   const file = openSync(path, "r");
   try {
-    const buffer = Buffer.alloc(limit);
-    const length = readSync(file, buffer, 0, limit, 0);
-    const text = buffer.toString("utf8", 0, length);
-    const end = text.lastIndexOf("\n");
-    return text.slice(0, end < 0 ? text.length : end).split("\n");
+    const chunk = Buffer.alloc(65_536);
+    let parts = [];
+    for (let total = 0; total < HEADER_LIMIT;) {
+      const length = readSync(file, chunk, 0, chunk.length, null);
+      if (!length) {
+        yield Buffer.concat(parts).toString("utf8");
+        return;
+      }
+      total += length;
+      let start = 0;
+      for (;;) {
+        const end = chunk.subarray(0, length).indexOf(10, start);
+        if (end < 0) break;
+        parts.push(Buffer.from(chunk.subarray(start, end)));
+        yield Buffer.concat(parts).toString("utf8");
+        parts = [];
+        start = end + 1;
+      }
+      parts.push(Buffer.from(chunk.subarray(start, length)));
+    }
   } finally {
     closeSync(file);
   }
@@ -138,17 +199,14 @@ function firstLines(path, limit = 1_000_000) {
 
 function header(path, tool) {
   return attempt(() => {
-    for (const line of firstLines(
-      path,
-      tool === "claude" ? 262_144 : 1_000_000,
-    )) {
+    for (const line of leadingLines(path)) {
       const record = attempt(() => JSON.parse(line));
       if (tool === "claude") {
         if (
           typeof record?.cwd === "string" &&
           typeof record.sessionId === "string"
         )
-          return { id: record.sessionId, cwd: record.cwd };
+          return { id: record.sessionId, cwd: record.cwd, ordinal: 0 };
         continue;
       }
       const meta = tool === "codex" ? record?.payload : record;
@@ -158,7 +216,7 @@ function header(path, tool) {
         meta.source?.subagent
       )
         return undefined;
-      return { id: meta.id, cwd: meta.cwd };
+      return { id: meta.id, cwd: meta.cwd, ordinal: record.ordinal ?? 0 };
     }
   });
 }
@@ -178,7 +236,7 @@ function sessionFiles(homes) {
     () => readdirSync(join(homes.claude, "projects"), { withFileTypes: true }),
     [],
   )
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
     .flatMap((entry) => {
       const directory = join(homes.claude, "projects", entry.name);
       return attempt(() => readdirSync(directory), [])
@@ -204,38 +262,89 @@ function sessionFiles(homes) {
 
 /** Sessions started in this checkout or its linked worktrees, newest first. */
 export function listSessions(space, homes) {
-  return sessionFiles(homes).flatMap((file) => {
+  const found = new Map();
+  for (const file of sessionFiles(homes)) {
     const meta = header(file.path, file.tool);
-    if (!meta) return [];
+    if (!meta) continue;
     const cwd = real(meta.cwd);
-    return space.roots.some((root) => inside(cwd, root))
-      ? [{ ...file, ...meta, cwd }]
-      : [];
-  });
+    if (!belongs(cwd, space)) continue;
+    // Codex can split one thread into segments. The last one holds the newest turns.
+    const key = file.tool === "codex" ? meta.id : real(file.path);
+    const previous = found.get(key);
+    if (!previous) found.set(key, { ...file, ...meta, cwd });
+    else if (meta.ordinal > previous.ordinal)
+      found.set(key, {
+        ...file,
+        ...meta,
+        cwd,
+        modified: Math.max(file.modified, previous.modified),
+      });
+  }
+  return [...found.values()].sort((a, b) => b.modified - a.modified);
 }
 
-/** A Codex fork keeps its earlier turns in the rollout it was forked from. */
-function codexRecords(path, homes, end, depth = 0) {
-  const records = decodeLines(
-    readSessionBytes(path).subarray(0, end).toString("utf8"),
-  );
-  const base = records[0]?.payload?.history_base;
-  if (!base) return records;
-  const parent = ["sessions", "archived_sessions"]
-    .flatMap((name) => jsonlFiles(join(homes.codex, name)))
-    .find((file) =>
-      [".jsonl", ".jsonl.zst"].some((suffix) =>
-        file.endsWith(base.thread_id + suffix),
-      ),
-    );
-  if (!parent || depth >= 20 || !Number.isSafeInteger(base.end_byte_offset))
-    throw new HandoffError(
-      "Part of this Codex session’s history is missing on this computer.",
-    );
-  return [
-    ...codexRecords(parent, homes, base.end_byte_offset, depth + 1),
-    ...records,
-  ];
+const MISSING_HISTORY =
+  "Part of this Codex session’s history is missing or doesn’t match on this computer.";
+
+const ordinalAfter = (records) => records.at(-1)?.ordinal + 1;
+
+/** The one segment that ends exactly where this session says it continued. */
+function inheritedBytes(base, homes) {
+  const { thread_id: id, end_byte_offset: offset } = base;
+  const end = base.end_ordinal_exclusive;
+  let found;
+  if (
+    /^[0-9a-f-]{36}$/i.test(id) &&
+    Number.isSafeInteger(offset) &&
+    offset > 0 &&
+    Number.isSafeInteger(end)
+  )
+    for (const path of ["sessions", "archived_sessions"].flatMap((name) =>
+      jsonlFiles(join(homes.codex, name)),
+    )) {
+      const name = basename(path).replace(/\.zst$/, "");
+      if (!name.endsWith(`${id}.jsonl`) && !name.includes(`-${id}_`)) continue;
+      const meta = header(path, "codex");
+      if (meta?.id !== id || meta.ordinal >= end) continue;
+      const bytes = readSessionBytes(path).subarray(0, offset);
+      if (bytes.length !== offset || bytes[offset - 1] !== 10) continue;
+      const records = attempt(() => decodeLines(bytes.toString("utf8")));
+      if (!records || ordinalAfter(records) !== end) continue;
+      if (found && !found.equals(bytes))
+        throw new HandoffError(MISSING_HISTORY);
+      found = bytes;
+    }
+  if (!found) throw new HandoffError(MISSING_HISTORY);
+  return found;
+}
+
+/** A Codex fork keeps its earlier turns in the rollouts it continued from. */
+function codexRecords(path, homes) {
+  let bytes = readSessionBytes(path);
+  let records = decodeLines(bytes.toString("utf8"));
+  const cwd = records[0]?.payload?.cwd;
+  const space = typeof cwd === "string" ? workspace(cwd) : undefined;
+  const parts = [records];
+  let total = bytes.length;
+  for (let base; (base = records[0]?.payload?.history_base);) {
+    if (
+      parts.length >= 200 ||
+      records[0].ordinal !== base.end_ordinal_exclusive
+    )
+      throw new HandoffError(MISSING_HISTORY);
+    bytes = inheritedBytes(base, homes);
+    total += bytes.length;
+    if (total > SESSION_LIMIT)
+      throw new HandoffError(`${basename(path)} is too large to share.`);
+    records = decodeLines(bytes.toString("utf8"));
+    const folder = records[0]?.payload?.cwd;
+    if (!space || typeof folder !== "string" || !belongs(real(folder), space))
+      throw new HandoffError(
+        "This Codex session continues one from another folder, so it wasn’t shared.",
+      );
+    parts.unshift(records);
+  }
+  return parts.flat();
 }
 
 export function openSession(path, homes) {
@@ -244,6 +353,28 @@ export function openSession(path, homes) {
   const session = readSession(records);
   const own = header(path, session.tool);
   return { ...session, ...(own ? { id: own.id, cwd: own.cwd } : {}), path };
+}
+
+/** Finds sessions by ID. A date or other part of a file name is not an ID. */
+function sessionById(homes, id) {
+  const wanted = id.toLowerCase();
+  if (!/^[0-9a-f]{8}[0-9a-f-]*$/.test(wanted)) return undefined;
+  const ids = new Set();
+  let best;
+  for (const file of sessionFiles(homes)) {
+    // A Codex segment adds its own ID after the thread it belongs to.
+    const own = basename(file.path).match(UUIDS)?.[0].toLowerCase();
+    if (!own?.startsWith(wanted)) continue;
+    ids.add(own);
+    const ordinal =
+      file.tool === "codex" ? (header(file.path, "codex")?.ordinal ?? 0) : 0;
+    if (!best || ordinal > best.ordinal) best = { path: file.path, ordinal };
+  }
+  if (ids.size > 1)
+    throw new HandoffError(
+      "More than one session starts with that ID. Enter more of it.",
+    );
+  return best?.path;
 }
 
 /** An explicit session, the agent running this command, or the newest session here. */
@@ -255,18 +386,14 @@ export function chooseSession(
   if (session) {
     const path = resolve(expand(session));
     if (attempt(() => statSync(path).isFile())) return path;
-    const match = sessionFiles(homes).find((file) =>
-      basename(file.path).includes(session),
-    );
-    if (match && /^[0-9a-f-]{8,}$/i.test(session)) return match.path;
+    const match = sessionById(homes, session);
+    if (match) return match;
     throw new HandoffError("That session wasn’t found.");
   }
   const running = env.CLAUDE_CODE_SESSION_ID || env.CODEX_THREAD_ID;
   if (running && /^[0-9a-f-]{36}$/i.test(running)) {
-    const match = sessionFiles(homes).find((file) =>
-      basename(file.path).includes(running),
-    );
-    if (match) return match.path;
+    const match = sessionById(homes, running);
+    if (match) return match;
   }
   const sessions = listSessions(space, homes);
   const here =
@@ -290,13 +417,34 @@ function textFile(path, name = basename(path)) {
   });
 }
 
+/** A file reached through a linked folder outside the project is not the project's. */
+const ownFile = (path, root) => inside(real(dirname(path)), root);
+
+/** Only notes marked as about the project start selected. */
+function projectNote(text) {
+  const matter = text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? "";
+  const types = [
+    ...matter.matchAll(/(?:^|[{,])\s*["']?type["']?\s*:\s*["']?([\w-]+)/gim),
+  ].map((match) => match[1].toLowerCase());
+  return (
+    types.length > 0 &&
+    types.every((type) => ["project", "reference"].includes(type))
+  );
+}
+
 function memoryItems(space, homes, tool) {
   const items = [];
   const add = (path, title, selected) => {
     const file = textFile(path);
     if (file) items.push({ kind: "memory", title, files: [file], selected });
   };
-  const folders = [...new Set([space.root, space.cwd])];
+  const personal = [homes.claude, homes.codex, homes.pi, homes.agents].map(
+    real,
+  );
+  const user = homes.user && real(homes.user);
+  // Instructions in the home folder, or above it, are about the person.
+  const shared = !user || !inside(user, space.root);
+  const folders = space.missing ? [] : [...new Set([space.root, space.cwd])];
   for (const folder of folders)
     for (const name of [
       "CLAUDE.md",
@@ -306,7 +454,14 @@ function memoryItems(space, homes, tool) {
       "CLAUDE.local.md",
     ]) {
       const path = join(folder, name);
-      add(path, relative(space.root, path), !name.includes(".local."));
+      if (!ownFile(path, space.root)) continue;
+      add(
+        path,
+        relative(space.root, path),
+        shared &&
+          !name.includes(".local.") &&
+          !personal.some((home) => inside(real(path), home)),
+      );
     }
   const slug = (path) => path.replace(/[^a-zA-Z0-9]/g, "-");
   const projects = [...new Set([space.main, space.root, space.cwd])];
@@ -316,19 +471,13 @@ function memoryItems(space, homes, tool) {
       .filter((file) => file.endsWith(".md"))
       .sort()) {
       const file = textFile(join(directory, name));
-      if (!file) continue;
-      const type = file.text.match(/^\s*type:\s*(\w+)/m)?.[1];
-      // Notes about the person, and the index that lists them, need a deliberate choice.
-      const selected =
-        tool === "claude" &&
-        name !== "MEMORY.md" &&
-        !["user", "feedback"].includes(type);
-      items.push({
-        kind: "memory",
-        title: `Memory: ${name}`,
-        files: [file],
-        selected,
-      });
+      if (file)
+        items.push({
+          kind: "memory",
+          title: `Memory: ${name}`,
+          files: [file],
+          selected: tool === "claude" && projectNote(file.text),
+        });
     }
   }
   add(join(homes.claude, "CLAUDE.md"), "Personal CLAUDE.md", false);
@@ -340,6 +489,7 @@ function memoryItems(space, homes, tool) {
 function skillFolder(folder) {
   const files = [];
   let total = 0;
+  let skipped = 0;
   const visit = (directory, prefix) => {
     const entries = attempt(
       () => readdirSync(directory, { withFileTypes: true }),
@@ -357,21 +507,29 @@ function skillFolder(folder) {
       )
         continue;
       const name = prefix + entry.name;
-      if (entry.isDirectory()) visit(join(directory, entry.name), `${name}/`);
-      else if (entry.isFile() && files.length < 60) {
-        const file = textFile(join(directory, entry.name), name);
-        if (!file || total + file.text.length > SKILL_LIMIT) continue;
-        total += file.text.length;
-        files.push(file);
+      if (entry.isDirectory()) {
+        visit(join(directory, entry.name), `${name}/`);
+        continue;
       }
+      const file =
+        entry.isFile() && files.length < 60 && !credentialFile(name)
+          ? textFile(join(directory, entry.name), name)
+          : undefined;
+      if (!file || total + file.text.length > SKILL_LIMIT) {
+        skipped++;
+        continue;
+      }
+      total += file.text.length;
+      files.push(file);
     }
   };
   visit(folder, "");
-  return files;
+  return { files, skipped };
 }
 
 function skillItems(session, space, homes) {
-  const projectRoots = [space.root, space.cwd].flatMap((root) =>
+  const projects = space.missing ? [] : [space.root, space.cwd];
+  const projectRoots = projects.flatMap((root) =>
     [".claude/skills", ".codex/skills", ".agents/skills", ".pi/skills"].map(
       (path) => join(root, path),
     ),
@@ -401,7 +559,7 @@ function skillItems(session, space, homes) {
   }
   // A transcript can name any path, so accept only the known skill folders.
   const allowed = [
-    space.root,
+    ...projects,
     homes.claude,
     homes.codex,
     homes.agents,
@@ -410,7 +568,7 @@ function skillItems(session, space, homes) {
   for (const raw of session.skills.folders) {
     const value = expand(raw.replace(/^\$\{?HOME\}?/, "~"));
     const folder = real(
-      isAbsolute(value) ? value : join(session.cwd ?? space.cwd, value),
+      isAbsolute(value) ? value : join(session.cwd ?? "", value),
     );
     if (
       /[\\/]skills[\\/]/.test(folder) &&
@@ -419,27 +577,33 @@ function skillItems(session, space, homes) {
       add(folder, true);
   }
   return [...found.values()].flatMap(({ path, selected }) => {
-    const files = skillFolder(path);
+    const { files, skipped } = skillFolder(path);
     return files.some((file) => file.path === "SKILL.md")
-      ? [{ kind: "skill", title: basename(path), files, selected }]
+      ? [{ kind: "skill", title: basename(path), files, skipped, selected }]
       : [];
   });
 }
 
-function planItems(session, space, homes, transcript) {
+function planItems(session, space, homes) {
   const items = session.plan
     ? [
         {
           kind: "plan",
-          title: "Approved plan",
+          title: "Plan",
           files: [{ path: "plan.md", text: session.plan }],
           selected: true,
         },
       ]
     : [];
-  const projectFolders = [".claude/plans", ".codex/plans"].map((path) =>
-    join(space.root, path),
+  const used = new Set(
+    session.plans.map((raw) => {
+      const value = expand(raw.replace(/^\$\{?HOME\}?/, "~"));
+      return real(isAbsolute(value) ? value : join(session.cwd ?? "", value));
+    }),
   );
+  const projectFolders = space.missing
+    ? []
+    : [".claude/plans", ".codex/plans"].map((path) => join(space.root, path));
   const personal = [homes.claude, homes.codex].map((home) =>
     join(home, "plans"),
   );
@@ -447,10 +611,15 @@ function planItems(session, space, homes, transcript) {
     for (const name of attempt(() => readdirSync(folder), []).filter((file) =>
       file.endsWith(".md"),
     )) {
-      const mentioned = transcript.includes(`plans/${name}`);
+      const path = join(folder, name);
+      const mentioned = used.has(real(path));
       // Personal plan folders mix every project, so only offer ones this session used.
-      if (!mentioned && personal.includes(folder)) continue;
-      const file = textFile(join(folder, name));
+      if (
+        !mentioned &&
+        (personal.includes(folder) || !ownFile(path, space.root))
+      )
+        continue;
+      const file = textFile(path);
       if (file && file.text.trim() !== session.plan?.trim())
         items.push({
           kind: "plan",
@@ -490,24 +659,41 @@ function sessionItems(session, space, homes) {
 
 /** Everything a sender may attach. Only related, non-personal items start selected. */
 export function collectContext(session, space, homes) {
-  const transcript = readSessionBytes(session.path).toString("utf8");
   const items = [
     ...memoryItems(space, homes, session.tool),
     ...skillItems(session, space, homes),
-    ...planItems(session, space, homes, transcript),
+    ...planItems(session, space, homes),
     ...sessionItems(session, space, homes),
   ];
   const seen = new Set();
+  // Never start with a selection that is too large to share.
+  let room = LIMITS.bytes - itemSize(session.messages) - 100_000;
+  let count = 0;
   return items
     .filter((item) => {
       const key = JSON.stringify([item.kind, item.files ?? item.messages]);
       return !seen.has(key) && seen.add(key);
     })
-    .map((item) => ({ ...item, size: itemSize(item) }));
+    .map((item) => {
+      const size = itemSize(item);
+      const selected = item.selected && count < LIMITS.items && size <= room;
+      if (selected) {
+        count++;
+        room -= size;
+      }
+      return { ...item, size, selected };
+    });
 }
 
+/** The session's own project. A deleted folder must not borrow the current one. */
 export function sessionWorkspace(session, fallback) {
-  const exists =
-    session.cwd && attempt(() => statSync(session.cwd).isDirectory());
-  return exists ? workspace(session.cwd) : fallback;
+  if (!session.cwd) return missing("");
+  if (attempt(() => statSync(session.cwd).isDirectory()))
+    return workspace(session.cwd);
+  const cwd = real(session.cwd);
+  return belongs(cwd, fallback) ? fallback : missing(cwd);
+}
+
+function missing(cwd) {
+  return { cwd, root: cwd, main: cwd, roots: [cwd], git: false, missing: true };
 }

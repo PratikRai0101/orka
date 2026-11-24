@@ -16,7 +16,9 @@ const local = (url) =>
   ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 
 export function apiOrigin(value = DEFAULT_API) {
-  const url = new URL(value);
+  const url = URL.canParse(value) ? new URL(value) : undefined;
+  if (!url || !["https:", "http:"].includes(url.protocol))
+    throw new HandoffError("Enter the Orka service address as an https URL.");
   if (url.protocol !== "https:" && !local(url))
     throw new HandoffError("The Orka service address must use HTTPS.");
   return url.origin;
@@ -82,18 +84,31 @@ export async function call(
       { retry: true },
     );
   }
-  const result = await response.json().catch(() => ({}));
+  const result = await response.json().catch(() => undefined);
   if (!response.ok)
     throw Object.assign(
       new HandoffError(
-        String(result.error ?? `Orka returned ${response.status}.`),
+        String(result?.error || `Orka returned ${response.status}.`),
       ),
       {
         status: response.status,
         retry: response.status >= 500,
       },
     );
+  // A reply cut off on the way says nothing about what the service did.
+  if (!result || typeof result !== "object")
+    throw Object.assign(
+      new HandoffError("Orka’s reply was cut off. Try again."),
+      { retry: true },
+    );
   return result;
+}
+
+function checkedUrl(value) {
+  const url = URL.canParse(value) ? new URL(value) : undefined;
+  return url && (url.protocol === "https:" || local(url))
+    ? url.href
+    : undefined;
 }
 
 export async function requireHandoffs(origin, options) {
@@ -108,10 +123,9 @@ export async function signIn(origin, show, options = {}) {
     ...options,
     body: {},
   });
-  const url = new URL(request.verifyUrl);
-  if (url.protocol !== "https:" && !local(url))
-    throw new HandoffError("Orka returned an invalid sign-in address.");
-  show({ code: request.userCode, url: url.href });
+  const url = checkedUrl(request.verifyUrl);
+  if (!url) throw new HandoffError("Orka returned an invalid sign-in address.");
+  show({ code: request.userCode, url });
   const deadline = Date.now() + request.expiresIn * 1000;
   while (Date.now() < deadline) {
     await (options.delay ?? delay)(request.interval * 1000);
@@ -126,8 +140,7 @@ export async function signIn(origin, show, options = {}) {
       throw error;
     }
     if (result.status !== "approved") continue;
-    saveToken(origin, { token: result.token, expiresAt: result.expiresAt });
-    return result.token;
+    return { token: result.token, expiresAt: result.expiresAt };
   }
   throw new HandoffError("The sign-in code expired. Run the command again.");
 }
@@ -136,13 +149,22 @@ export async function signIn(origin, show, options = {}) {
 export async function upload(origin, bundle, token, options = {}) {
   for (let tries = 0; ; tries++) {
     try {
-      return await call(origin, "/v2/handoffs", {
+      const result = await call(origin, "/v2/handoffs", {
         ...options,
         body: bundle,
         token,
       });
+      const url = checkedUrl(result.url);
+      if (url && result.id) return { ...result, url };
+      throw Object.assign(new HandoffError("Orka returned an invalid link."), {
+        retry: true,
+      });
     } catch (error) {
-      if (!error.retry || tries >= 2) throw error;
+      if (!error.retry) throw error;
+      if (tries >= 2)
+        throw new HandoffError(
+          `${error.message} The link may have been created. Run orka-handoff list to check.`,
+        );
       await (options.delay ?? delay)(1000 * (tries + 1));
     }
   }

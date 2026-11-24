@@ -19,12 +19,11 @@ const SECRET_NAME =
 const CREDENTIAL =
   /\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|[sr]k_live_[A-Za-z0-9]{16,})/g;
 const BEARER = /\b(Bearer[ \t]+)[A-Za-z0-9._~+/-]+=*/gi;
-const PRIVATE_KEY =
-  /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----/g;
+const KEY_START = /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----/g;
+const KEY_END = /-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----/g;
 const ASSIGNMENT =
   /^([ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*[=:][ \t]*)[^\r\n]+/gm;
-const JSON_STRING =
-  /(?:(("(?:\\[^\r\n]|[^"\\\r\n])*")\s*:\s*))?("(?:\\[^\r\n]|[^"\\\r\n])*")/g;
+const COLON = /\s*:\s*/y;
 
 function parseString(token) {
   try {
@@ -34,19 +33,78 @@ function parseString(token) {
   }
 }
 
+/** Finds where a quoted string ends, or where it was cut off. */
+function scanString(text, start) {
+  let index = start + 1;
+  for (; index < text.length; index++) {
+    const character = text[index];
+    if (character === '"') return { end: index + 1, closed: true };
+    if (character === "\r" || character === "\n") break;
+    if (character === "\\") {
+      const next = text[index + 1];
+      if (next === undefined || next === "\r" || next === "\n") break;
+      index++;
+    }
+  }
+  return { end: Math.max(index, start + 1), closed: false };
+}
+
+/**
+ * Reads each `"string"` or `"key": "string"`. A regular expression does this too,
+ * but takes quadratic time on a long line of escaped JSON.
+ */
+function redactStrings(text) {
+  let result = "";
+  let copied = 0;
+  let start = text.indexOf('"');
+  while (start >= 0) {
+    const first = scanString(text, start);
+    // Every other quote before the cut is escaped, so none of them closes either.
+    let end = first.end;
+    if (first.closed) {
+      let token = start;
+      COLON.lastIndex = first.end;
+      const value = COLON.test(text) ? COLON.lastIndex : -1;
+      if (value >= 0 && text[value] === '"') {
+        const second = scanString(text, value);
+        if (second.closed) [token, end] = [value, second.end];
+      }
+      const current = parseString(text.slice(token, end));
+      if (current !== undefined) {
+        const name =
+          token === start
+            ? undefined
+            : parseString(text.slice(start, first.end));
+        const next =
+          name !== undefined && SECRET_NAME.test(name)
+            ? REDACTED
+            : redactOnce(current);
+        if (next !== current) {
+          result += text.slice(copied, token) + JSON.stringify(next);
+          copied = end;
+        }
+      }
+    }
+    start = text.indexOf('"', end);
+  }
+  return result + text.slice(copied);
+}
+
+function redactKeys(text) {
+  let result = "";
+  let copied = 0;
+  KEY_START.lastIndex = 0;
+  for (let start; (start = KEY_START.exec(text));) {
+    KEY_END.lastIndex = KEY_START.lastIndex;
+    if (!KEY_END.exec(text)) break;
+    result += text.slice(copied, start.index) + REDACTED;
+    copied = KEY_START.lastIndex = KEY_END.lastIndex;
+  }
+  return result + text.slice(copied);
+}
+
 function redactOnce(text) {
-  return text
-    .replace(JSON_STRING, (whole, prefix, key, token) => {
-      const value = parseString(token);
-      if (value === undefined) return whole;
-      const name = key === undefined ? undefined : parseString(key);
-      const next =
-        name !== undefined && SECRET_NAME.test(name)
-          ? REDACTED
-          : redactOnce(value);
-      return next === value ? whole : (prefix ?? "") + JSON.stringify(next);
-    })
-    .replace(PRIVATE_KEY, REDACTED)
+  return redactKeys(redactStrings(text))
     .replace(ASSIGNMENT, (whole, prefix, name) =>
       SECRET_NAME.test(name) ? prefix + REDACTED : whole,
     )
@@ -303,7 +361,9 @@ export function readSession(records) {
         ? cleanRequest(message.text)
         : message.text.trim();
     if (!text) continue;
-    if (message.role === "user") title ??= requestTitle(message.text);
+    // Clipping first could cut a secret so that no rule recognizes it.
+    if (message.role === "user")
+      title ??= requestTitle(redactText(message.text));
     messages.push({ role: message.role, text });
   }
   if (!messages.length)
@@ -315,8 +375,7 @@ export function readSession(records) {
     title: title ?? `${TOOL_NAMES[meta.tool]} session`,
     messages,
     plan: lastPlan(records),
-    skills: skillReferences(records),
-    mentions: sessionMentions(records, meta.id),
+    ...references(records, messages, meta.id),
   };
 }
 
@@ -341,25 +400,74 @@ function toolCalls(records) {
       : content
           .filter((part) => ["tool_use", "toolCall"].includes(part?.type))
           .map((part) => ({
+            id: part.id,
             name: part.name,
             input: part.input ?? part.arguments,
           }));
   });
 }
 
+/** The newest plan the user did not reject. */
 function lastPlan(records) {
+  const rejected = new Set();
+  for (const record of records) {
+    const content = record?.message?.content;
+    if (Array.isArray(content))
+      for (const part of content)
+        if (part?.type === "tool_result" && part.is_error === true)
+          rejected.add(part.tool_use_id);
+  }
   return toolCalls(records)
-    .filter((call) => call.name === "ExitPlanMode")
+    .filter(
+      (call) =>
+        call.name === "ExitPlanMode" &&
+        !(call.id !== undefined && rejected.has(call.id)),
+    )
     .map((call) => call.input?.plan)
     .findLast((plan) => typeof plan === "string" && plan.trim());
 }
 
-const SKILL_FILE = /([^\s"'`<>\\:=]+)\/SKILL\.md\b/g;
+/** Every string in a tool call. Codex encodes its arguments as JSON text. */
+function inputText(value) {
+  if (typeof value === "string") {
+    if (/^\s*[{[]/.test(value))
+      try {
+        return inputText(JSON.parse(value));
+      } catch {
+        // Not JSON, so it is the text itself.
+      }
+    return [value];
+  }
+  return value && typeof value === "object"
+    ? Object.values(value).flatMap(inputText)
+    : [];
+}
 
-/** Skills the session used, by name (Claude) or by the folder it read them from. */
-function skillReferences(records) {
+const PATH_BREAK = /[\s"'`<>\\:=]/;
+
+/** Paths ending in a match, read backwards so long text stays quick to search. */
+function paths(text, ending) {
+  return [...text.matchAll(ending)].map((match) => {
+    let start = match.index;
+    const limit = Math.max(0, start - 1024);
+    while (start > limit && !PATH_BREAK.test(text[start - 1])) start--;
+    return text.slice(start, match.index + match[0].length);
+  });
+}
+
+const SKILL_FILE = /\/SKILL\.md\b/g;
+const PLAN_FILE = /plans\/[^\s"'`<>\\/:=]{1,200}\.md\b/g;
+const UUID = /\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/g;
+
+/**
+ * What the session points at: skills, plans and other sessions. Only requests and
+ * tool inputs count. Tool output can name any file on the computer.
+ */
+function references(records, messages, own) {
   const names = new Set();
   const folders = new Set();
+  const plans = new Set();
+  const ids = new Set();
   // Typing a skill's slash command records its name instead of a Skill call.
   for (const record of records)
     if (record?.type === "user" && record.isSidechain !== true)
@@ -367,25 +475,21 @@ function skillReferences(records) {
         /<command-name>\/?([^<\s]+)<\/command-name>/g,
       ))
         names.add(match[1]);
-  for (const call of toolCalls(records)) {
+  const calls = toolCalls(records);
+  for (const call of calls)
     if (call.name === "Skill" && typeof call.input?.skill === "string")
       names.add(call.input.skill);
-    const input =
-      typeof call.input === "string" ? call.input : JSON.stringify(call.input);
-    for (const match of (input ?? "").matchAll(SKILL_FILE))
-      folders.add(match[1]);
+  const used = calls.flatMap((call) => inputText(call.input));
+  for (const text of used)
+    for (const path of paths(text, SKILL_FILE))
+      folders.add(path.slice(0, -"/SKILL.md".length));
+  const asked = messages
+    .filter((message) => message.role === "user")
+    .map((message) => message.text);
+  for (const text of [...used, ...asked]) {
+    for (const path of paths(text, PLAN_FILE)) plans.add(path);
+    for (const id of text.match(UUID) ?? []) ids.add(id);
   }
-  return { names: [...names], folders: [...folders] };
-}
-
-const UUID = /\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/g;
-
-/** Session IDs this session points at, so explicitly related work can be offered. */
-function sessionMentions(records, own) {
-  const ids = new Set();
-  for (const call of toolCalls(records))
-    for (const id of (JSON.stringify(call.input) ?? "").match(UUID) ?? [])
-      ids.add(id);
   for (const record of records.slice(0, 1)) {
     ids.add(record?.payload?.forked_from_id);
     ids.add(record?.payload?.history_base?.thread_id);
@@ -395,7 +499,11 @@ function sessionMentions(records, own) {
   ids.delete(own);
   ids.delete(undefined);
   ids.delete(null);
-  return [...ids];
+  return {
+    skills: { names: [...names], folders: [...folders].filter(Boolean) },
+    plans: [...plans],
+    mentions: [...ids],
+  };
 }
 
 // Bundles
@@ -423,6 +531,18 @@ export function safePath(path) {
           !["", ".", ".."].includes(part) &&
           !/^\.env(?:\.|$)|\.env$/i.test(part),
       )
+  );
+}
+
+/** Files that usually hold a credential, whatever is inside. Notes about them are fine. */
+export function credentialFile(path) {
+  const name = path.split("/").at(-1);
+  return (
+    /\.(?:pem|key|p12|pfx|keystore|jks)$/i.test(name) ||
+    /^id_(?:rsa|dsa|ecdsa|ed25519)$/i.test(name) ||
+    (/(?:^|[._-])(?:credentials?|secrets?)(?:[._-]|$)/i.test(name) &&
+      !/\.(?:md|txt)$/i.test(name)) ||
+    [".netrc", ".npmrc", ".pypirc"].includes(name)
   );
 }
 

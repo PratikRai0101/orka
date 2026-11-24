@@ -3,8 +3,11 @@
 Share a coding session, and the context it needs, as one link. Neither you nor
 the people you send it to need Orka installed.
 
+The package is not on npm yet, so don't run it with `npx`. With Node.js 20.1 or
+later, run it from a checkout of this repository:
+
 ```sh
-npx orka-handoff
+node /path/to/orka/packages/handoff/bin/orka-handoff.js
 ```
 
 Run it inside a project. It picks the latest Claude Code, Codex or Pi session
@@ -15,10 +18,13 @@ Dashboard so you can sign in and approve this command.
 
 - The conversation: your messages and the assistant's replies. Tool calls, tool
   output, reasoning and attachments stay on your computer.
-- Project instructions and memories, the skills the session used, its plan, and
-  sessions it mentions. Memories about you and your preferences start unselected.
+- Project instructions, the skills the session used, its plan, and sessions you
+  mentioned in it. Memory notes start selected only if their type is `project` or
+  `reference`.
+- A skill is its whole folder, except files that usually hold credentials.
 
-Review the list before you confirm. Orka redacts credentials it recognizes before
+Review the list before you confirm. Enter `v` to read everything in it, or run
+with `--preview --json`. Orka redacts credentials it recognizes before
 upload, and the service refuses bundles that still contain one. Recognition is not
 complete, so read the preview.
 

@@ -42,6 +42,7 @@ Options
   --no-context         Share only the conversation
   --items <1,3>        Choose context by number
   --preview            Show what would be shared, then stop
+                       Add --json to print its full contents
   --yes                Share the selected items without asking
   --json               Print the result as JSON
 `;
@@ -53,6 +54,16 @@ const say = (text = "") => process.stderr.write(`${text}\n`);
 const kb = (bytes) =>
   bytes < 1000 ? "<1 KB" : `${Math.round(bytes / 1000)} KB`;
 
+/** Keeps line breaks, so a whole file can be read before sharing it. */
+const plainLines = (text) => text.split(/\r?\n/).map(plain).join("\n");
+
+function details(item) {
+  const files = item.files?.map((file) => plain(file.path)) ?? [];
+  const left = item.skipped ? `, ${item.skipped} left out` : "";
+  // A skill is a folder, so its name alone doesn't say what is shared.
+  return item.kind === "skill" ? `${files.join(", ")}${left}` : "";
+}
+
 function show(session, repo, items) {
   say(`\n${plain(session.title)}`);
   say(
@@ -60,11 +71,12 @@ function show(session, repo, items) {
   );
   if (repo?.uncommitted) say("Your uncommitted changes are not shared.");
   if (items.length) say("\nContext");
-  items.forEach((item, index) =>
+  items.forEach((item, index) => {
     say(
       `  ${item.selected ? "[x]" : "[ ]"} ${String(index + 1).padStart(2)}  ${item.kind.padEnd(8)}${plain(item.title).slice(0, 70)}  ${kb(item.size)}`,
-    ),
-  );
+    );
+    if (item.selected && details(item)) say(`          ${details(item)}`);
+  });
   say("\nAnyone with the link can read this. Recognized secrets are removed.");
 }
 
@@ -84,21 +96,53 @@ function selectNumbers(items, value) {
   items.forEach((item, index) => (item.selected = wanted.has(index)));
 }
 
-async function review(session, repo, items) {
+/** Prints the exact text a link would expose, after secrets are removed. */
+function showContents(bundle) {
+  say(`\n# ${plain(bundle.title)}`);
+  const messages = (list) =>
+    list.forEach((message) =>
+      say(
+        `\n## ${message.role === "user" ? "You" : "Assistant"}\n\n${plainLines(message.text)}`,
+      ),
+    );
+  messages(bundle.messages);
+  for (const item of bundle.items) {
+    say(`\n# ${item.kind}: ${plain(item.title)}`);
+    if (item.messages) messages(item.messages);
+    for (const file of item.files ?? [])
+      say(`\n## ${plain(file.path)}\n\n${plainLines(file.text)}`);
+  }
+}
+
+async function review(session, repo, items, build) {
   const lines = createInterface({
     input: process.stdin,
     output: process.stderr,
   });
+  const closed = new Promise((resolve) =>
+    lines.once("close", () => resolve("q")),
+  );
   try {
     for (;;) {
       show(session, repo, items);
+      const question = `Press Return to share, ${items.length ? "numbers to change context, " : ""}v to read it all, or q to cancel: `;
+      // Ctrl-C and Ctrl-D close the prompt without answering it.
       const answer = (
-        await lines.question(
-          `Press Return to share${items.length ? ", enter numbers to change context" : ""}, or q to cancel: `,
-        )
+        await Promise.race([lines.question(question).catch(() => "q"), closed])
       ).trim();
-      if (!answer) return true;
-      if (/^q(uit)?$/i.test(answer)) return false;
+      if (/^q(uit)?$/i.test(answer)) return undefined;
+      if (!answer || /^v(iew)?$/i.test(answer)) {
+        try {
+          const built = build();
+          if (!answer) return built;
+          showContents(built.bundle);
+        } catch (error) {
+          // Too much was chosen. Keep the choices so they can be changed.
+          if (!(error instanceof HandoffError)) throw error;
+          say(`\n${plain(error.message)}`);
+        }
+        continue;
+      }
       for (const part of answer.split(/[\s,]+/)) {
         const item = items[Number(part) - 1];
         if (item) item.selected = !item.selected;
@@ -124,13 +168,22 @@ function openBrowser(url) {
 }
 
 async function authorized(origin, action) {
-  const authorize = () =>
-    signIn(origin, ({ code, url }) => {
-      say(`\nSign in to share. Open ${url}`);
-      say(`Check that the page shows this code: ${code}`);
+  const authorize = async () => {
+    const credential = await signIn(origin, ({ code, url }) => {
+      say(`\nSign in to Orka. Open ${url}`);
+      say(`Check that the page shows this code: ${plain(code)}`);
       say("Waiting for approval…");
       openBrowser(url);
     });
+    try {
+      saveToken(origin, credential);
+    } catch {
+      say(
+        "This sign-in couldn’t be saved, so you’ll be asked again next time.",
+      );
+    }
+    return credential.token;
+  };
   const saved = savedToken(origin);
   if (saved)
     try {
@@ -159,7 +212,8 @@ async function share(origin, options) {
     !(Number.isInteger(days) && days >= 1 && days <= 90)
   )
     throw new HandoffError("Choose between 1 and 90 days.");
-  const build = (requestId) =>
+  const requestId = randomUUID();
+  const build = () =>
     buildBundle({
       session,
       items: items.filter((item) => item.selected),
@@ -172,12 +226,17 @@ async function share(origin, options) {
     process.stderr.isTTY &&
     !options.yes &&
     !options.preview;
+  let built;
   if (asks) {
-    if (!(await review(session, repo, items)))
-      return say("Nothing was shared.");
-  } else show(session, repo, items);
-  const { bundle, size, redacted } = build(randomUUID());
+    built = await review(session, repo, items, build);
+    if (!built) return say("Nothing was shared.");
+  } else {
+    show(session, repo, items);
+    built = build();
+  }
+  const { bundle, size, redacted } = built;
   if (options.preview || (!asks && !options.yes)) {
+    if (options.json) console.log(JSON.stringify(bundle));
     say(
       `Nothing was shared. This handoff is ${kb(size)}${redacted ? `, with secrets removed from ${redacted} places` : ""}.`,
     );
@@ -226,13 +285,18 @@ async function main() {
       help: { type: "boolean", short: "h" },
     },
   });
-  const [command = "share", id] = positionals;
+  const [command = "share", id, ...extra] = positionals;
   if (options.help) return console.log(HELP);
   const origin = apiOrigin(options.api ?? process.env.ORKA_HANDOFF_API);
+  if (extra.length || (id && command !== "revoke"))
+    throw new HandoffError(
+      `${plain(extra[0] ?? id)} wasn’t expected. Run orka-handoff --help.`,
+    );
   switch (command) {
     case "share":
       return share(origin, options);
     case "list": {
+      await requireHandoffs(origin);
       const { items } = await authorized(origin, (token) =>
         call(origin, "/v2/handoffs", { token }),
       );
@@ -247,9 +311,14 @@ async function main() {
     case "revoke": {
       if (!id)
         throw new HandoffError("Pass the ID shown by orka-handoff list.");
-      await authorized(origin, (token) =>
+      await requireHandoffs(origin);
+      const { revoked } = await authorized(origin, (token) =>
         call(origin, "/v2/handoffs/revoke", { token, body: { id } }),
       );
+      if (!revoked)
+        throw new HandoffError(
+          "You have no active link with that ID. Run orka-handoff list to check.",
+        );
       return say("The link no longer works.");
     }
     case "sign-out": {
@@ -274,7 +343,11 @@ async function main() {
 main().catch((error) => {
   const known =
     error instanceof HandoffError || error.code?.startsWith?.("ERR_PARSE_ARGS");
-  say(known ? error.message : "Something went wrong. Nothing was shared.");
+  say(
+    known
+      ? plain(error.message)
+      : "Something went wrong. Set ORKA_HANDOFF_DEBUG=1 to see why.",
+  );
   if (!known && process.env.ORKA_HANDOFF_DEBUG) say(error.stack);
   process.exitCode = 1;
 });

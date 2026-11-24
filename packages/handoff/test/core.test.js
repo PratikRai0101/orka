@@ -276,3 +276,48 @@ test("the prompt carries the link and not the conversation", () => {
       prompt.length < 1000,
   );
 });
+
+test("a title is redacted before it is shortened", () => {
+  const text =
+    'Connect with {"user":"admin","host":"db.example.test","port":5432,"password":"correct horse battery staple and more words"} please';
+  const session = readSession([
+    {
+      type: "user",
+      sessionId: "a",
+      cwd: "/x",
+      message: { role: "user", content: text },
+    },
+  ]);
+  assert.ok(!session.title.includes("correct horse"));
+  const { bundle } = buildBundle({ session, requestId: "r" });
+  assert.ok(!JSON.stringify(bundle).includes("correct horse"));
+});
+
+test("redaction and path search stay quick on long lines", () => {
+  const started = Date.now();
+  for (const text of [
+    '\\"a\\":\\"b\\",'.repeat(80_000),
+    '"'.repeat(1_000_000),
+    "-----BEGIN PRIVATE KEY-----".repeat(40_000),
+  ])
+    redactText(text);
+  readSession([
+    {
+      type: "assistant",
+      sessionId: "a",
+      cwd: "/x",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Done" },
+          {
+            type: "tool_use",
+            name: "Write",
+            input: { x: "a/".repeat(500_000) },
+          },
+        ],
+      },
+    },
+  ]);
+  assert.ok(Date.now() - started < 5_000);
+});

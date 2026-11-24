@@ -23,6 +23,7 @@ export type HandoffSession = {
   messages: HandoffMessage[];
   plan?: string;
   skills: { names: string[]; folders: string[] };
+  plans: string[];
   mentions: string[];
 };
 export type HandoffBundle = {
@@ -51,6 +52,7 @@ export function decodeLines(text: string): unknown[];
 export function readSession(records: unknown[]): HandoffSession;
 export function itemSize(item: HandoffItem): number;
 export function safePath(path: string): boolean;
+export function credentialFile(path: string): boolean;
 export function buildBundle(input: {
   session: Pick<HandoffSession, "tool" | "title" | "messages">;
   items?: HandoffItem[];
