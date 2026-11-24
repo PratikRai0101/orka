@@ -17,7 +17,7 @@ const REDACTED = "[REDACTED]";
 const SECRET_NAME =
   /(?:^|[^a-z0-9])(?:api[_ -]?key|token|secret|password|private[_ -]?key)(?:$|[^a-z0-9])/iu;
 const CREDENTIAL =
-  /\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|[sr]k_live_[A-Za-z0-9]{16,})/g;
+  /\b(?:orka_handoff_host_[A-Fa-f0-9]{64}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|[sr]k_live_[A-Za-z0-9]{16,})/g;
 const BEARER = /\b(Bearer[ \t]+)[A-Za-z0-9._~+/-]+=*/gi;
 const KEY_START = /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----/g;
 const KEY_END = /-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----/g;

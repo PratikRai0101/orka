@@ -14,6 +14,25 @@ Run it inside a project. It picks the latest Claude Code, Codex or Pi session
 there, or the agent's own session when an agent runs it, shows what it will share, and prints a link. The first time, it opens the
 Dashboard so you can sign in and approve this command.
 
+## Share from a remote host without signing in
+
+On a host provisioned by your operator, run the command where the session file
+lives. You don't need to copy the raw file to your computer or sign in:
+
+```sh
+orka-handoff --host --session <id-or-file>
+```
+
+Review the selected context before sharing. Keep the handoff ID printed by the
+command so you can revoke it early:
+
+```sh
+orka-handoff revoke <handoff-id> --host
+```
+
+Host mode requires `ORKA_HANDOFF_API` and a provisioned `ORKA_HANDOFF_HOST_TOKEN`.
+It will not send the credential to a different `--api` or start browser sign-in.
+
 ## What is shared
 
 - The conversation: your messages and the assistant's replies. Tool calls, tool

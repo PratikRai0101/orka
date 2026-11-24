@@ -36,6 +36,7 @@ const HELP = `Share a coding session and its context as one link.
   orka-handoff sign-out        Sign this computer out
 
 Options
+  --host               Use this host’s provisioned credential; no browser sign-in
   --session <id|file>  Share a specific session
   --title <text>       Change the title
   --days <1-90>        How long the link works (default 30)
@@ -220,7 +221,7 @@ async function authorized(origin, action) {
   return action(await authorize());
 }
 
-async function share(origin, options) {
+async function share(origin, options, hostToken) {
   const homes = toolHomes();
   const here = workspace(process.cwd());
   const session = chooseSession(here, homes, options);
@@ -271,10 +272,10 @@ async function share(origin, options) {
     }
     return;
   }
-  await requireHandoffs(origin);
-  const result = await authorized(origin, (token) =>
-    upload(origin, bundle, token),
-  );
+  await requireHandoffs(origin, hostToken ? { host: true } : undefined);
+  const result = hostToken
+    ? await upload(origin, bundle, hostToken, { host: true })
+    : await authorized(origin, (token) => upload(origin, bundle, token));
   if (options.json)
     return console.log(
       JSON.stringify({
@@ -287,7 +288,9 @@ async function share(origin, options) {
   say(
     `\nShared ${kb(size)}${redacted ? `, with secrets removed from ${redacted} places` : ""}. The link expires on ${new Date(result.expiresAt).toLocaleDateString()}.`,
   );
-  say(`To stop sharing: orka-handoff revoke ${result.id}\n`);
+  say(
+    `To stop sharing: orka-handoff revoke ${result.id}${hostToken ? " --host" : ""}\n`,
+  );
   console.log(result.url);
   say(
     `\nPrompt for the next agent:\n${continuationPrompt(result.url, session.tool)}`,
@@ -303,6 +306,7 @@ async function main() {
       days: { type: "string" },
       items: { type: "string" },
       api: { type: "string" },
+      host: { type: "boolean" },
       "no-context": { type: "boolean" },
       preview: { type: "boolean" },
       yes: { type: "boolean", short: "y" },
@@ -312,14 +316,33 @@ async function main() {
   });
   const [command = "share", id, ...extra] = positionals;
   if (options.help) return console.log(HELP);
-  const origin = apiOrigin(options.api ?? process.env.ORKA_HANDOFF_API);
+  const configuredApi = process.env.ORKA_HANDOFF_API;
+  const origin = apiOrigin(options.api ?? configuredApi);
+  let hostToken;
+  if (options.host) {
+    if (command !== "share" && command !== "revoke")
+      throw new HandoffError("Host mode only supports share and revoke.");
+    if (command === "share" && !options.session)
+      throw new HandoffError(
+        "Pass --session with the exact session ID or file to share from this host.",
+      );
+    if (!configuredApi || origin !== apiOrigin(configuredApi))
+      throw new HandoffError(
+        "Host mode requires its configured ORKA_HANDOFF_API address.",
+      );
+    hostToken = process.env.ORKA_HANDOFF_HOST_TOKEN;
+    if (!/^orka_handoff_host_[a-f0-9]{64}$/.test(hostToken ?? ""))
+      throw new HandoffError(
+        "Host mode requires a provisioned ORKA_HANDOFF_HOST_TOKEN.",
+      );
+  }
   if (extra.length || (id && command !== "revoke"))
     throw new HandoffError(
       `${plain(extra[0] ?? id)} wasn’t expected. Run orka-handoff --help.`,
     );
   switch (command) {
     case "share":
-      return share(origin, options);
+      return share(origin, options, hostToken);
     case "list": {
       await requireHandoffs(origin);
       const { items } = await authorized(origin, (token) =>
@@ -335,14 +358,22 @@ async function main() {
     }
     case "revoke": {
       if (!id)
-        throw new HandoffError("Pass the ID shown by orka-handoff list.");
-      await requireHandoffs(origin);
-      const { revoked } = await authorized(origin, (token) =>
-        call(origin, "/v2/handoffs/revoke", { token, body: { id } }),
-      );
+        throw new HandoffError(
+          hostToken
+            ? "Pass the ID shown when the host shared the link."
+            : "Pass the ID shown by orka-handoff list.",
+        );
+      await requireHandoffs(origin, hostToken ? { host: true } : undefined);
+      const revoke = (token) =>
+        call(origin, "/v2/handoffs/revoke", { token, body: { id } });
+      const { revoked } = hostToken
+        ? await revoke(hostToken)
+        : await authorized(origin, revoke);
       if (!revoked)
         throw new HandoffError(
-          "You have no active link with that ID. Run orka-handoff list to check.",
+          hostToken
+            ? "This host has no active link with that ID."
+            : "You have no active link with that ID. Run orka-handoff list to check.",
         );
       return say("The link no longer works.");
     }

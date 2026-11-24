@@ -132,7 +132,14 @@ function fixture(t) {
 
 async function service(
   t,
-  { handoffs = 1, failures = 0, cut = 0, revoked = true, error = "Busy" } = {},
+  {
+    handoffs = 1,
+    hostToken,
+    failures = 0,
+    cut = 0,
+    revoked = true,
+    error = "Busy",
+  } = {},
 ) {
   const seen = { creates: [], polls: 0, starts: 0, tokens: [], paths: [] };
   let valid = "orka_handoff_first";
@@ -145,7 +152,8 @@ async function service(
       response.writeHead(status, { "Content-Type": "application/json" });
       response.end(JSON.stringify(value));
     };
-    if (request.url === "/v2/instance") return send(200, { handoffs });
+    if (request.url === "/v2/instance")
+      return send(200, { handoffs, handoffHost: hostToken ? 1 : undefined });
     if (request.url === "/v2/handoffs/device") {
       seen.starts++;
       return send(200, {
@@ -168,7 +176,10 @@ async function service(
               expiresAt: new Date(Date.now() + 1e7).toISOString(),
             },
       );
-    if (request.headers.authorization !== `Bearer ${valid}`)
+    if (
+      request.headers.authorization !== `Bearer ${valid}` &&
+      !(hostToken && request.headers.authorization === `Bearer ${hostToken}`)
+    )
       return send(401, { error: "Sign in required" });
     if (request.url === "/v2/handoffs" && request.method === "POST") {
       seen.creates.push(body);
@@ -205,6 +216,40 @@ async function service(
     rotate: () => (valid = "orka_handoff_second"),
   };
 }
+
+test("host sharing creates and revokes a link without starting browser sign-in", async (t) => {
+  const { run, claude } = fixture(t);
+  const hostToken = `orka_handoff_host_${"b".repeat(64)}`;
+  claude(ID, [["user", `Session notes: ${hostToken}`]]);
+  const { origin, seen } = await service(t, { hostToken });
+  const extra = {
+    ORKA_HANDOFF_API: origin,
+    ORKA_HANDOFF_HOST_TOKEN: hostToken,
+  };
+  const unspecified = await run(["--host", "--yes"], { extra });
+  assert.match(unspecified.err, /Pass --session/);
+  const wrongOrigin = await run(["--host", "--session", ID, "--yes"], {
+    origin: "http://127.0.0.1:1",
+    extra,
+  });
+  assert.match(wrongOrigin.err, /configured ORKA_HANDOFF_API/);
+  assert.deepEqual(seen.paths, []);
+  const result = await run(["--host", "--session", ID, "--yes", "--json"], {
+    extra,
+  });
+  assert.equal(result.code, 0, result.err);
+  assert.equal(seen.creates[0].messages[0].text, "Session notes: [REDACTED]");
+  const revoked = await run(["revoke", JSON.parse(result.out).id, "--host"], {
+    extra,
+  });
+  assert.equal(revoked.code, 0, revoked.err);
+  assert.deepEqual(seen.paths, [
+    "/v2/instance",
+    "/v2/handoffs",
+    "/v2/instance",
+    "/v2/handoffs/revoke",
+  ]);
+});
 
 test("sharing signs in once, sends related context and never sends secrets or personal notes", async (t) => {
   const { run, home } = fixture(t);
