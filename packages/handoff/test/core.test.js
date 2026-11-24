@@ -8,6 +8,7 @@ import {
   decodeLines,
   readSession,
   redactText,
+  requestTitle,
   safePath,
 } from "../src/core.js";
 
@@ -293,6 +294,21 @@ test("a title is redacted before it is shortened", () => {
   assert.ok(!JSON.stringify(bundle).includes("correct horse"));
 });
 
+test("setup blocks end at their first closing tag", () => {
+  const title = requestTitle;
+  assert.equal(
+    title(
+      "<system-reminder a='b'>x</system-reminder>Fix <INSTRUCTIONS>y</INSTRUCTIONS>it",
+    ),
+    "Fix it",
+  );
+  assert.equal(
+    title("Fix <command-names>x</command-name>"),
+    "Fix <command-names>x</command-name>",
+  );
+  assert.equal(title("Fix <INSTRUCTIONS>it"), "Fix <INSTRUCTIONS>it");
+});
+
 test("redaction and path search stay quick on long lines", () => {
   const started = Date.now();
   for (const text of [
@@ -301,6 +317,11 @@ test("redaction and path search stay quick on long lines", () => {
     "-----BEGIN PRIVATE KEY-----".repeat(40_000),
   ])
     redactText(text);
+  for (const text of [
+    "<INSTRUCTIONS ".repeat(200_000),
+    "<command-name>a".repeat(200_000),
+  ])
+    requestTitle(text);
   readSession([
     {
       type: "assistant",

@@ -146,10 +146,30 @@ function redactValue(value, count) {
 // Sessions. Message decoding matches the desktop reader.
 const CONTEXT_TAGS =
   "environment_context|INSTRUCTIONS|user_instructions|system-reminder|local-command-caveat|command-name|command-message|command-args|local-command-stdout|local-command-stderr|in-app-browser-context|external_codex_apps_open_page";
-const CONTEXT_BLOCKS = new RegExp(
-  `<(?:${CONTEXT_TAGS})(?:\\s[^>]*)?>[\\s\\S]*?</(?:${CONTEXT_TAGS})>`,
-  "g",
-);
+const CONTEXT_OPEN = new RegExp(`<(?:${CONTEXT_TAGS})(?=[\\s>])`, "g");
+const CONTEXT_CLOSE = new RegExp(`</(?:${CONTEXT_TAGS})>`, "g");
+
+/** Removes each block up to its first closing tag, without rereading unclosed ones. */
+function withoutContext(text) {
+  let clean = "";
+  let from = 0;
+  let bracket = -1;
+  let close;
+  CONTEXT_OPEN.lastIndex = 0;
+  for (let open; (open = CONTEXT_OPEN.exec(text));) {
+    if (bracket < CONTEXT_OPEN.lastIndex)
+      bracket = text.indexOf(">", CONTEXT_OPEN.lastIndex);
+    if (bracket < 0) break;
+    if (!close || close.index <= bracket) {
+      CONTEXT_CLOSE.lastIndex = bracket + 1;
+      close = CONTEXT_CLOSE.exec(text);
+    }
+    if (!close) break;
+    clean += text.slice(from, open.index);
+    from = CONTEXT_OPEN.lastIndex = close.index + close[0].length;
+  }
+  return clean + text.slice(from);
+}
 const SETUP_PREFIXES = [
   "# AGENTS.md instructions",
   "<environment_context",
@@ -168,7 +188,7 @@ function cleanRequest(text) {
   const marker = text.indexOf("## My request:");
   const request =
     marker < 0 ? text : text.slice(marker + "## My request:".length);
-  const clean = request.replace(CONTEXT_BLOCKS, "").trim();
+  const clean = withoutContext(request).trim();
   return !clean || SETUP_PREFIXES.some((prefix) => clean.startsWith(prefix))
     ? undefined
     : clean;
@@ -367,14 +387,15 @@ export function readSession(records) {
     messages.push({ role: message.role, text });
   }
   if (!messages.length)
-    throw new HandoffError(
-      "This session has no readable conversation to share.",
+    throw Object.assign(
+      new HandoffError("This session has no readable conversation to share."),
+      { empty: true },
     );
   return {
     ...meta,
     title: title ?? `${TOOL_NAMES[meta.tool]} session`,
     messages,
-    plan: lastPlan(records),
+    ...planDecisions(records),
     ...references(records, messages, meta.id),
   };
 }
@@ -407,8 +428,8 @@ function toolCalls(records) {
   });
 }
 
-/** The newest plan the user did not reject. */
-function lastPlan(records) {
+/** The newest plan the user did not reject, and the ones they did. */
+function planDecisions(records) {
   const rejected = new Set();
   for (const record of records) {
     const content = record?.message?.content;
@@ -417,14 +438,18 @@ function lastPlan(records) {
         if (part?.type === "tool_result" && part.is_error === true)
           rejected.add(part.tool_use_id);
   }
-  return toolCalls(records)
-    .filter(
-      (call) =>
-        call.name === "ExitPlanMode" &&
-        !(call.id !== undefined && rejected.has(call.id)),
-    )
-    .map((call) => call.input?.plan)
-    .findLast((plan) => typeof plan === "string" && plan.trim());
+  const calls = toolCalls(records).filter(
+    (call) => call.name === "ExitPlanMode",
+  );
+  const refused = (call) => call.id !== undefined && rejected.has(call.id);
+  const text = (call) =>
+    typeof call.input?.plan === "string" ? call.input.plan.trim() : "";
+  return {
+    plan: calls.findLast((call) => !refused(call) && text(call))?.input.plan,
+    rejectedPlans: calls.filter(refused).map(text).filter(Boolean),
+    // Newer versions keep the plan in a file, so its text may not be recorded.
+    planRejected: calls.length > 0 && refused(calls.at(-1)),
+  };
 }
 
 /** Every string in a tool call. Codex encodes its arguments as JSON text. */
@@ -490,15 +515,8 @@ function references(records, messages, own) {
     for (const path of paths(text, PLAN_FILE)) plans.add(path);
     for (const id of text.match(UUID) ?? []) ids.add(id);
   }
-  for (const record of records.slice(0, 1)) {
-    ids.add(record?.payload?.forked_from_id);
-    ids.add(record?.payload?.history_base?.thread_id);
-    const parent = record?.parentSession;
-    if (typeof parent === "string") ids.add(parent.match(UUID)?.at(-1));
-  }
+  // A fork's parent doesn't count. It can have later turns this session never saw.
   ids.delete(own);
-  ids.delete(undefined);
-  ids.delete(null);
   return {
     skills: { names: [...names], folders: [...folders].filter(Boolean) },
     plans: [...plans],
@@ -536,12 +554,14 @@ export function safePath(path) {
 
 /** Files that usually hold a credential, whatever is inside. Notes about them are fine. */
 export function credentialFile(path) {
-  const name = path.split("/").at(-1);
+  const folders = path.split("/");
+  const name = folders.pop();
   return (
+    folders.some((folder) => /^\.?(?:credentials?|secrets?)$/i.test(folder)) ||
     /\.(?:pem|key|p12|pfx|keystore|jks)$/i.test(name) ||
     /^id_(?:rsa|dsa|ecdsa|ed25519)$/i.test(name) ||
     (/(?:^|[._-])(?:credentials?|secrets?)(?:[._-]|$)/i.test(name) &&
-      !/\.(?:md|txt)$/i.test(name)) ||
+      !/\.md$/i.test(name)) ||
     [".netrc", ".npmrc", ".pypirc"].includes(name)
   );
 }

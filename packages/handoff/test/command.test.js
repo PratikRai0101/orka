@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -814,4 +815,263 @@ test("a sign-in that can't be saved still shares", async (t) => {
   assert.equal(result.code, 0, result.err);
   assert.equal(seen.creates.length, 1);
   assert.equal((await run(["--yes"], { origin: "not an address" })).code, 1);
+});
+
+const preview = async (run, args = [], options) => {
+  const result = await run(["--preview", "--json", ...args], options);
+  assert.equal(result.code, 0, result.err);
+  return { ...result, bundle: JSON.parse(result.out) };
+};
+const named = (bundle, kind) =>
+  bundle.items.filter((item) => item.kind === kind);
+
+test("a fork's parent doesn't start selected", async (t) => {
+  const { run, write, project } = fixture(t);
+  const parent = "66666666-6666-4666-8666-666666666666";
+  const child = "77777777-7777-4777-8777-777777777777";
+  const session = (id, text, extra) =>
+    write(
+      `.codex/sessions/rollout-${id}.jsonl`,
+      [
+        { type: "session_meta", payload: { id, cwd: project, ...extra } },
+        {
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text }],
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+    );
+  session(parent, "Private turn after the fork");
+  const file = session(child, "Child", { forked_from_id: parent });
+  const { bundle, err } = await preview(run, ["--session", file]);
+  assert.deepEqual(named(bundle, "session"), []);
+  assert.match(err, /\[ \] +\d+ +session +Private turn after the fork/);
+});
+
+test("a rejected plan is not shared through its file", async (t) => {
+  const { run, write, claude, home } = fixture(t);
+  const path = join(home, ".claude/plans/cool-plan.md");
+  write(".claude/plans/cool-plan.md", "Second plan");
+  const call = (id, name, input) => [
+    "assistant",
+    [{ type: "tool_use", id, name, input }],
+  ];
+  const result = (id, is_error) => [
+    "user",
+    [{ type: "tool_result", tool_use_id: id, is_error, content: "x" }],
+  ];
+  const started = [
+    ["user", "Plan it"],
+    call("a", "ExitPlanMode", { plan: "First plan" }),
+    result("a", false),
+    call("w", "Write", { file_path: path, content: "Second plan" }),
+  ];
+  const texts = async (...records) => {
+    const file = claude(ID, [...started, ...records]);
+    const { bundle } = await preview(run, ["--session", file]);
+    return named(bundle, "plan").map((item) => item.files[0].text);
+  };
+  const second = call("b", "ExitPlanMode", { plan: "Second plan" });
+  assert.deepEqual(await texts(second, result("b", true)), ["First plan"]);
+  // Newer versions record no text with the request.
+  assert.deepEqual(
+    await texts(call("b", "ExitPlanMode", {}), result("b", true)),
+    ["First plan"],
+  );
+  assert.deepEqual(await texts(second, result("b", false)), ["Second plan"]);
+  // The rejected file stays out after a different plan is approved.
+  assert.deepEqual(
+    await texts(
+      second,
+      result("b", true),
+      call("c", "ExitPlanMode", { plan: "Third plan" }),
+      result("c", false),
+    ),
+    ["Third plan"],
+  );
+});
+
+test("a skill's name selects only the skill Claude used", async (t) => {
+  const { run, write, claude, home } = fixture(t);
+  for (const folder of [".codex", ".agents", "project/.claude"])
+    write(`${folder}/skills/review/SKILL.md`, `From ${folder}`);
+  const skills = async (skill) => {
+    const file = claude(ID, [
+      ["user", "Check it"],
+      ["assistant", [{ type: "tool_use", name: "Skill", input: { skill } }]],
+    ]);
+    const { bundle } = await preview(run, ["--session", file]);
+    return named(bundle, "skill").map((item) => item.files[0].text);
+  };
+  assert.deepEqual(await skills("someplugin:review"), []);
+  assert.deepEqual(await skills("review"), ["Review"]);
+  rmSync(join(home, ".claude/skills/review"), { recursive: true });
+  assert.deepEqual(await skills("review"), ["From project/.claude"]);
+});
+
+test("the same skill in two folders stays selected", async (t) => {
+  const { run, write, claude, project } = fixture(t);
+  for (const folder of [".claude", ".codex"])
+    write(`project/${folder}/skills/both/SKILL.md`, "Both");
+  const file = claude(ID, [
+    ["user", "Check it"],
+    [
+      "assistant",
+      [
+        {
+          type: "tool_use",
+          name: "Bash",
+          input: { command: `cat ${project}/.codex/skills/both/SKILL.md` },
+        },
+      ],
+    ],
+  ]);
+  const { bundle } = await preview(run, ["--session", file]);
+  assert.deepEqual(
+    named(bundle, "skill").map((item) => item.title),
+    ["both"],
+  );
+});
+
+test("sessions without a conversation are passed over", async (t) => {
+  const { run, claude } = fixture(t);
+  for (let index = 0; index < 10; index++)
+    claude(`${index}2345678-1111-4111-8111-111111111111`, [
+      ["user", "<command-name>/clear</command-name>"],
+    ]);
+  claude(
+    "a2345678-1111-4111-8111-111111111111",
+    [["user", "Side task"]],
+    "agent-a2345678",
+  );
+  const { err } = await preview(run);
+  assert.ok(err.includes("Fix it"), err);
+  assert.ok(err.includes("Earlier work"), err);
+  assert.ok(!err.includes("Side task"), err);
+});
+
+test("credential folders in a skill are left out", async (t) => {
+  const { run, write } = fixture(t);
+  for (const path of [
+    "secrets/prod.json",
+    "a/credentials/aws",
+    "credentials.txt",
+  ])
+    write(`.claude/skills/review/${path}`, "abc123");
+  const { out, err } = await preview(run);
+  assert.ok(!out.includes("abc123"));
+  assert.ok(err.includes("SKILL.md, 3 left out"), err);
+});
+
+test("the review shows the branch and commit, whatever Git is told", async (t) => {
+  const { run, git, home } = fixture(t);
+  git("checkout", "-q", "-b", "quiet-branch");
+  const other = join(home, "other");
+  execFileSync("git", ["init", "-q", "-b", "wrong", other]);
+  const { bundle, err } = await preview(run, [], {
+    extra: {
+      GIT_DIR: join(other, ".git"),
+      GIT_WORK_TREE: other,
+    },
+  });
+  assert.equal(bundle.repository.branch, "quiet-branch");
+  assert.equal(bundle.repository.name, "team/repo");
+  assert.ok(
+    err.includes(`Branch quiet-branch, commit ${bundle.repository.commit}`),
+    err,
+  );
+});
+
+test("a worktree inside the project doesn't replace its session", async (t) => {
+  const { run, git, claude, project } = fixture(t);
+  const worktree = join(project, ".claude/worktrees/wt");
+  git("worktree", "add", "-q", "-b", "feature", worktree);
+  const file = claude(
+    "99999999-9999-4999-8999-999999999999",
+    [["user", "Worktree work"]],
+    undefined,
+    worktree,
+  );
+  assert.ok((await preview(run)).err.includes("\nFix it"));
+  assert.ok(
+    (await preview(run, [], { cwd: worktree })).err.includes("\nWorktree work"),
+  );
+  // Once it is gone, the main checkout's branch and commit aren't its own.
+  git("worktree", "remove", "--force", worktree);
+  const { bundle } = await preview(run, ["--session", file]);
+  assert.deepEqual(bundle.repository, { name: "team/repo" });
+});
+
+test("a fork whose worktree is gone keeps its history", async (t) => {
+  const { run, write, project } = fixture(t);
+  const parent = "66666666-6666-4666-8666-666666666666";
+  const lines = (id, cwd, first, text, base) =>
+    [
+      {
+        type: "session_meta",
+        payload: { id, cwd, ...(base ? { history_base: base } : {}) },
+      },
+      {
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text }],
+        },
+      },
+    ]
+      .map((record, index) =>
+        JSON.stringify({ ...record, ordinal: first + index }),
+      )
+      .join("\n") + "\n";
+  const kept = lines(parent, project, 0, "Kept");
+  write(`.codex/sessions/rollout-${parent}.jsonl`, kept);
+  const child = "77777777-7777-4777-8777-777777777777";
+  const file = write(
+    `.codex/sessions/rollout-${child}.jsonl`,
+    lines(child, join(project, ".claude/worktrees/gone"), 2, "Child", {
+      thread_id: parent,
+      end_ordinal_exclusive: 2,
+      end_byte_offset: Buffer.byteLength(kept),
+    }),
+  );
+  const { bundle } = await preview(run, ["--session", file]);
+  assert.deepEqual(
+    bundle.messages.map((message) => message.text),
+    ["Kept", "Child"],
+  );
+});
+
+test("a long list of changes still warns", async (t) => {
+  const { run, write } = fixture(t);
+  const name = "x".repeat(200);
+  for (let index = 0; index < 6_000; index++)
+    write(`project/${name}${index}`, "");
+  const { bundle } = await preview(run);
+  assert.equal(bundle.repository.uncommitted, true);
+});
+
+test("a revoked sign-in that can't be forgotten is replaced", async (t) => {
+  const { run, home } = fixture(t);
+  const { origin, seen, rotate } = await service(t);
+  assert.equal((await run(["--yes"], { origin })).code, 0);
+  rotate();
+  const folder = join(home, ".config/orka-handoff");
+  const modes = [
+    folder,
+    ...readdirSync(folder).map((name) => join(folder, name)),
+  ];
+  for (const path of modes) chmodSync(path, path === folder ? 0o500 : 0o400);
+  try {
+    const result = await run(["--yes"], { origin });
+    assert.equal(result.code, 0, result.err);
+  } finally {
+    for (const path of modes) chmodSync(path, path === folder ? 0o700 : 0o600);
+  }
+  assert.equal(seen.starts, 2);
 });

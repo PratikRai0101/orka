@@ -22,6 +22,8 @@ export type HandoffSession = {
   title: string;
   messages: HandoffMessage[];
   plan?: string;
+  rejectedPlans: string[];
+  planRejected: boolean;
   skills: { names: string[]; folders: string[] };
   plans: string[];
   mentions: string[];

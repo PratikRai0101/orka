@@ -2,6 +2,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { parseArgs } from "node:util";
 import {
   apiOrigin,
@@ -21,7 +22,6 @@ import {
 import {
   chooseSession,
   collectContext,
-  openSession,
   repository,
   sessionWorkspace,
   toolHomes,
@@ -64,11 +64,17 @@ function details(item) {
   return item.kind === "skill" ? `${files.join(", ")}${left}` : "";
 }
 
+const checkoutLine = ({ branch, commit }) =>
+  [branch && `Branch ${plain(branch)}`, commit && `commit ${commit}`]
+    .filter(Boolean)
+    .join(", ");
+
 function show(session, repo, items) {
   say(`\n${plain(session.title)}`);
   say(
     `${TOOL_NAMES[session.tool]}, ${session.messages.length} messages${repo ? `, ${plain(repo.name)}` : ""}`,
   );
+  if (repo?.branch || repo?.commit) say(checkoutLine(repo));
   if (repo?.uncommitted) say("Your uncommitted changes are not shared.");
   if (items.length) say("\nContext");
   items.forEach((item, index) => {
@@ -98,7 +104,13 @@ function selectNumbers(items, value) {
 
 /** Prints the exact text a link would expose, after secrets are removed. */
 function showContents(bundle) {
+  const { repository: repo } = bundle;
   say(`\n# ${plain(bundle.title)}`);
+  if (repo) {
+    say(`\nRepository ${plain(repo.name)}`);
+    if (repo.branch || repo.commit) say(checkoutLine(repo));
+    if (repo.uncommitted) say("Has uncommitted changes");
+  }
   const messages = (list) =>
     list.forEach((message) =>
       say(
@@ -118,13 +130,22 @@ async function review(session, repo, items, build) {
   const lines = createInterface({
     input: process.stdin,
     output: process.stderr,
+    prompt: "",
   });
+  let open = true;
   const closed = new Promise((resolve) =>
-    lines.once("close", () => resolve("q")),
+    lines.once("close", () => {
+      open = false;
+      resolve("q");
+    }),
   );
   try {
     for (;;) {
       show(session, repo, items);
+      // Drop keys pressed before the list was on screen. They can't approve it.
+      await delay(150);
+      if (!open) return undefined;
+      lines.write(null, { ctrl: true, name: "u" });
       const question = `Press Return to share, ${items.length ? "numbers to change context, " : ""}v to read it all, or q to cancel: `;
       // Ctrl-C and Ctrl-D close the prompt without answering it.
       const answer = (
@@ -190,7 +211,11 @@ async function authorized(origin, action) {
       return await action(saved);
     } catch (error) {
       if (error.status !== 401) throw error;
-      saveToken(origin);
+      try {
+        saveToken(origin);
+      } catch {
+        // The new sign-in below is used even if neither can be saved.
+      }
     }
   return action(await authorize());
 }
@@ -198,7 +223,7 @@ async function authorized(origin, action) {
 async function share(origin, options) {
   const homes = toolHomes();
   const here = workspace(process.cwd());
-  const session = openSession(chooseSession(here, homes, options), homes);
+  const session = chooseSession(here, homes, options);
   const space = sessionWorkspace(session, here);
   const items = options["no-context"]
     ? []

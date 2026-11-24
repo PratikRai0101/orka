@@ -68,19 +68,25 @@ function attempt(action, fallback) {
 const real = (path) => attempt(() => realpathSync(path), resolve(path));
 const inside = (path, root) => path === root || path.startsWith(root + sep);
 
-function git(cwd, ...args) {
-  return attempt(
-    () =>
-      execFileSync("git", ["-C", cwd, ...args], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 10_000,
-        // Reading status must not write the sender's index.
-        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-      }).trim(),
-    "",
+// A hook or alias can point these at another repository.
+const GIT_LOCATION =
+  /^GIT_(?:DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|NAMESPACE|PREFIX)$/i;
+
+function runGit(cwd, ...args) {
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !GIT_LOCATION.test(name)),
   );
+  return execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 10_000,
+    maxBuffer: 64_000_000,
+    // Reading status must not write the sender's index.
+    env: { ...env, GIT_OPTIONAL_LOCKS: "0" },
+  }).trim();
 }
+
+const git = (...args) => attempt(() => runGit(...args), "");
 
 /** The checkout, its main repository and every linked worktree. */
 export function workspace(directory) {
@@ -137,13 +143,20 @@ function remoteName(remote) {
 export function repository(space) {
   if (!space.git) return undefined;
   const remote = git(space.root, "remote", "get-url", "origin");
+  const name = (remoteName(remote) ?? basename(space.main)).slice(0, 200);
+  // The session's own checkout is gone, so this one's state isn't its state.
+  if (space.moved) return { name };
   const branch = git(space.root, "branch", "--show-current");
   const commit = git(space.root, "rev-parse", "HEAD");
   return {
-    name: remoteName(remote) ?? basename(space.main),
-    ...(branch ? { branch } : {}),
+    name,
+    ...(branch && branch.length <= 255 ? { branch } : {}),
     ...(/^[0-9a-f]{40,64}$/.test(commit) ? { commit } : {}),
-    uncommitted: Boolean(git(space.root, "status", "--porcelain")),
+    // If status can't be read, warn instead of calling the checkout clean.
+    uncommitted: attempt(
+      () => Boolean(runGit(space.root, "status", "--porcelain")),
+      true,
+    ),
   };
 }
 
@@ -231,7 +244,8 @@ function jsonlFiles(directory) {
 }
 
 function sessionFiles(homes) {
-  // Claude keeps subagent transcripts below each session's own directory.
+  // Claude keeps subagent transcripts below each session's own directory. Older
+  // versions kept them beside it.
   const claude = attempt(
     () => readdirSync(join(homes.claude, "projects"), { withFileTypes: true }),
     [],
@@ -240,7 +254,7 @@ function sessionFiles(homes) {
     .flatMap((entry) => {
       const directory = join(homes.claude, "projects", entry.name);
       return attempt(() => readdirSync(directory), [])
-        .filter((name) => name.endsWith(".jsonl"))
+        .filter((name) => /^(?!agent-).*\.jsonl$/.test(name))
         .map((name) => join(directory, name));
     });
   const all = [
@@ -323,7 +337,11 @@ function codexRecords(path, homes) {
   let bytes = readSessionBytes(path);
   let records = decodeLines(bytes.toString("utf8"));
   const cwd = records[0]?.payload?.cwd;
-  const space = typeof cwd === "string" ? workspace(cwd) : undefined;
+  // A removed worktree still belongs to the checkout around it.
+  const space =
+    typeof cwd === "string"
+      ? workspace(existsSync(cwd) ? cwd : (checkout(real(cwd)) ?? cwd))
+      : undefined;
   const parts = [records];
   let total = bytes.length;
   for (let base; (base = records[0]?.payload?.history_base);) {
@@ -377,7 +395,7 @@ function sessionById(homes, id) {
   return best?.path;
 }
 
-/** An explicit session, the agent running this command, or the newest session here. */
+/** Opens an explicit session, the agent running this command, or the newest session here. */
 export function chooseSession(
   space,
   homes,
@@ -385,20 +403,33 @@ export function chooseSession(
 ) {
   if (session) {
     const path = resolve(expand(session));
-    if (attempt(() => statSync(path).isFile())) return path;
+    if (attempt(() => statSync(path).isFile())) return openSession(path, homes);
     const match = sessionById(homes, session);
-    if (match) return match;
+    if (match) return openSession(match, homes);
     throw new HandoffError("That session wasn’t found.");
   }
   const running = env.CLAUDE_CODE_SESSION_ID || env.CODEX_THREAD_ID;
   if (running && /^[0-9a-f-]{36}$/i.test(running)) {
     const match = sessionById(homes, running);
-    if (match) return match;
+    if (match) return openSession(match, homes);
   }
   const sessions = listSessions(space, homes);
-  const here =
-    sessions.find((item) => inside(item.cwd, space.root)) ?? sessions[0];
-  if (here) return here.path;
+  // A linked worktree can be inside this checkout without being part of it.
+  const here = (item) =>
+    item.cwd === space.cwd || checkout(item.cwd) === space.root;
+  let empty;
+  for (const item of [
+    ...sessions.filter(here),
+    ...sessions.filter((item) => !here(item)),
+  ])
+    try {
+      return openSession(item.path, homes);
+    } catch (error) {
+      // A session that was cleared before its first request has nothing to share.
+      if (!error.empty) throw error;
+      empty = error;
+    }
+  if (empty) throw empty;
   throw new HandoffError(
     "No Claude Code, Codex or Pi session was found for this folder. Run this command in your project folder, or pass --session with a file.",
   );
@@ -424,7 +455,9 @@ const ownFile = (path, root) => inside(real(dirname(path)), root);
 function projectNote(text) {
   const matter = text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? "";
   const types = [
-    ...matter.matchAll(/(?:^|[{,])\s*["']?type["']?\s*:\s*["']?([\w-]+)/gim),
+    ...matter.matchAll(
+      /(?:^|[{,])[ \t]*["']?type["']?[ \t]*:[ \t]*["']?([\w-]+)/gim,
+    ),
   ].map((match) => match[1].toLowerCase());
   return (
     types.length > 0 &&
@@ -534,9 +567,6 @@ function skillItems(session, space, homes) {
       (path) => join(root, path),
     ),
   );
-  const personalRoots = [homes.claude, homes.codex, homes.agents, homes.pi].map(
-    (home) => join(home, "skills"),
-  );
   const found = new Map();
   const add = (folder, selected) => {
     const path = real(folder);
@@ -551,12 +581,19 @@ function skillItems(session, space, homes) {
   for (const root of new Set(projectRoots))
     for (const name of attempt(() => readdirSync(root), []))
       add(join(root, name), false);
-  for (const name of session.skills.names) {
-    const short = name.split(":").at(-1);
-    if (safePath(short) && !short.includes("/"))
-      for (const root of [...projectRoots, ...personalRoots])
-        add(join(root, short), true);
-  }
+  // Only Claude records skill names. It prefers a personal skill to a project one,
+  // and a name with a prefix belongs to a plugin.
+  const named = [
+    homes.claude,
+    ...projects.map((root) => join(root, ".claude")),
+  ];
+  for (const name of session.skills.names)
+    if (safePath(name) && !/[/:]/.test(name)) {
+      const folder = named
+        .map((root) => join(root, "skills", name))
+        .find((path) => existsSync(join(path, "SKILL.md")));
+      if (folder) add(folder, true);
+    }
   // A transcript can name any path, so accept only the known skill folders.
   const allowed = [
     ...projects,
@@ -625,7 +662,10 @@ function planItems(session, space, homes) {
           kind: "plan",
           title: name,
           files: [file],
-          selected: mentioned,
+          selected:
+            mentioned &&
+            !session.planRejected &&
+            !session.rejectedPlans.includes(file.text.trim()),
         });
     }
   return items;
@@ -638,23 +678,22 @@ function sessionItems(session, space, homes) {
   const mentioned = others
     .filter((item) => session.mentions.includes(item.id))
     .slice(0, 3);
-  const recent = others
-    .filter((item) => !mentioned.includes(item))
-    .slice(0, RECENT_SESSIONS);
-  return [...mentioned, ...recent].flatMap((item) => {
+  const recent = others.filter((item) => !mentioned.includes(item));
+  const items = [];
+  // Sessions without a conversation don't use up a place.
+  for (const item of [...mentioned, ...recent].slice(0, RECENT_SESSIONS * 5)) {
+    if (items.length >= mentioned.length + RECENT_SESSIONS) break;
     const other = attempt(() => openSession(item.path, homes));
-    return other
-      ? [
-          {
-            kind: "session",
-            title: other.title,
-            tool: other.tool,
-            messages: other.messages,
-            selected: mentioned.includes(item),
-          },
-        ]
-      : [];
-  });
+    if (other)
+      items.push({
+        kind: "session",
+        title: other.title,
+        tool: other.tool,
+        messages: other.messages,
+        selected: mentioned.includes(item),
+      });
+  }
+  return items;
 }
 
 /** Everything a sender may attach. Only related, non-personal items start selected. */
@@ -665,24 +704,26 @@ export function collectContext(session, space, homes) {
     ...planItems(session, space, homes),
     ...sessionItems(session, space, homes),
   ];
-  const seen = new Set();
+  // The same file can be in more than one folder. Keep one, selected if any was.
+  const unique = new Map();
+  for (const item of items) {
+    const key = JSON.stringify([item.kind, item.files ?? item.messages]);
+    const previous = unique.get(key);
+    if (previous) previous.selected ||= item.selected;
+    else unique.set(key, item);
+  }
   // Never start with a selection that is too large to share.
   let room = LIMITS.bytes - itemSize(session.messages) - 100_000;
   let count = 0;
-  return items
-    .filter((item) => {
-      const key = JSON.stringify([item.kind, item.files ?? item.messages]);
-      return !seen.has(key) && seen.add(key);
-    })
-    .map((item) => {
-      const size = itemSize(item);
-      const selected = item.selected && count < LIMITS.items && size <= room;
-      if (selected) {
-        count++;
-        room -= size;
-      }
-      return { ...item, size, selected };
-    });
+  return [...unique.values()].map((item) => {
+    const size = itemSize(item);
+    const selected = item.selected && count < LIMITS.items && size <= room;
+    if (selected) {
+      count++;
+      room -= size;
+    }
+    return { ...item, size, selected };
+  });
 }
 
 /** The session's own project. A deleted folder must not borrow the current one. */
@@ -691,7 +732,7 @@ export function sessionWorkspace(session, fallback) {
   if (attempt(() => statSync(session.cwd).isDirectory()))
     return workspace(session.cwd);
   const cwd = real(session.cwd);
-  return belongs(cwd, fallback) ? fallback : missing(cwd);
+  return belongs(cwd, fallback) ? { ...fallback, moved: true } : missing(cwd);
 }
 
 function missing(cwd) {
