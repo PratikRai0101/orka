@@ -58,17 +58,7 @@ impl NegativeAttribution {
     }
 
     fn fingerprint(path: &Path) -> Option<Value> {
-        let metadata = fs::symlink_metadata(path).ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        let modified = metadata
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
-        Some(json!([modified.to_string(), metadata.len()]))
+        serde_json::to_value(crate::scan_cache::FileStamp::of(path)?).ok()
     }
 
     pub(crate) fn contains(&self, db: &rusqlite::Connection) -> Result<bool> {
@@ -301,8 +291,13 @@ fn candidate_uuids(name: &str) -> Vec<&str> {
 pub(crate) struct CodexSegmentIndex {
     home: PathBuf,
     by_id: HashMap<String, Vec<PathBuf>>,
-    parsed: RefCell<HashMap<String, Vec<Segment>>>,
+    parsed: RefCell<HashMap<String, IndexedSegments>>,
     error: Option<String>,
+}
+
+struct IndexedSegments {
+    candidates: Vec<Segment>,
+    stamps: Vec<crate::scan_cache::FileStamp>,
 }
 
 impl CodexSegmentIndex {
@@ -356,25 +351,52 @@ impl CodexSegmentIndex {
     }
 
     fn segments(&self, id: &str) -> Result<Vec<Segment>> {
+        use crate::scan_cache::FileStamp;
+
         Uuid::parse_str(id).map_err(|_| "Invalid history identity")?;
+        if id.len() != 36 {
+            return segments(&self.home, id);
+        }
         if let Some(err) = &self.error {
             return Err(err.clone());
         }
-        if let Some(cached) = self.parsed.borrow().get(id) {
-            return Ok(cached.clone());
-        }
-        let mut candidates = Vec::new();
-        if let Some(paths) = self.by_id.get(id) {
-            for path in paths {
-                if let Some(segment) = parse_segment(path, id)? {
-                    candidates.push(segment);
+        let Some(paths) = self.by_id.get(id) else {
+            return Ok(Vec::new());
+        };
+        let stamps = paths
+            .iter()
+            .map(|path| FileStamp::of(path))
+            .collect::<Option<Vec<_>>>();
+        if let Some(stamps) = &stamps {
+            if let Some(cached) = self.parsed.borrow().get(id) {
+                if cached.stamps == *stamps {
+                    return Ok(cached.candidates.clone());
                 }
             }
         }
+        let mut candidates = Vec::new();
+        for path in paths {
+            if let Some(segment) = parse_segment(path, id)? {
+                candidates.push(segment);
+            }
+        }
         candidates.sort_by_key(|segment| segment.ordinal);
-        self.parsed
-            .borrow_mut()
-            .insert(id.to_owned(), candidates.clone());
+        if let Some(stamps) = stamps {
+            if !paths
+                .iter()
+                .zip(&stamps)
+                .all(|(path, stamp)| FileStamp::of(path).as_ref() == Some(stamp))
+            {
+                return Err("Codex history changed during scan; retry sync".into());
+            }
+            self.parsed.borrow_mut().insert(
+                id.to_owned(),
+                IndexedSegments {
+                    candidates: candidates.clone(),
+                    stamps,
+                },
+            );
+        }
         Ok(candidates)
     }
 
@@ -967,13 +989,20 @@ pub(crate) fn session_snapshot(
             leaf_records,
             |id, end, offset| {
                 let (bytes, parent_path, stamp_before) = match codex_index {
-                    Some(index) => {
+                    Some(index) if id.len() == 36 => {
                         let cands = index.candidate_paths(id)?;
+                        for candidate in &cands {
+                            if let Some(stamp) = crate::scan_cache::FileStamp::of(candidate) {
+                                ancestor_deps.push((candidate.clone(), stamp));
+                            } else {
+                                missing_stamp = true;
+                            }
+                        }
                         let loaded = index.parent_prefix(id, end, offset)?;
                         ancestor_candidates.push((id.to_owned(), cands));
                         loaded
                     }
-                    None => {
+                    _ => {
                         let home = native::codex_home()?;
                         let loaded = parent_prefix_in(segments(&home, id)?, end, offset)?;
                         missing_stamp = true;

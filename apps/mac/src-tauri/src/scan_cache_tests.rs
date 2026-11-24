@@ -679,3 +679,209 @@ fn paginated_cache_detects_new_ambiguous_ancestor_segment_and_remove_local_prune
         .unwrap();
     assert_eq!(after_cache, 0);
 }
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+#[test]
+fn excludes_instructions_outside_connected_folder() {
+    let f = Fixture::new();
+    run_git(&f.root, &["init", "--quiet"]);
+    let relative = Path::new("docs/AGENTS.md");
+    let docs = f.root.join("docs");
+    fs::create_dir(&docs).unwrap();
+    fs::write(f.root.join(relative), "# In scope\n").unwrap();
+    run_git(&f.root, &["add", "docs/AGENTS.md"]);
+    assert!(indexer::instruction_files(&f.root)
+        .unwrap()
+        .contains(relative));
+
+    let outside = f._home.path().join("another-project");
+    fs::create_dir(&outside).unwrap();
+    let outside_bytes = b"# Separate fixture\n";
+    fs::write(outside.join("AGENTS.md"), outside_bytes).unwrap();
+    fs::remove_dir_all(&docs).unwrap();
+    std::os::unix::fs::symlink(&outside, &docs).unwrap();
+
+    indexer::scan(&f.db, &f.project).unwrap();
+    let outside_hash = db::digest(outside_bytes);
+    assert!(
+        !f.outbox()
+            .iter()
+            .any(|q| q["resource"]["files"][0]["hash"] == outside_hash),
+        "scan queued a memory backed by bytes outside the connected folder"
+    );
+}
+
+#[test]
+fn discovers_nested_repos_below_an_ignored_directory() {
+    let f = Fixture::new();
+    run_git(&f.root, &["init", "--quiet"]);
+    fs::write(f.root.join(".gitignore"), "build/\n").unwrap();
+    let nested = f.root.join("build/nested");
+    fs::create_dir_all(&nested).unwrap();
+    run_git(&nested, &["init", "--quiet"]);
+    fs::write(nested.join("AGENTS.md"), "# Nested project\n").unwrap();
+    assert!(
+        indexer::instruction_files(&f.root)
+            .unwrap()
+            .contains(Path::new("build/nested/AGENTS.md")),
+        "nested repository has its own Git ignore scope"
+    );
+}
+
+#[test]
+fn falls_back_to_inline_plan_when_reference_turns_invalid() {
+    let f = Fixture::new();
+    let plans_dir = crate::plans::native_directory("claude").unwrap();
+    fs::create_dir_all(&plans_dir).unwrap();
+    let path = plans_dir.join("valid-file.md");
+    fs::write(&path, "# Valid File Plan\n\nBody.\n").unwrap();
+    let sid = uuid::Uuid::new_v4().to_string();
+    write_session(
+        &f,
+        "claude",
+        &sid,
+        &[json!({
+            "type":"assistant", "slug":"valid-file", "message":{"content":[{
+                "type":"tool_use", "name":"ExitPlanMode",
+                "input":{"plan":"# Inline fallback\n\nStill valid.", "planFilePath":path}
+            }]}
+        })],
+    );
+    let inline_exists = || {
+        f.resources().iter().any(|r| {
+            r["kind"] == "plan"
+                && r["logicalPath"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with("claude/sessions/"))
+        })
+    };
+    indexer::scan(&f.db, &f.project).unwrap();
+    assert!(
+        !inline_exists(),
+        "valid external plan should take precedence"
+    );
+    fs::write(&path, [0xff, 0xfe]).unwrap();
+    indexer::scan(&f.db, &f.project).unwrap();
+    assert!(
+        inline_exists(),
+        "referenced file is invalid and the inline plan is still valid"
+    );
+}
+
+#[test]
+fn detects_edits_to_existing_alternate_ancestor() {
+    let f = Fixture::new();
+    let project_id = f.project["id"].as_str().unwrap();
+    let (_, paths) = segmented_chain(&f);
+    let original = fs::read_to_string(&paths[0]).unwrap();
+    let records = native::complete_records(original.as_bytes()).unwrap();
+    let id = records[0]["payload"]["id"].as_str().unwrap();
+    let msg = records
+        .iter()
+        .find_map(|r| r["payload"]["content"][0]["text"].as_str())
+        .unwrap();
+    let mut replacement = msg.to_owned();
+    replacement.replace_range(..1, if msg.starts_with('Z') { "Y" } else { "Z" });
+    let mutated = original.replacen(msg, &replacement, 1);
+    assert_eq!(mutated.len(), original.len());
+    let directory = native::codex_home().unwrap().join("archived_sessions");
+    fs::create_dir_all(&directory).unwrap();
+    let sibling = directory.join(format!("rollout-2026-11-24T00-00-01-{id}_000.jsonl"));
+    fs::write(&sibling, &original).unwrap();
+
+    let errors = || {
+        db::rows(
+            &f.db,
+            "SELECT json_object('source',source,'error',error) FROM errors WHERE source LIKE ?",
+            &[&format!("{project_id}:%")],
+        )
+        .unwrap()
+    };
+    indexer::scan(&f.db, &f.project).unwrap();
+    assert!(
+        errors().is_empty(),
+        "identical ancestor candidates are safe: {:?}",
+        errors()
+    );
+
+    fs::write(&sibling, mutated).unwrap();
+    indexer::scan(&f.db, &f.project).unwrap();
+    assert!(
+        errors()
+            .iter()
+            .any(|e| e["error"] == "Ambiguous inherited history; original sources preserved"),
+        "conflicting ancestor candidate must be visible: {:?}",
+        errors()
+    );
+}
+
+#[test]
+fn local_scan_repairs_same_length_blob_corruption() {
+    let f = Fixture::new();
+    let bytes = b"# Local instructions\n";
+    fs::write(f.root.join("AGENTS.md"), bytes).unwrap();
+    indexer::scan(&f.db, &f.project).unwrap();
+    let hash = db::digest(bytes);
+    let path = db::blob_path(&hash).unwrap();
+    assert_eq!(db::blob_read(&hash).unwrap(), bytes);
+    indexer::scan(&f.db, &f.project).unwrap();
+    fs::write(path, vec![b'X'; bytes.len()]).unwrap();
+    indexer::scan(&f.db, &f.project).unwrap();
+    assert_eq!(
+        db::blob_read(&hash).as_deref(),
+        Ok(bytes.as_slice()),
+        "scan should repair cache from intact local source"
+    );
+}
+
+#[test]
+fn paginated_scan_resolves_compact_codex_ancestor_ids() {
+    let f = Fixture::new();
+    let (_, paths) = segmented_chain(&f);
+    let mut previous_size = 0;
+    for path in paths {
+        let mut records = native::complete_records(&fs::read(&path).unwrap()).unwrap();
+        let payload = &mut records[0]["payload"];
+        let id = payload["id"].as_str().unwrap().to_owned();
+        let compact = uuid::Uuid::parse_str(&id).unwrap().simple().to_string();
+        payload["id"] = json!(compact);
+        payload["session_id"] = json!(compact);
+        if payload["history_base"].is_object() {
+            payload["history_base"]["thread_id"] = json!(compact);
+            payload["history_base"]["end_byte_offset"] = json!(previous_size);
+        }
+        let bytes = native::encode(&records);
+        previous_size = bytes.len();
+        let next = path.with_file_name(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace(&id, &compact),
+        );
+        fs::remove_file(path).unwrap();
+        fs::write(next, bytes).unwrap();
+    }
+
+    indexer::scan(&f.db, &f.project).unwrap();
+    assert_eq!(
+        f.outbox()
+            .iter()
+            .filter(|entry| entry["resource"]["kind"] == "session")
+            .count(),
+        1
+    );
+    let errors = db::rows(&f.db, "SELECT json_quote(error) FROM errors", &[]).unwrap();
+    assert!(
+        errors.is_empty(),
+        "compact ancestor identities should resolve: {errors:?}"
+    );
+}

@@ -12,7 +12,7 @@ use std::{
 };
 use walkdir::WalkDir;
 
-const CACHE_VERSION: &str = concat!("v2-", env!("CARGO_PKG_VERSION"));
+const CACHE_VERSION: &str = concat!("v3-", env!("CARGO_PKG_VERSION"));
 
 #[cfg(test)]
 thread_local! {
@@ -95,6 +95,21 @@ impl FileStamp {
             })
         }
     }
+}
+
+pub(crate) fn verified_stamp(path: &Path, hash: &str, expected_size: u64) -> Option<FileStamp> {
+    let before = FileStamp::of(path)?;
+    if before.length != expected_size {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() as u64 == expected_size
+        && db::digest(&bytes) == hash
+        && FileStamp::of(path).as_ref() == Some(&before)
+    {
+        return Some(before);
+    }
+    None
 }
 
 fn cache_key(namespace: &str, scope: &Value) -> String {
