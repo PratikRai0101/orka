@@ -1,0 +1,25 @@
+{
+  "name": "orka-handoff",
+  "version": "0.1.0",
+  "description": "Share a coding session and its context as one link.",
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "bin": {
+    "orka-handoff": "bin/orka-handoff.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/whysosaket/orka.git",
+    "directory": "packages/handoff"
+  }
+}

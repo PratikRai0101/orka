@@ -15,6 +15,7 @@
   "include": [
     "apps/mac/src/**/*.ts",
     "apps/mac/src/**/*.tsx",
+    "packages/**/*.d.ts",
     "tests/**/*.ts",
     "scripts/**/*.ts",
     "playwright*.config.ts"
