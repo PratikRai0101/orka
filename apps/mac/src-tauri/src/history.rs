@@ -4,7 +4,8 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    cell::RefCell,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
@@ -247,11 +248,144 @@ pub fn find_rollout(home: &Path, id: &str) -> Result<PathBuf> {
     )
 }
 
+#[derive(Clone)]
 struct Segment {
     ordinal: u64,
     path: PathBuf,
     multi_agent_v2: bool,
     cwd: Option<PathBuf>,
+}
+
+fn parse_segment(path: &Path, id: &str) -> Result<Option<Segment>> {
+    let first = first_line(path)?;
+    let record: Value =
+        serde_json::from_str(&first).map_err(|_| "Invalid native segment metadata")?;
+    if record["type"] == "session_meta" && record["payload"]["id"] == id {
+        Ok(Some(Segment {
+            ordinal: record["ordinal"].as_u64().unwrap_or(0),
+            path: path.to_path_buf(),
+            multi_agent_v2: record["payload"]["multi_agent_version"] == "v2",
+            cwd: record["payload"]["cwd"].as_str().map(PathBuf::from),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn candidate_uuids(name: &str) -> Vec<&str> {
+    let name = name.strip_suffix(".zst").unwrap_or(name);
+    let Some(stem) = name.strip_suffix(".jsonl") else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    if stem.len() >= 36 {
+        let tail = &stem[stem.len() - 36..];
+        if Uuid::parse_str(tail).is_ok() {
+            ids.push(tail);
+        }
+    }
+    for (idx, _) in stem.match_indices('_') {
+        if idx >= 37 && stem.as_bytes()[idx - 37] == b'-' {
+            let cand = &stem[idx - 36..idx];
+            if Uuid::parse_str(cand).is_ok() && !ids.contains(&cand) {
+                ids.push(cand);
+            }
+        }
+    }
+    ids
+}
+
+/// Indexes Codex rollout filenames once per scan so resolving current segments
+/// and paginated ancestors does not re-walk `sessions/` and `archived_sessions/`
+/// for every transcript.
+pub(crate) struct CodexSegmentIndex {
+    home: PathBuf,
+    by_id: HashMap<String, Vec<PathBuf>>,
+    parsed: RefCell<HashMap<String, Vec<Segment>>>,
+    error: Option<String>,
+}
+
+impl CodexSegmentIndex {
+    pub(crate) fn new(home: &Path) -> Self {
+        let mut by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut error = None;
+        for directory in [home.join("sessions"), home.join("archived_sessions")] {
+            if !directory.exists() {
+                continue;
+            }
+            match fs::symlink_metadata(&directory) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    error = Some("Native history directory is a symlink".into());
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error = Some(err.to_string());
+                    break;
+                }
+            }
+            for entry in WalkDir::new(directory).follow_links(false) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        error = Some(err.to_string());
+                        break;
+                    }
+                };
+                if !entry.file_type().is_file() || !is_session(entry.path()) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy();
+                for id in candidate_uuids(&name) {
+                    by_id
+                        .entry(id.to_owned())
+                        .or_default()
+                        .push(entry.path().to_path_buf());
+                }
+            }
+            if error.is_some() {
+                break;
+            }
+        }
+        Self {
+            home: home.to_path_buf(),
+            by_id,
+            parsed: RefCell::new(HashMap::new()),
+            error,
+        }
+    }
+
+    fn segments(&self, id: &str) -> Result<Vec<Segment>> {
+        Uuid::parse_str(id).map_err(|_| "Invalid history identity")?;
+        if let Some(err) = &self.error {
+            return Err(err.clone());
+        }
+        if let Some(cached) = self.parsed.borrow().get(id) {
+            return Ok(cached.clone());
+        }
+        let mut candidates = Vec::new();
+        if let Some(paths) = self.by_id.get(id) {
+            for path in paths {
+                if let Some(segment) = parse_segment(path, id)? {
+                    candidates.push(segment);
+                }
+            }
+        }
+        candidates.sort_by_key(|segment| segment.ordinal);
+        self.parsed
+            .borrow_mut()
+            .insert(id.to_owned(), candidates.clone());
+        Ok(candidates)
+    }
+
+    pub(crate) fn current_path(&self, path: &Path, id: &str) -> Result<PathBuf> {
+        let candidates = self.segments(id)?;
+        resolve_current_path(&self.home, path, id, &candidates)
+    }
+
+    fn parent_prefix(&self, id: &str, end: u64, offset: u64) -> Result<(Vec<u8>, PathBuf)> {
+        parent_prefix_in(self.segments(id)?, end, offset)
+    }
 }
 
 fn segments(home: &Path, id: &str) -> Result<Vec<Segment>> {
@@ -278,16 +412,8 @@ fn segments(home: &Path, id: &str) -> Result<Vec<Segment>> {
             {
                 continue;
             }
-            let first = first_line(entry.path())?;
-            let record: Value =
-                serde_json::from_str(&first).map_err(|_| "Invalid native segment metadata")?;
-            if record["type"] == "session_meta" && record["payload"]["id"] == id {
-                candidates.push(Segment {
-                    ordinal: record["ordinal"].as_u64().unwrap_or(0),
-                    path: entry.into_path(),
-                    multi_agent_v2: record["payload"]["multi_agent_version"] == "v2",
-                    cwd: record["payload"]["cwd"].as_str().map(PathBuf::from),
-                });
+            if let Some(segment) = parse_segment(entry.path(), id)? {
+                candidates.push(segment);
             }
         }
     }
@@ -401,9 +527,12 @@ fn indexed_v2_segment<'a>(home: &Path, id: &str, candidates: &'a [Segment]) -> O
     Some(selected)
 }
 
-pub fn current_path(path: &Path, id: &str) -> Result<PathBuf> {
-    let home = native::codex_home()?;
-    let candidates = segments(&home, id)?;
+fn resolve_current_path(
+    home: &Path,
+    path: &Path,
+    id: &str,
+    candidates: &[Segment],
+) -> Result<PathBuf> {
     if candidates.len() > 1 && candidates.iter().any(|segment| segment.multi_agent_v2) {
         let reset = candidates
             .iter()
@@ -413,7 +542,7 @@ pub fn current_path(path: &Path, id: &str) -> Result<PathBuf> {
             .any(|pair| pair[0].ordinal == pair[1].ordinal);
         if duplicate_ordinal || (reset && candidates.iter().any(|segment| !segment.multi_agent_v2))
         {
-            if let Some(selected) = indexed_v2_segment(&home, id, &candidates) {
+            if let Some(selected) = indexed_v2_segment(home, id, candidates) {
                 return Ok(selected.path.clone());
             }
             return Err("Ambiguous native history segments; source preserved".into());
@@ -430,9 +559,15 @@ pub fn current_path(path: &Path, id: &str) -> Result<PathBuf> {
         .unwrap_or_else(|| path.into()))
 }
 
-fn parent_prefix(home: &Path, id: &str, end: u64, offset: u64) -> Result<Vec<u8>> {
-    let mut found = None;
-    for segment in segments(home, id)?.into_iter().rev() {
+pub fn current_path(path: &Path, id: &str) -> Result<PathBuf> {
+    let home = native::codex_home()?;
+    let candidates = segments(&home, id)?;
+    resolve_current_path(&home, path, id, &candidates)
+}
+
+fn parent_prefix_in(candidates: Vec<Segment>, end: u64, offset: u64) -> Result<(Vec<u8>, PathBuf)> {
+    let mut found: Option<(Vec<u8>, PathBuf)> = None;
+    for segment in candidates.into_iter().rev() {
         if segment.ordinal >= end {
             continue;
         }
@@ -448,18 +583,36 @@ fn parent_prefix(home: &Path, id: &str, end: u64, offset: u64) -> Result<Vec<u8>
                 .and_then(|n| n.checked_add(1))
                 == Some(end)
         {
-            if found.as_ref().is_some_and(|previous| previous != &bytes) {
+            if found
+                .as_ref()
+                .is_some_and(|(previous, _)| previous != &bytes)
+            {
                 return Err("Ambiguous inherited history; original sources preserved".into());
             }
-            found = Some(bytes);
+            found = Some((bytes, segment.path));
         }
     }
     found.ok_or("Inherited Codex history is missing or has an invalid boundary. Sync this session again from the original device.".into())
 }
 
+fn parent_prefix(home: &Path, id: &str, end: u64, offset: u64) -> Result<Vec<u8>> {
+    parent_prefix_in(segments(home, id)?, end, offset).map(|(bytes, _)| bytes)
+}
+
 impl History {
     fn load(
-        mut bytes: Vec<u8>,
+        bytes: Vec<u8>,
+        parent: impl FnMut(&str, u64, u64) -> Result<Vec<u8>>,
+        scope: Option<&Path>,
+    ) -> Result<Self> {
+        let len = bytes.len();
+        let records = native::complete_records(&bytes)?;
+        Self::load_from_records(len, records, parent, scope)
+    }
+
+    fn load_from_records(
+        mut bytes_len: usize,
+        mut records: Vec<Value>,
         mut parent: impl FnMut(&str, u64, u64) -> Result<Vec<u8>>,
         scope: Option<&Path>,
     ) -> Result<Self> {
@@ -467,12 +620,12 @@ impl History {
         let mut seen = BTreeSet::new();
         let mut expected: Option<(String, u64)> = None;
         let mut total = 0;
+        let mut trailing_newline = true;
         loop {
-            total += bytes.len();
-            if bytes.len() as u64 > MAX_FILE || total > MAX_TOTAL || rollouts.len() >= 200 {
+            total += bytes_len;
+            if bytes_len as u64 > MAX_FILE || total > MAX_TOTAL || rollouts.len() >= 200 {
                 return Err("Complete session history exceeds the sync limit".into());
             }
-            let records = native::complete_records(&bytes)?;
             if records.iter().any(|r| {
                 !r["payload"].is_object()
                     || (r["payload"]["type"] == "thread_settings_applied"
@@ -514,7 +667,7 @@ impl History {
             if let Some((expected_id, end)) = expected.take() {
                 if id != expected_id
                     || !paginated
-                    || bytes.last() != Some(&b'\n')
+                    || !trailing_newline
                     || records
                         .last()
                         .and_then(|r| r["ordinal"].as_u64())
@@ -543,10 +696,13 @@ impl History {
                 .as_u64()
                 .filter(|n| *n > 0 && *n <= MAX_FILE)
                 .ok_or("Invalid history byte boundary")?;
-            bytes = parent(parent_id, end, offset)?;
-            if bytes.len() as u64 != offset || bytes.last() != Some(&b'\n') {
+            let next_bytes = parent(parent_id, end, offset)?;
+            if next_bytes.len() as u64 != offset || next_bytes.last() != Some(&b'\n') {
                 return Err("History byte boundary must end at a complete record".into());
             }
+            bytes_len = next_bytes.len();
+            trailing_newline = next_bytes.last() == Some(&b'\n');
+            records = native::complete_records(&next_bytes)?;
             expected = Some((parent_id.to_owned(), end));
         }
         rollouts.reverse();
@@ -755,6 +911,98 @@ impl History {
         }
         Ok(rollout)
     }
+}
+
+pub(crate) struct SessionSnapshot {
+    pub(crate) files: Vec<Value>,
+    pub(crate) redacted_records: Vec<Value>,
+    pub(crate) deps: Vec<(PathBuf, crate::scan_cache::FileStamp)>,
+}
+
+/// Builds a redacted session manifest from already-parsed leaf records without
+/// re-reading or re-parsing the transcript, returning the redacted records and
+/// file stamps of every input segment for scan caching.
+pub(crate) fn session_snapshot(
+    tool: &str,
+    path: &Path,
+    leaf_bytes_len: usize,
+    mut leaf_records: Vec<Value>,
+    leaf_stamp: Option<crate::scan_cache::FileStamp>,
+    scope: Option<&Path>,
+    codex_index: Option<&CodexSegmentIndex>,
+) -> Result<SessionSnapshot> {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut deps = Vec::new();
+    if let Some(stamp) = leaf_stamp {
+        deps.push((abs, stamp));
+    }
+    if tool == "codex" {
+        let mut ancestor_deps = Vec::new();
+        let mut missing_stamp = false;
+        let mut history = History::load_from_records(
+            leaf_bytes_len,
+            leaf_records,
+            |id, end, offset| {
+                let (bytes, parent_path) = match codex_index {
+                    Some(index) => index.parent_prefix(id, end, offset)?,
+                    None => {
+                        let home = native::codex_home()?;
+                        parent_prefix_in(segments(&home, id)?, end, offset)?
+                    }
+                };
+                if let Some(stamp) = crate::scan_cache::FileStamp::of(&parent_path) {
+                    let abs_parent =
+                        std::path::absolute(&parent_path).unwrap_or_else(|_| parent_path.clone());
+                    ancestor_deps.push((abs_parent, stamp));
+                } else {
+                    missing_stamp = true;
+                }
+                Ok(bytes)
+            },
+            scope,
+        )?;
+        for rollout in &mut history.rollouts {
+            rollout
+                .records
+                .iter_mut()
+                .for_each(crate::session_redaction::SessionRedactor::redact);
+        }
+        history.rebase_offsets();
+        let files = history.files()?;
+        let redacted_records = history.records();
+        if missing_stamp {
+            deps.clear();
+        } else {
+            deps.extend(ancestor_deps);
+        }
+        return Ok(SessionSnapshot {
+            files,
+            redacted_records,
+            deps,
+        });
+    }
+    if tool == "pi" {
+        let (_, cwd, _) = native::session_info(tool, &leaf_records)?;
+        if let Some(root) = scope {
+            let cwd = cwd.canonicalize().unwrap_or(cwd);
+            let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            if !cwd.starts_with(root) {
+                return Err("Pi session belongs to a different repository".into());
+            }
+        }
+    }
+    leaf_records
+        .iter_mut()
+        .for_each(crate::session_redaction::SessionRedactor::redact);
+    let bytes = native::encode(&leaf_records);
+    let files = vec![
+        json!({"path":"session.jsonl","hash":db::blob(&bytes)?,"size":bytes.len(),"executable":false}),
+    ];
+    Ok(SessionSnapshot {
+        files,
+        redacted_records: leaf_records,
+        deps,
+    })
 }
 
 pub fn session_files(tool: &str, path: &Path, scope: Option<&Path>) -> Result<Vec<Value>> {

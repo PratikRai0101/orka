@@ -353,6 +353,34 @@ fn blob_dir(root: &Path, origin: &str) -> PathBuf {
     }
 }
 
+pub(crate) struct BlobStore {
+    dir: PathBuf,
+}
+
+impl BlobStore {
+    pub(crate) fn current() -> Result<Self> {
+        let config = global_setting("config")?;
+        let dir = blob_dir(&root()?, config["apiUrl"].as_str().unwrap_or(""));
+        Ok(Self { dir })
+    }
+
+    pub(crate) fn present(&self, hash: &str, expected_size: u64) -> bool {
+        checked_blob_path(&self.dir, hash)
+            .ok()
+            .and_then(|path| fs::symlink_metadata(path).ok())
+            .is_some_and(|meta| meta.is_file() && meta.len() == expected_size)
+    }
+
+    pub(crate) fn all_present(&self, files: &[Value]) -> bool {
+        files.iter().all(|file| {
+            file["hash"]
+                .as_str()
+                .zip(file["size"].as_u64())
+                .is_some_and(|(hash, size)| self.present(hash, size))
+        })
+    }
+}
+
 pub fn blob_path(hash: &str) -> Result<PathBuf> {
     let config = global_setting("config")?;
     let dir = blob_dir(&root()?, config["apiUrl"].as_str().unwrap_or(""));

@@ -1,12 +1,12 @@
 use crate::{
     db::{self, Result},
-    history, memory_context, native, packages, plans,
+    history, memory_context, native, packages, plans, scan_cache,
     sync_queue::{Priority, SyncQueue},
 };
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -437,20 +437,59 @@ pub(crate) fn has_git_repository(path: &Path) -> bool {
         .any(|directory| fs::symlink_metadata(directory.join(".git")).is_ok())
 }
 
-fn unversioned_instruction_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
+fn is_instruction_name(name: Option<&str>) -> bool {
+    matches!(name, Some("AGENTS.md" | "AGENTS.override.md" | "CLAUDE.md"))
+}
+
+fn git_command(directory: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command.arg("-C").arg(directory);
+    command
+}
+
+fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        Ok(PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn unversioned_instruction_files(root: &Path) -> Result<(BTreeSet<PathBuf>, Vec<PathBuf>)> {
     let filter_root = root.to_path_buf();
+    let nested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let filter_nested = std::sync::Arc::clone(&nested);
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
         .require_git(false)
         .current_dir(root)
         .filter_entry(move |entry| {
-            entry
-                .path()
-                .strip_prefix(&filter_root)
-                .is_ok_and(memory_context::discoverable)
-                && !(entry.file_type().is_some_and(|kind| kind.is_dir())
-                    && fs::symlink_metadata(entry.path().join(".git")).is_ok())
+            let Ok(relative) = entry.path().strip_prefix(&filter_root) else {
+                return false;
+            };
+            if !memory_context::discoverable(relative) {
+                return false;
+            }
+            if !relative.as_os_str().is_empty()
+                && entry.file_type().is_some_and(|kind| kind.is_dir())
+                && fs::symlink_metadata(entry.path().join(".git")).is_ok()
+            {
+                filter_nested.lock().unwrap().push(relative.to_path_buf());
+                return false;
+            }
+            true
         })
         .build();
     let mut files = BTreeSet::new();
@@ -460,10 +499,7 @@ fn unversioned_instruction_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
             return Err(error.to_string());
         }
         if entry.file_type().is_some_and(|kind| kind.is_file())
-            && matches!(
-                entry.file_name().to_str(),
-                Some("AGENTS.md" | "AGENTS.override.md" | "CLAUDE.md")
-            )
+            && is_instruction_name(entry.file_name().to_str())
         {
             files.insert(
                 entry
@@ -474,7 +510,8 @@ fn unversioned_instruction_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
             );
         }
     }
-    Ok(files)
+    let nested = nested.lock().unwrap().clone();
+    Ok((files, nested))
 }
 
 fn git_instruction_allowed(path: &Path) -> Result<Option<bool>> {
@@ -485,15 +522,7 @@ fn git_instruction_allowed(path: &Path) -> Result<Option<bool>> {
     if !has_git_repository(parent) {
         return Ok(None);
     }
-    let mut command = std::process::Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
-            command.env_remove(key);
-        }
-    }
-    let output = command
-        .arg("-C")
-        .arg(parent)
+    let output = git_command(parent)
         .args(["check-ignore", "--quiet", "--"])
         .arg(path)
         .output()
@@ -508,38 +537,126 @@ fn git_instruction_allowed(path: &Path) -> Result<Option<bool>> {
     }
 }
 
-pub(crate) fn instruction_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
-    let unversioned = if has_git_repository(root) {
-        BTreeSet::new()
-    } else {
-        unversioned_instruction_files(root)?
-    };
+fn nested_git_ancestor(repo_dir: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut current = PathBuf::new();
+    let parent = relative.parent()?;
+    for component in parent.components() {
+        current.push(component);
+        if fs::symlink_metadata(repo_dir.join(&current).join(".git")).is_ok() {
+            return Some(current);
+        }
+    }
+    None
+}
+
+fn git_instruction_files(repo_dir: &Path) -> Result<BTreeSet<PathBuf>> {
+    let staged = git_command(repo_dir)
+        .args(["ls-files", "-z", "--stage"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !staged.status.success() {
+        return Err(format!(
+            "Cannot verify Git ignore rules for {}",
+            repo_dir.display()
+        ));
+    }
+    let others = git_command(repo_dir)
+        .args(["ls-files", "-z", "--others", "--exclude-standard"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !others.status.success() {
+        return Err(format!(
+            "Cannot verify Git ignore rules for {}",
+            repo_dir.display()
+        ));
+    }
     let mut files = BTreeSet::new();
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry
-                .path()
-                .strip_prefix(root)
-                .is_ok_and(memory_context::discoverable)
-        })
-    {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if !entry.file_type().is_file()
-            || !matches!(
-                entry.file_name().to_str(),
-                Some("AGENTS.md" | "AGENTS.override.md" | "CLAUDE.md")
-            )
-        {
+    let mut nested_repos = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
+
+    for record in staged.stdout.split(|b| *b == 0) {
+        if record.is_empty() {
             continue;
         }
-        let relative = entry.path().strip_prefix(root).map_err(|e| e.to_string())?;
-        if !git_instruction_allowed(entry.path())?.unwrap_or_else(|| unversioned.contains(relative))
-        {
+        let Some(tab) = record.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let meta = &record[..tab];
+        let path_bytes = &record[tab + 1..];
+        let rel = path_from_git_bytes(path_bytes)?;
+        if !memory_context::discoverable(&rel) {
             continue;
         }
-        files.insert(relative.to_path_buf());
+        if meta.starts_with(b"160000 ") {
+            let full = repo_dir.join(&rel);
+            if fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir())
+                && fs::symlink_metadata(full.join(".git")).is_ok()
+            {
+                nested_repos.insert(rel);
+            }
+            continue;
+        }
+        if is_instruction_name(rel.file_name().and_then(|n| n.to_str())) {
+            candidates.insert(rel);
+        }
+    }
+
+    for entry in others.stdout.split(|b| *b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(dir_bytes) = entry.strip_suffix(b"/") {
+            let rel = path_from_git_bytes(dir_bytes)?;
+            if !memory_context::discoverable(&rel) {
+                continue;
+            }
+            let full = repo_dir.join(&rel);
+            if fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir())
+                && fs::symlink_metadata(full.join(".git")).is_ok()
+            {
+                nested_repos.insert(rel);
+            }
+            continue;
+        }
+        let rel = path_from_git_bytes(entry)?;
+        if !memory_context::discoverable(&rel) {
+            continue;
+        }
+        if is_instruction_name(rel.file_name().and_then(|n| n.to_str())) {
+            candidates.insert(rel);
+        }
+    }
+
+    for rel in candidates {
+        if let Some(nested) = nested_git_ancestor(repo_dir, &rel) {
+            nested_repos.insert(nested);
+            continue;
+        }
+        let full = repo_dir.join(&rel);
+        if fs::symlink_metadata(&full).is_ok_and(|m| m.is_file()) {
+            files.insert(rel);
+        }
+    }
+
+    for nested in nested_repos {
+        let nested_dir = repo_dir.join(&nested);
+        for sub in git_instruction_files(&nested_dir)? {
+            files.insert(nested.join(sub));
+        }
+    }
+
+    Ok(files)
+}
+
+pub(crate) fn instruction_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    if has_git_repository(root) {
+        return git_instruction_files(root);
+    }
+    let (mut files, nested) = unversioned_instruction_files(root)?;
+    for rel in nested {
+        for sub in git_instruction_files(&root.join(&rel))? {
+            files.insert(rel.join(sub));
+        }
     }
     Ok(files)
 }
@@ -836,6 +953,7 @@ fn collect(
     }
     seen.insert(id.clone());
     let mut b = binding(db, &id)?;
+    let original_binding = b.clone();
     if project["catalogOnly"] == true {
         let mut resource = json!({"resourceId":id,"kind":kind,"source":source,"logicalPath":logical,"title":title,"files":files,"deleted":false});
         crate::sources::scope(project, &mut resource);
@@ -1067,7 +1185,10 @@ fn collect(
             db::upsert(db, "resources", &id, project_id, &local)?;
         }
     }
-    db::upsert(db, "bindings", &id, project_id, &b)
+    if b != original_binding {
+        db::upsert(db, "bindings", &id, project_id, &b)?;
+    }
+    Ok(())
 }
 fn scanned_sources(
     db: &rusqlite::Connection,
@@ -1113,13 +1234,14 @@ fn scanned_sources(
 }
 fn collect_plan_file(
     db: &rusqlite::Connection,
+    blobs: &db::BlobStore,
     project: &Value,
     source: &str,
     logical: &str,
     path: &Path,
     seen: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let (file, title) = plans::file(path)?;
+    let (file, title) = scan_cache::plan_file(db, blobs, path)?;
     collect(
         db,
         project,
@@ -1139,10 +1261,11 @@ fn collect_plan_file(
 
 fn collect_embedded_plan(
     db: &rusqlite::Connection,
+    blobs: &db::BlobStore,
     project: &Value,
     source: &str,
     logical: &str,
-    text: &str,
+    plan: &scan_cache::CachedEmbeddedPlan,
     seen: &mut BTreeSet<String>,
 ) -> Result<()> {
     let project_id = project["id"].as_str().ok_or("Missing project")?;
@@ -1156,8 +1279,8 @@ fn collect_embedded_plan(
                 kind: "plan",
                 source,
                 logical,
-                title: &plans::title(text, "Plan"),
-                files: vec![plans::content(text.as_bytes())?],
+                title: &plan.title,
+                files: vec![plan.file.clone()],
                 paths: vec![],
                 native_id: None,
                 native_parent: None,
@@ -1166,14 +1289,13 @@ fn collect_embedded_plan(
         );
     }
     let b = binding(db, &id)?;
-    let origin = db::digest(text.as_bytes());
     let root = Path::new(project["path"].as_str().ok_or("Connect a folder")?);
-    if b["planOriginHash"] == origin {
+    if b["planOriginHash"] == plan.origin_hash {
         if let Some(path) = b["paths"][0].as_str() {
             let path = Path::new(path);
             plans::check_path(root, path)?;
             if path.try_exists().map_err(|e| e.to_string())? {
-                return collect_plan_file(db, project, source, logical, path, seen);
+                return collect_plan_file(db, blobs, project, source, logical, path, seen);
             }
         }
         return Ok(());
@@ -1182,12 +1304,11 @@ fn collect_embedded_plan(
     if pending && project["captureOnly"] != true {
         return Ok(());
     }
-    let file = plans::content(text.as_bytes())?;
-    let hash = manifest_hash(&json!([&file]));
+    let hash = manifest_hash(&json!([&plan.file]));
     let path = plans::destination(root, &json!({"source":source,"logicalPath":logical}))?;
     plans::check_path(root, &path)?;
     if b["paths"].is_null() && !path.try_exists().map_err(|e| e.to_string())? {
-        packages::write_file(root, &path, &file)?;
+        packages::write_file(root, &path, &plan.file)?;
     }
     collect(
         db,
@@ -1196,8 +1317,8 @@ fn collect_embedded_plan(
             kind: "plan",
             source,
             logical,
-            title: &plans::title(text, "Plan"),
-            files: vec![file],
+            title: &plan.title,
+            files: vec![plan.file.clone()],
             paths: vec![path],
             native_id: None,
             native_parent: None,
@@ -1208,7 +1329,7 @@ fn collect_embedded_plan(
     // A draft made behind a blocked request leaves the original plan eligible
     // for a later active scan, even when its materialized file is stale.
     if !pending || project["captureOnly"] != true || b["lastSeenHash"] == hash {
-        b["planOriginHash"] = json!(origin);
+        b["planOriginHash"] = json!(plan.origin_hash);
         db::upsert(db, "bindings", &id, project_id, &b)?;
     }
     Ok(())
@@ -1379,6 +1500,117 @@ fn refresh_catalog(
     let mut unique = BTreeSet::new();
     errors.retain(|message| unique.insert(message.clone()));
     Ok(errors)
+}
+
+fn session_handoff_scope(
+    db: &rusqlite::Connection,
+    project_id: &str,
+    governed_sync: bool,
+) -> Result<(String, bool)> {
+    let handoff_prefix = format!("handoff:{project_id}:");
+    let rows = db::rows(
+        db,
+        "SELECT json_object('key',key,'value',json(value)) FROM meta WHERE key GLOB ?1 OR key LIKE 'sessionForkHandoff:%' OR key LIKE 'codexImport:%' ORDER BY key",
+        &[&format!("{handoff_prefix}*")],
+    )?;
+    let has_handoffs = rows.iter().any(|row| {
+        row["key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with(&handoff_prefix))
+    });
+    let scope = db::digest(
+        json!([governed_sync && has_handoffs, rows])
+            .to_string()
+            .as_bytes(),
+    );
+    Ok((scope, has_handoffs))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_session_plans(
+    db: &rusqlite::Connection,
+    blobs: &db::BlobStore,
+    project: &Value,
+    project_id: &str,
+    scan_id: &str,
+    tool: &str,
+    id: &str,
+    checkout: &crate::worktrees::SessionCheckout,
+    plans_dir: &Path,
+    plan_refs: &[PathBuf],
+    embedded_plans: &[scan_cache::CachedEmbeddedPlan],
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut has_plan_file = false;
+    for path in plan_refs {
+        if !path.try_exists().map_err(|e| e.to_string())? {
+            continue;
+        }
+        let logical = if let Ok(relative) = path.strip_prefix(plans_dir) {
+            checkout.plan_key(tool, relative)
+        } else {
+            format!(
+                "{tool}/native/{}",
+                path.strip_prefix(plans::native_directory(tool)?)
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+            )
+        };
+        if project["governed"] == true && project["catalogOnly"] != true {
+            let mut known = db::get(
+                db,
+                &format!(
+                    "{}:{logical}",
+                    crate::sources::meta_key(project, "planSources")?
+                ),
+            )?
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+            for source in native::session_sources(db, project_id, id)?
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                if !known.contains(&source) {
+                    known.push(source);
+                }
+            }
+            db::set(
+                db,
+                &format!(
+                    "{}:{logical}",
+                    crate::sources::meta_key(project, "planSources")?
+                ),
+                &json!(known),
+            )?;
+        }
+        match collect_plan_file(db, blobs, project, tool, &logical, path, seen) {
+            Ok(()) => has_plan_file = true,
+            Err(err) => error(db, &format!("{scan_id}:scan:{}", path.display()), &err)?,
+        }
+    }
+    for plan in embedded_plans {
+        if tool == "claude" && has_plan_file {
+            continue;
+        }
+        if let Err(err) = collect_embedded_plan(
+            db,
+            blobs,
+            project,
+            tool,
+            &format!("{tool}/sessions/{id}/{}", plan.name),
+            plan,
+            seen,
+        ) {
+            error(
+                db,
+                &format!("{scan_id}:scan:plan:{tool}/{id}/{}", plan.name),
+                &err,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn session_directories(
@@ -1564,6 +1796,7 @@ fn scan_source(
     }
     let claude = native::claude_home()?;
     let codex = native::codex_home()?;
+    let blobs = db::BlobStore::current()?;
     let mut memory_complete = true;
     if crate::projects::sharing_allowed(project, "memory") {
         let result = (|| {
@@ -1582,7 +1815,7 @@ fn scan_source(
                             source: "shared",
                             logical: &logical,
                             title: &rel,
-                            files: vec![packages::file(&path, "content.md")?],
+                            files: vec![scan_cache::package_file(db, &blobs, &path, "content.md")?],
                             paths: vec![path],
                             native_id: None,
                             native_parent: None,
@@ -1678,7 +1911,12 @@ fn scan_source(
                                         source: "claude",
                                         logical: &logical,
                                         title: &rel,
-                                        files: vec![packages::file(e.path(), "content.md")?],
+                                        files: vec![scan_cache::package_file(
+                                            db,
+                                            &blobs,
+                                            e.path(),
+                                            "content.md",
+                                        )?],
                                         paths: vec![e.path().into()],
                                         native_id: None,
                                         native_parent: None,
@@ -1734,23 +1972,24 @@ fn scan_source(
                         {
                             continue;
                         }
-                        let text = match fs::read_to_string(&path) {
-                            Ok(text) => text,
+                        let meta = match scan_cache::codex_summary_meta(db, &path) {
+                            Ok(meta) => meta,
                             Err(error) => {
                                 // Codex may rewrite or remove a summary during consolidation.
                                 crate::sync::record_result(
                                     db,
                                     &format!("{scan_id}:scan:{}", path.display()),
-                                    Err(error.to_string()),
+                                    Err(error),
                                 )?;
                                 continue;
                             }
                         };
-                        let cwd = text.lines().find_map(|line| line.strip_prefix("cwd: "));
-                        let belongs =
-                            cwd.is_some_and(|p| Path::new(p.trim_matches('"')).starts_with(&root));
+                        let belongs = meta
+                            .cwd
+                            .as_deref()
+                            .is_some_and(|p| Path::new(p).starts_with(&root));
                         let name = entry.file_name().to_string_lossy().into_owned();
-                        let thread = memory_context::summary_thread(&text);
+                        let thread = meta.thread;
                         if store == &legacy {
                             legacy_summaries.insert(name.clone(), (belongs, thread.clone()));
                         }
@@ -1761,11 +2000,7 @@ fn scan_source(
                             .as_ref()
                             .map(|id| format!("{id}.md"))
                             .unwrap_or_else(|| name.clone());
-                        let updated_at = text
-                            .lines()
-                            .find_map(|line| line.strip_prefix("updated_at: "))
-                            .unwrap_or("")
-                            .to_owned();
+                        let updated_at = meta.updated_at;
                         if summary_files
                             .get(&key)
                             .is_none_or(|old| updated_at > old.updated_at)
@@ -1887,7 +2122,7 @@ fn scan_source(
                             source: "codex",
                             logical: &format!("codex/summaries/{key}"),
                             title: &name,
-                            files: vec![packages::file(&path, "content.md")?],
+                            files: vec![scan_cache::package_file(db, &blobs, &path, "content.md")?],
                             paths: vec![path],
                             native_id: None,
                             native_parent: None,
@@ -1935,7 +2170,7 @@ fn scan_source(
                 if project["catalogOnly"] == true {
                     let copies = paths
                         .iter()
-                        .map(|p| packages::directory(p).map(|f| (p, json!(f))))
+                        .map(|p| scan_cache::skill_directory(db, &blobs, p).map(|f| (p, json!(f))))
                         .collect::<Result<Vec<_>>>()?;
                     if copies.windows(2).any(|pair| pair[0].1 != pair[1].1) {
                         return Err(
@@ -1989,7 +2224,7 @@ fn scan_source(
                 let base = b["base"].clone();
                 let copies = paths
                     .iter()
-                    .map(|p| packages::directory(p).map(|f| (p, json!(f))))
+                    .map(|p| scan_cache::skill_directory(db, &blobs, p).map(|f| (p, json!(f))))
                     .collect::<Result<Vec<_>>>()?;
                 if project["governed"] == true
                     && crate::skill_reconciliation::defer_scan(
@@ -2056,16 +2291,21 @@ fn scan_source(
                         guard.is_some_and(|h| manifest_hash(files) != h)
                     })
                     .collect::<Vec<_>>();
-                let selected = changed
+                let selected_index = changed
                     .first()
-                    .copied()
+                    .and_then(|(path, _)| copies.iter().position(|(p, _)| p == path))
                     .or_else(|| {
                         copies
                             .iter()
-                            .find(|(_, files)| b["lastSeenHash"] == manifest_hash(files))
+                            .position(|(_, files)| b["lastSeenHash"] == manifest_hash(files))
                     })
-                    .map(|(path, _)| (*path).clone())
-                    .unwrap_or_else(|| paths[0].clone());
+                    .unwrap_or(0);
+                let selected = copies[selected_index].0.clone();
+                let selected_files = copies[selected_index]
+                    .1
+                    .as_array()
+                    .ok_or("Missing skill files")?
+                    .clone();
                 collect(
                     db,
                     project,
@@ -2074,7 +2314,7 @@ fn scan_source(
                         source: "shared",
                         logical: &name,
                         title: &name,
-                        files: packages::directory(&selected)?,
+                        files: selected_files,
                         paths: vec![
                             selected.clone(),
                             if selected == root.join(".agents/skills").join(&name) {
@@ -2150,9 +2390,15 @@ fn scan_source(
                     .to_string_lossy();
                 let logical = format!("{source}/files/{relative}");
                 report_file(entry.path())?;
-                if let Err(err) =
-                    collect_plan_file(db, project, source, &logical, entry.path(), &mut seen)
-                {
+                if let Err(err) = collect_plan_file(
+                    db,
+                    &blobs,
+                    project,
+                    source,
+                    &logical,
+                    entry.path(),
+                    &mut seen,
+                ) {
                     error(
                         db,
                         &format!("{scan_id}:scan:{}", entry.path().display()),
@@ -2170,6 +2416,11 @@ fn scan_source(
         let session_scope =
             crate::worktrees::SessionScope::new(db, project, &root, &sources, &home)?;
         let topology = session_scope.cache_scope()?;
+        let governed_sync = project["governed"] == true && project["catalogOnly"] != true;
+        let (handoff_scope, has_handoffs) = session_handoff_scope(db, project_id, governed_sync)?;
+        let share_plans = crate::projects::sharing_allowed(project, "plan");
+        let codex_index = history::CodexSegmentIndex::new(&codex);
+        let mut plan_dirs: HashMap<(PathBuf, &'static str), PathBuf> = HashMap::new();
         let mut last_history_progress = None;
         let include_pi =
             project["catalogOnly"] == true && crate::projects::sharing_allowed(project, "session");
@@ -2208,8 +2459,134 @@ fn scan_source(
                     .map(|cache| cache.contains(db))
                     .transpose()?
                     .unwrap_or(false);
+                if cached_unrelated {
+                    if unattributed_paths.contains(&unattributed) {
+                        db.execute("DELETE FROM errors WHERE source=?", [&unattributed])
+                            .map_err(|e| e.to_string())?;
+                    }
+                    continue;
+                }
+                let leaf_stamp = scan_cache::FileStamp::of(e.path());
+                let session_cache_key = scan_cache::session_key(project, &root, tool, e.path());
+                if let Some(stamp) = &leaf_stamp {
+                    if let Some(cached) = scan_cache::load_session(db, &session_cache_key)? {
+                        if cached.topology == topology
+                            && cached.handoff_scope == handoff_scope
+                            && cached.stamps_match(e.path(), stamp)
+                        {
+                            if let Some(checkout) =
+                                session_scope.for_session(tool, &cached.id, &cached.cwd)?
+                            {
+                                let codex_status = if tool == "codex" {
+                                    Some(codex_index.current_path(e.path(), &cached.id))
+                                } else {
+                                    None
+                                };
+                                match codex_status {
+                                    Some(Ok(latest)) if latest != e.path() => {
+                                        if unattributed_paths.contains(&unattributed) {
+                                            db.execute(
+                                                "DELETE FROM errors WHERE source=?",
+                                                [&unattributed],
+                                            )
+                                            .map_err(|e| e.to_string())?;
+                                        }
+                                        continue;
+                                    }
+                                    Some(Err(_)) => {}
+                                    _ => {
+                                        let need_plans =
+                                            tool != "pi" && !checkout.historical && share_plans;
+                                        let current_plans_dir = if need_plans {
+                                            let key = (checkout.scope.clone(), tool);
+                                            if let Some(dir) = plan_dirs.get(&key) {
+                                                Some(dir.clone())
+                                            } else {
+                                                let dir = plans::project_directory(
+                                                    &checkout.scope,
+                                                    tool,
+                                                )?;
+                                                plan_dirs.insert(key, dir.clone());
+                                                Some(dir)
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        let plans_ready = !need_plans
+                                            || (cached.plans_checked
+                                                && cached.plans_dir == current_plans_dir);
+                                        if plans_ready && cached.blobs_present(&blobs, need_plans) {
+                                            if unattributed_paths.contains(&unattributed) {
+                                                db.execute(
+                                                    "DELETE FROM errors WHERE source=?",
+                                                    [&unattributed],
+                                                )
+                                                .map_err(|e| e.to_string())?;
+                                            }
+                                            report_file(e.path())?;
+                                            session_scope.pin(&checkout, tool, &cached.id)?;
+                                            if governed_sync && !has_handoffs {
+                                                native::bind_handoff(
+                                                    db,
+                                                    project_id,
+                                                    &cached.id,
+                                                    &[],
+                                                )?;
+                                            }
+                                            if let Some(plans_dir) = &current_plans_dir {
+                                                collect_session_plans(
+                                                    db,
+                                                    &blobs,
+                                                    project,
+                                                    project_id,
+                                                    &scan_id,
+                                                    tool,
+                                                    &cached.id,
+                                                    &checkout,
+                                                    plans_dir,
+                                                    &cached.plan_refs,
+                                                    &cached.embedded_plans,
+                                                    &mut seen,
+                                                )?;
+                                            }
+                                            let result = collect(
+                                                db,
+                                                project,
+                                                Scanned {
+                                                    kind: "session",
+                                                    source: tool,
+                                                    logical: &cached.logical,
+                                                    title: &cached.title,
+                                                    files: cached.files,
+                                                    paths: vec![e.path().into()],
+                                                    native_id: Some(&cached.id),
+                                                    native_parent: if project["catalogOnly"] == true
+                                                    {
+                                                        cached.native_parent.as_deref()
+                                                    } else {
+                                                        None
+                                                    },
+                                                },
+                                                &mut seen,
+                                            );
+                                            if result.is_err() {
+                                                sessions_complete = false;
+                                            }
+                                            crate::sync::record_result(
+                                                db,
+                                                &format!("{scan_id}:scan:{}", e.path().display()),
+                                                result,
+                                            )?;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Codex and Pi put the working directory in the first record.
-                let unrelated_prefix = if !cached_unrelated && matches!(tool, "codex" | "pi") {
+                let unrelated_prefix = if matches!(tool, "codex" | "pi") {
                     match history::session_route_prefix(e.path(), tool) {
                         Some((Some(id), cwd)) => {
                             session_scope.for_session(tool, &id, &cwd)?.is_none()
@@ -2220,11 +2597,9 @@ fn scan_source(
                 } else {
                     false
                 };
-                if cached_unrelated || unrelated_prefix {
-                    if !cached_unrelated {
-                        if let Some(cache) = &negative {
-                            cache.remember(db, e.path())?;
-                        }
+                if unrelated_prefix {
+                    if let Some(cache) = &negative {
+                        cache.remember(db, e.path())?;
                     }
                     if unattributed_paths.contains(&unattributed) {
                         db.execute("DELETE FROM errors WHERE source=?", [&unattributed])
@@ -2269,6 +2644,7 @@ fn scan_source(
                         continue;
                     }
                 };
+                let leaf_bytes_len = bytes.len();
                 let records = match native::complete_records(&bytes) {
                     Ok(r) => r,
                     Err(err) => {
@@ -2313,7 +2689,7 @@ fn scan_source(
                 };
                 report_file(e.path())?;
                 if tool == "codex" {
-                    match crate::history::current_path(e.path(), &id) {
+                    match codex_index.current_path(e.path(), &id) {
                         Ok(latest) if latest != e.path() => continue,
                         Err(err) => {
                             error(db, &format!("{scan_id}:scan:{}", e.path().display()), &err)?;
@@ -2344,111 +2720,6 @@ fn scan_source(
                     continue;
                 }
                 session_scope.pin(&checkout, tool, &id)?;
-                let checkout_scope = &checkout.scope;
-                let files = match crate::history::session_files(
-                    tool,
-                    e.path(),
-                    (!checkout.historical).then_some(checkout_scope.as_path()),
-                ) {
-                    Ok(files) => files,
-                    Err(err) => {
-                        error(db, &format!("{scan_id}:scan:{}", e.path().display()), &err)?;
-                        sessions_complete = false;
-                        continue;
-                    }
-                };
-                if project["governed"] == true && project["catalogOnly"] != true {
-                    let records =
-                        crate::history::resource_records(&json!({"source":tool,"files":files}))?;
-                    native::bind_handoff(db, project_id, &id, &records)?;
-                }
-                if tool != "pi"
-                    && !checkout.historical
-                    && crate::projects::sharing_allowed(project, "plan")
-                {
-                    let plan_records =
-                        crate::history::resource_records(&json!({"source":tool,"files":files}))?;
-                    let mut has_plan_file = false;
-                    match plans::references(tool, checkout_scope, &plan_records) {
-                        Ok(paths) => {
-                            for path in paths {
-                                if !path.try_exists().map_err(|e| e.to_string())? {
-                                    continue;
-                                }
-                                let local = plans::project_directory(checkout_scope, tool)?;
-                                let logical = if let Ok(relative) = path.strip_prefix(&local) {
-                                    checkout.plan_key(tool, relative)
-                                } else {
-                                    format!(
-                                        "{tool}/native/{}",
-                                        path.strip_prefix(plans::native_directory(tool)?)
-                                            .map_err(|e| e.to_string())?
-                                            .to_string_lossy()
-                                    )
-                                };
-                                if project["governed"] == true && project["catalogOnly"] != true {
-                                    let mut known = db::get(
-                                        db,
-                                        &format!(
-                                            "{}:{logical}",
-                                            crate::sources::meta_key(project, "planSources")?
-                                        ),
-                                    )?
-                                    .as_array()
-                                    .cloned()
-                                    .unwrap_or_default();
-                                    for source in native::session_sources(db, project_id, &id)?
-                                        .as_array()
-                                        .cloned()
-                                        .unwrap_or_default()
-                                    {
-                                        if !known.contains(&source) {
-                                            known.push(source);
-                                        }
-                                    }
-                                    db::set(
-                                        db,
-                                        &format!(
-                                            "{}:{logical}",
-                                            crate::sources::meta_key(project, "planSources")?
-                                        ),
-                                        &json!(known),
-                                    )?;
-                                }
-                                match collect_plan_file(
-                                    db, project, tool, &logical, &path, &mut seen,
-                                ) {
-                                    Ok(()) => has_plan_file = true,
-                                    Err(err) => error(
-                                        db,
-                                        &format!("{scan_id}:scan:{}", path.display()),
-                                        &err,
-                                    )?,
-                                }
-                            }
-                        }
-                        Err(err) => error(
-                            db,
-                            &format!("{scan_id}:scan:plans:{}", e.path().display()),
-                            &err,
-                        )?,
-                    }
-                    for (name, text) in plans::embedded(tool, &plan_records) {
-                        if tool == "claude" && has_plan_file {
-                            continue;
-                        }
-                        if let Err(err) = collect_embedded_plan(
-                            db,
-                            project,
-                            tool,
-                            &format!("{tool}/sessions/{id}/{name}"),
-                            &text,
-                            &mut seen,
-                        ) {
-                            error(db, &format!("{scan_id}:scan:plan:{tool}/{id}/{name}"), &err)?;
-                        }
-                    }
-                }
                 let handoff = crate::session_forks::handoff_origin(db, project, tool, &records)?;
                 let logical = if let Some(origin) = &handoff {
                     format!(
@@ -2461,6 +2732,98 @@ fn scan_source(
                 } else {
                     format!("{tool}/{id}")
                 };
+                let native_parent =
+                    crate::session_forks::native_parent(tool, &id, &records).map(str::to_owned);
+                let checkout_scope = &checkout.scope;
+                let snapshot = match crate::history::session_snapshot(
+                    tool,
+                    e.path(),
+                    leaf_bytes_len,
+                    records,
+                    leaf_stamp,
+                    (!checkout.historical).then_some(checkout_scope.as_path()),
+                    (tool == "codex").then_some(&codex_index),
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        error(db, &format!("{scan_id}:scan:{}", e.path().display()), &err)?;
+                        sessions_complete = false;
+                        continue;
+                    }
+                };
+                if governed_sync {
+                    native::bind_handoff(db, project_id, &id, &snapshot.redacted_records)?;
+                }
+                let mut can_cache = !snapshot.deps.is_empty();
+                let mut plans_checked = false;
+                let mut cached_plans_dir = None;
+                let mut cached_plan_refs = Vec::new();
+                let mut cached_embedded_plans = Vec::new();
+                if tool != "pi" && !checkout.historical && share_plans {
+                    let key = (checkout_scope.clone(), tool);
+                    let plans_dir = if let Some(dir) = plan_dirs.get(&key) {
+                        dir.clone()
+                    } else {
+                        let dir = plans::project_directory(checkout_scope, tool)?;
+                        plan_dirs.insert(key, dir.clone());
+                        dir
+                    };
+                    let mut plan_refs_ok = false;
+                    match plans::references(tool, checkout_scope, &snapshot.redacted_records) {
+                        Ok(paths) => {
+                            cached_plan_refs = paths;
+                            plan_refs_ok = true;
+                        }
+                        Err(err) => {
+                            can_cache = false;
+                            error(
+                                db,
+                                &format!("{scan_id}:scan:plans:{}", e.path().display()),
+                                &err,
+                            )?;
+                        }
+                    }
+                    let mut embedded_ok = true;
+                    for (name, text) in plans::embedded(tool, &snapshot.redacted_records) {
+                        match plans::content(text.as_bytes()) {
+                            Ok(file) => {
+                                cached_embedded_plans.push(scan_cache::CachedEmbeddedPlan {
+                                    name: name.to_owned(),
+                                    title: plans::title(&text, "Plan"),
+                                    file,
+                                    origin_hash: db::digest(text.as_bytes()),
+                                });
+                            }
+                            Err(err) => {
+                                embedded_ok = false;
+                                can_cache = false;
+                                error(
+                                    db,
+                                    &format!("{scan_id}:scan:plan:{tool}/{id}/{name}"),
+                                    &err,
+                                )?;
+                            }
+                        }
+                    }
+                    collect_session_plans(
+                        db,
+                        &blobs,
+                        project,
+                        project_id,
+                        &scan_id,
+                        tool,
+                        &id,
+                        &checkout,
+                        &plans_dir,
+                        &cached_plan_refs,
+                        &cached_embedded_plans,
+                        &mut seen,
+                    )?;
+                    if plan_refs_ok && embedded_ok {
+                        plans_checked = true;
+                        cached_plans_dir = Some(plans_dir);
+                    }
+                }
                 let result = collect(
                     db,
                     project,
@@ -2469,17 +2832,38 @@ fn scan_source(
                         source: tool,
                         logical: &logical,
                         title: &title,
-                        files,
+                        files: snapshot.files.clone(),
                         paths: vec![e.path().into()],
                         native_id: Some(&id),
                         native_parent: if project["catalogOnly"] == true {
-                            crate::session_forks::native_parent(tool, &id, &records)
+                            native_parent.as_deref()
                         } else {
                             None
                         },
                     },
                     &mut seen,
                 );
+                if result.is_ok() && can_cache {
+                    scan_cache::save_session(
+                        db,
+                        &session_cache_key,
+                        &scan_cache::CachedSession {
+                            topology: topology.clone(),
+                            handoff_scope: handoff_scope.clone(),
+                            deps: snapshot.deps,
+                            id,
+                            cwd,
+                            title,
+                            files: snapshot.files,
+                            logical,
+                            native_parent,
+                            plans_checked,
+                            plans_dir: cached_plans_dir,
+                            plan_refs: cached_plan_refs,
+                            embedded_plans: cached_embedded_plans,
+                        },
+                    )?;
+                }
                 if result.is_err() {
                     sessions_complete = false;
                 }
@@ -2550,6 +2934,7 @@ fn scan_source(
                         plans::check_path(&root, path)?;
                         collect_plan_file(
                             db,
+                            &blobs,
                             project,
                             base["source"].as_str().ok_or("Missing plan source")?,
                             base["logicalPath"].as_str().ok_or("Missing plan path")?,

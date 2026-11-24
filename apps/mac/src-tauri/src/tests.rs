@@ -391,6 +391,8 @@ mod project_restore_tests;
 mod repository_tests;
 #[path = "resource_command_tests.rs"]
 mod resource_command_tests;
+#[path = "scan_cache_tests.rs"]
+mod scan_cache_tests;
 #[path = "selective_sharing_tests.rs"]
 mod selective_sharing_tests;
 #[path = "session_compatibility_tests.rs"]
