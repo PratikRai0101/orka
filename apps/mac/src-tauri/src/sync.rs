@@ -1948,6 +1948,9 @@ impl PullApplyState {
             return false;
         };
         let kind = resource["kind"].as_str().unwrap_or("");
+        if kind == "plan" && crate::plans::validate_manifest(resource).is_err() {
+            return false;
+        }
         if kind == "skill" && packages::reject_env_files(files).is_err() {
             return false;
         }
@@ -2029,6 +2032,27 @@ impl PullApplyState {
         }
         true
     }
+}
+
+fn validate_preflight_folders(project: &Value) -> bool {
+    for source in crate::sources::views(project) {
+        let Some(raw) = source["path"].as_str() else {
+            continue;
+        };
+        let root = Path::new(raw);
+        if !root.is_dir() {
+            return false;
+        }
+        let Ok(root) = root.canonicalize() else {
+            return false;
+        };
+        if let Some(identity) = source["folderIdentity"].as_str() {
+            if !indexer::folder_identity_matches(&root, identity).unwrap_or(false) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// One sync cycle. `sync_workspace_global` holds the workspace-wide stages and
@@ -2202,7 +2226,19 @@ impl<'a> SyncPass<'a> {
             Ok(()) => {
                 if !retry_only {
                     if let Some(id) = p["id"].as_str() {
-                        self.preflight_at.insert(id.to_string(), Instant::now());
+                        let source_error_prefix = format!("{id}:source:%");
+                        let has_source_errors: bool = db
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM errors WHERE source LIKE ?)",
+                                [&source_error_prefix],
+                                |row| row.get(0),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        if has_source_errors {
+                            self.preflight_at.remove(id);
+                        } else {
+                            self.preflight_at.insert(id.to_string(), Instant::now());
+                        }
                     }
                     if waiting.is_none() {
                         db::set(
@@ -2259,6 +2295,8 @@ impl<'a> SyncPass<'a> {
         }
         if p["governed"] == true {
             let id = p["id"].as_str().ok_or("Missing project")?;
+            let previous_catalog = db::get(db, &format!("governance:{id}"))?;
+            let mut catalog_changed = false;
             let result: Result<()> = async {
                 crate::projects::active(db, id)?;
                 let catalog = api_as(
@@ -2268,6 +2306,9 @@ impl<'a> SyncPass<'a> {
                     Some(&json!({"action":"catalog","input":{"projectId":id}})),
                 )
                 .await?;
+                if catalog != previous_catalog {
+                    catalog_changed = true;
+                }
                 db::set(db, &format!("governance:{id}"), &catalog)?;
                 // A lifecycle refusal must leave queued work unchanged. Only
                 // prepare legacy knowledge after current access is confirmed.
@@ -2282,6 +2323,9 @@ impl<'a> SyncPass<'a> {
                 Ok(())
             }
             .await;
+            if catalog_changed {
+                self.preflight_at.remove(id);
+            }
             return self.record_authorization(id, result);
         }
         Ok(Continue(()))
@@ -2350,6 +2394,9 @@ impl<'a> SyncPass<'a> {
                 .map(|q| q["id"].clone()),
         );
         let uploads = outbox.batch(&queued);
+        if !uploads.is_empty() {
+            self.preflight_at.remove(project);
+        }
         for (index, original) in uploads.iter().enumerate() {
             let mut q = (*original).clone();
             if crate::projects::foreground_waiting()? || SyncQueue::cancelled(db, project)? {
@@ -2551,9 +2598,10 @@ impl<'a> SyncPass<'a> {
             && self
                 .preflight_at
                 .get(project)
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(2));
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+            && validate_preflight_folders(p);
         let scan = if preflight_fresh {
-            preflight_project(db, p, true)
+            Ok(())
         } else {
             progress(
                 db,

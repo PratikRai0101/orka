@@ -3256,12 +3256,21 @@ pub fn memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()> {
     Ok(())
 }
 
-fn memory_index_fingerprint(project: &Value, memory_id: &str, resources: &[Value]) -> String {
+fn memory_index_fingerprint(
+    project: &Value,
+    memory_id: &str,
+    blobs: &db::BlobStore,
+    resources: &[Value],
+) -> String {
     let entries: Vec<Value> = resources
         .iter()
         .map(|r| {
+            let blobs_present = r["files"]
+                .as_array()
+                .is_some_and(|files| blobs.all_present(files));
             json!([
                 r["resourceId"],
+                r["sourceId"],
                 r["revision"],
                 r["logicalPath"],
                 r["title"],
@@ -3270,7 +3279,8 @@ fn memory_index_fingerprint(project: &Value, memory_id: &str, resources: &[Value
                 r["updatedBy"],
                 r["memory"],
                 r["access"],
-                r["files"]
+                r["files"],
+                blobs_present
             ])
         })
         .collect();
@@ -3289,35 +3299,35 @@ fn memory_index_fingerprint(project: &Value, memory_id: &str, resources: &[Value
 }
 
 fn memory_index_cache_valid(
-    db: &rusqlite::Connection,
     blobs: &db::BlobStore,
     root: &Path,
-    project_id: &str,
     index_path: &Path,
     fingerprint: &str,
     cached: &scan_cache::CachedMemoryIndex,
-) -> Result<bool> {
+) -> bool {
     if cached.fingerprint != fingerprint {
-        return Ok(false);
+        return false;
     }
     if scan_cache::FileStamp::of(index_path).as_ref() != Some(&cached.index_stamp) {
-        return Ok(false);
+        return false;
     }
     let mut checked_parents = HashSet::new();
     for target in &cached.targets {
         let Some(parent) = target.path.parent() else {
-            return Ok(false);
+            return false;
         };
-        if checked_parents.insert(parent) && packages::safe_directory(root, parent).is_err() {
-            return Ok(false);
+        if checked_parents.insert(parent)
+            && packages::check_existing_directory(root, parent).is_err()
+        {
+            return false;
         }
         if scan_cache::FileStamp::of(&target.path).as_ref() != Some(&target.stamp)
             || !blobs.present(&target.hash, target.size)
         {
-            return Ok(false);
+            return false;
         }
     }
-    Ok(db::get(db, &format!("contextSources:{project_id}"))? == json!(cached.sources))
+    true
 }
 
 fn source_memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()> {
@@ -3348,19 +3358,16 @@ fn source_memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()>
         .map_err(|e| e.to_string())?;
     let blobs = db::BlobStore::current()?;
     let index_path = directory.join("index.md");
-    let fingerprint = memory_index_fingerprint(project, &memory_id, &resources);
-    let cache_key = scan_cache::memory_index_key(&memory_id);
+    let fingerprint = memory_index_fingerprint(project, &memory_id, &blobs, &resources);
+    let cache_key = scan_cache::memory_index_key(project_id, &memory_id);
     if !has_errors {
         if let Some(cached) = scan_cache::load_memory_index(db, &cache_key)? {
-            if memory_index_cache_valid(
-                db,
-                &blobs,
-                root,
-                project_id,
-                &index_path,
-                &fingerprint,
-                &cached,
-            )? {
+            if memory_index_cache_valid(&blobs, root, &index_path, &fingerprint, &cached) {
+                db::set(
+                    db,
+                    &format!("contextSources:{project_id}"),
+                    &json!(cached.sources),
+                )?;
                 return Ok(());
             }
         }
@@ -3419,14 +3426,14 @@ fn source_memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()>
             let hash = file["hash"].as_str().ok_or("Missing hash")?;
             let size = file["size"].as_u64().ok_or("Missing size")?;
             let parent = target.parent().ok_or("No parent")?;
-            if !checked_parents.contains(parent) {
-                packages::safe_directory(root, parent)?;
-                checked_parents.insert(parent.to_path_buf());
-            }
             let is_regular = fs::symlink_metadata(&target)
                 .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink());
             let mut local_file: Option<Value> = None;
             if project["governed"] == true && target.is_file() {
+                if !checked_parents.contains(parent) {
+                    packages::check_existing_directory(root, parent)?;
+                    checked_parents.insert(parent.to_path_buf());
+                }
                 let local = if is_regular {
                     scan_cache::package_file(db, &blobs, &target, "content.md")?
                 } else {
@@ -3447,7 +3454,14 @@ fn source_memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()>
                     String::from_utf8(db::blob_read(hash)?).map_err(|_| "Memory must be UTF-8")?;
                 owned_content.as_str()
             };
-            let already_written = if is_regular && blobs.present(hash, size) {
+            let parent_safe_existing = checked_parents.contains(parent)
+                || packages::check_existing_directory(root, parent)
+                    .map(|()| {
+                        checked_parents.insert(parent.to_path_buf());
+                    })
+                    .is_ok();
+            let already_written = if is_regular && parent_safe_existing && blobs.present(hash, size)
+            {
                 let local = match local_file {
                     Some(local) => local,
                     None => scan_cache::package_file(db, &blobs, &target, "content.md")?,
@@ -3460,6 +3474,7 @@ fn source_memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()>
             };
             if !already_written {
                 packages::write_file(root, &target, file)?;
+                checked_parents.insert(parent.to_path_buf());
             }
             let cached_target = scan_cache::FileStamp::of(&target).map(|stamp| {
                 scan_cache::CachedMemoryIndexTarget {

@@ -820,6 +820,40 @@ fn memory_index_skips_unchanged_rewrites_and_rebuilds_only_when_inputs_or_files_
             .any(|draft| draft["resource"]["resourceId"] == learned_id),
         "editing a governed memory mirror should still capture a private draft"
     );
+
+    // Replacing a governed memory's parent directory with a symlink must fail closed without capturing a draft.
+    f.db.execute("DELETE FROM drafts WHERE project=?", [&project_id])
+        .unwrap();
+    let outside_dir = f._home.path().join("outside-memory-dir");
+    fs::create_dir_all(&outside_dir).unwrap();
+    fs::write(outside_dir.join("content.md"), "# Secret external memory\n").unwrap();
+    let governed_parent = governed_path.parent().unwrap();
+    fs::remove_dir_all(governed_parent).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_dir, governed_parent).unwrap();
+    indexer::memory_index(&f.db, &governed).unwrap();
+    let drafts_after_symlink = db::rows(
+        &f.db,
+        "SELECT value FROM drafts WHERE project=?",
+        &[&project_id],
+    )
+    .unwrap();
+    assert!(
+        drafts_after_symlink.is_empty(),
+        "symlinked parent directory must not ingest or capture external files as drafts: {drafts_after_symlink:?}"
+    );
+    let symlink_errors = db::rows(
+        &f.db,
+        "SELECT json_object('source',source,'error',error) FROM errors",
+        &[],
+    )
+    .unwrap();
+    assert!(
+        symlink_errors
+            .iter()
+            .any(|e| e["error"] == "Directory contains symlink or file"),
+        "expected parent symlink error, got {symlink_errors:?}"
+    );
 }
 
 #[test]
@@ -1161,6 +1195,315 @@ fn pull_project_skips_current_resources_and_applies_only_changed_or_missing_blob
         "missing blob should force only that 1 resource to re-download"
     );
     assert!(remote_blob.exists());
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = server.join();
+}
+
+#[test]
+fn memory_index_multi_source_hits_cache_rebuilds_on_source_reattribution_and_prunes_on_remove_local(
+) {
+    let f = Fixture::new();
+    let project_id = f.project["id"].as_str().unwrap().to_owned();
+    let root_a = f._home.path().join("repo-a");
+    let root_b = f._home.path().join("repo-b");
+    fs::create_dir_all(&root_a).unwrap();
+    fs::create_dir_all(&root_b).unwrap();
+    let source_a = uuid::Uuid::new_v4().to_string();
+    let source_b = uuid::Uuid::new_v4().to_string();
+    let multi_project = json!({
+        "id": project_id,
+        "name": "multi",
+        "sources": [
+            {"id": source_a, "name": "Repo A", "path": root_a, "folderIdentity": indexer::folder_identity(&root_a).unwrap()},
+            {"id": source_b, "name": "Repo B", "path": root_b, "folderIdentity": indexer::folder_identity(&root_b).unwrap()}
+        ]
+    });
+    db::upsert(&f.db, "projects", &project_id, &project_id, &multi_project).unwrap();
+
+    let id_a = uuid::Uuid::new_v4().to_string();
+    let id_b = uuid::Uuid::new_v4().to_string();
+    let bytes_a = b"# Memory A\n\nFact from repo A.\n";
+    let bytes_b = b"# Memory B\n\nFact from repo B.\n";
+    let mut mem_a = json!({
+        "resourceId": id_a,
+        "projectId": project_id,
+        "sourceId": source_a,
+        "kind": "memory",
+        "source": "shared",
+        "logicalPath": "instructions/AGENTS.md",
+        "title": "AGENTS A",
+        "revision": 1,
+        "deleted": false,
+        "files": [{"path":"content.md","hash":db::blob(bytes_a).unwrap(),"size":bytes_a.len(),"executable":false}]
+    });
+    let mem_b = json!({
+        "resourceId": id_b,
+        "projectId": project_id,
+        "sourceId": source_b,
+        "kind": "memory",
+        "source": "shared",
+        "logicalPath": "instructions/CLAUDE.md",
+        "title": "CLAUDE B",
+        "revision": 1,
+        "deleted": false,
+        "files": [{"path":"content.md","hash":db::blob(bytes_b).unwrap(),"size":bytes_b.len(),"executable":false}]
+    });
+    db::upsert(&f.db, "resources", &id_a, &project_id, &mem_a).unwrap();
+    db::upsert(&f.db, "resources", &id_b, &project_id, &mem_b).unwrap();
+
+    let key_a = format!("{project_id}:{source_a}");
+    let key_b = format!("{project_id}:{source_b}");
+    let builds_a_0 = scan_cache::memory_index_builds(&key_a);
+    let builds_b_0 = scan_cache::memory_index_builds(&key_b);
+
+    // Run 1 builds both sources.
+    indexer::memory_index(&f.db, &multi_project).unwrap();
+    assert_eq!(scan_cache::memory_index_builds(&key_a), builds_a_0 + 1);
+    assert_eq!(scan_cache::memory_index_builds(&key_b), builds_b_0 + 1);
+    let idx_a_stamp = scan_cache::FileStamp::of(&root_a.join(".orka/memory/index.md")).unwrap();
+    let idx_b_stamp = scan_cache::FileStamp::of(&root_b.join(".orka/memory/index.md")).unwrap();
+
+    // Run 2 with zero changes hits cache for BOTH sources (no contextSources thrashing).
+    indexer::memory_index(&f.db, &multi_project).unwrap();
+    assert_eq!(scan_cache::memory_index_builds(&key_a), builds_a_0 + 1);
+    assert_eq!(scan_cache::memory_index_builds(&key_b), builds_b_0 + 1);
+    assert_eq!(
+        scan_cache::FileStamp::of(&root_a.join(".orka/memory/index.md")).unwrap(),
+        idx_a_stamp
+    );
+    assert_eq!(
+        scan_cache::FileStamp::of(&root_b.join(".orka/memory/index.md")).unwrap(),
+        idx_b_stamp
+    );
+
+    // Re-attributing mem_a to source_b at the same revision invalidates both sources.
+    mem_a["sourceId"] = json!(source_b);
+    db::upsert(&f.db, "resources", &id_a, &project_id, &mem_a).unwrap();
+    indexer::memory_index(&f.db, &multi_project).unwrap();
+    assert_eq!(scan_cache::memory_index_builds(&key_a), builds_a_0 + 2);
+    assert_eq!(scan_cache::memory_index_builds(&key_b), builds_b_0 + 2);
+    assert!(fs::read_to_string(root_b.join(".orka/memory/index.md"))
+        .unwrap()
+        .contains("Fact from repo A."));
+
+    // Replacing index.md with a symlink must be rejected on warm cache.
+    let outside = f._home.path().join("outside-index.md");
+    fs::write(&outside, "# outside\n").unwrap();
+    let idx_a = root_a.join(".orka/memory/index.md");
+    fs::remove_file(&idx_a).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &idx_a).unwrap();
+    indexer::memory_index(&f.db, &multi_project).unwrap();
+    let errors = db::rows(
+        &f.db,
+        "SELECT json_object('source',source,'error',error) FROM errors",
+        &[],
+    )
+    .unwrap();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e["error"] == "Destination is a symlink"),
+        "expected symlink rejection, got {errors:?}"
+    );
+
+    // remove_local must prune scanCache memoryIndex rows for this project.
+    let before_cache: i64 =
+        f.db.query_row(
+            "SELECT count(*) FROM meta WHERE key LIKE ?",
+            [format!("scanCache:%:memoryIndex:{project_id}:%")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(before_cache > 0);
+    crate::projects::remove_local(&f.db, &project_id).unwrap();
+    let after_cache: i64 =
+        f.db.query_row(
+            "SELECT count(*) FROM meta WHERE key LIKE ?",
+            [format!("scanCache:%:memoryIndex:{project_id}:%")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_cache, 0);
+}
+
+#[test]
+fn preflight_fresh_preserves_multi_source_scan_errors_and_runs_post_authorize_scan_on_governed_first_sync(
+) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    let f = Fixture::new();
+    let multi_id = uuid::Uuid::new_v4().to_string();
+    let gov_id = uuid::Uuid::new_v4().to_string();
+    let root_ok = f._home.path().join("multi-ok");
+    let root_bad = f._home.path().join("multi-bad");
+    let root_gov = f._home.path().join("gov-repo");
+    fs::create_dir_all(&root_ok).unwrap();
+    fs::create_dir_all(root_bad.join(".codex")).unwrap();
+    fs::create_dir_all(&root_gov).unwrap();
+    // Create a symlinked .codex/plans directory in root_bad (scan-only error; sources::validate passes).
+    let ext_plans = f._home.path().join("ext-plans");
+    fs::create_dir_all(&ext_plans).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&ext_plans, root_bad.join(".codex/plans")).unwrap();
+    fs::write(root_gov.join("AGENTS.md"), "# Governed first sync\n").unwrap();
+
+    let src_ok = uuid::Uuid::new_v4().to_string();
+    let src_bad = uuid::Uuid::new_v4().to_string();
+    let multi_project = json!({
+        "id": multi_id,
+        "name": "multi-errors",
+        "sources": [
+            {"id": src_ok, "name": "Ok", "path": root_ok, "folderIdentity": indexer::folder_identity(&root_ok).unwrap()},
+            {"id": src_bad, "name": "Bad", "path": root_bad, "folderIdentity": indexer::folder_identity(&root_bad).unwrap()}
+        ]
+    });
+    let gov_project = json!({
+        "id": gov_id,
+        "name": "gov-first",
+        "governed": true,
+        "path": root_gov,
+        "folderIdentity": indexer::folder_identity(&root_gov).unwrap()
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = Arc::clone(&stop);
+    let projects_payload = json!([multi_project, gov_project]);
+
+    let server = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(pos + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_len = header_str
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while buf.len() < header_end + content_len {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let first = header_str.lines().next().unwrap_or("");
+            let mut parts = first.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let path = parts.next().unwrap_or("");
+
+            let resp_bytes: Vec<u8> = if method == "POST" && path == "/v2/devices/register" {
+                json!({"capabilities": {}}).to_string().into_bytes()
+            } else if method == "GET" && path.starts_with("/v2/projects/capabilities") {
+                b"{}".to_vec()
+            } else if method == "GET" && path.starts_with("/v2/projects") {
+                projects_payload.to_string().into_bytes()
+            } else if method == "GET" && path == "/v2/devices" {
+                b"[]".to_vec()
+            } else if method == "POST" && path == "/v2/governance/action" {
+                json!({"owner": true, "access": {"instructions": {"create": "publish"}}})
+                    .to_string()
+                    .into_bytes()
+            } else if method == "GET" && path.starts_with("/v2/sync/pull") {
+                json!({"events":[],"cursor":1,"hasMore":false,"policyRevision":1,"requests":[],"presence":[]})
+                    .to_string()
+                    .into_bytes()
+            } else {
+                b"{}".to_vec()
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                resp_bytes.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&resp_bytes);
+            let _ = stream.flush();
+        }
+    });
+
+    let origin = format!("http://{addr}");
+    db::set(&f.db, "config", &json!({"apiUrl": origin})).unwrap();
+    crate::env::test_support::install_memory_keychain();
+    let owner = db::get(&f.db, "user").unwrap().as_str().unwrap().to_owned();
+    crate::auth::test_session(&json!({
+        "user": {"id": owner},
+        "access_token": "test-token",
+        "refresh_token": "test-refresh",
+        "expires_at": i64::MAX
+    }))
+    .unwrap();
+    let account_db = db::open().unwrap();
+    db::set(&account_db, "user", &json!(owner)).unwrap();
+    db::upsert(
+        &account_db,
+        "projects",
+        &multi_id,
+        &multi_id,
+        &multi_project,
+    )
+    .unwrap();
+    db::upsert(&account_db, "projects", &gov_id, &gov_id, &gov_project).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(sync::once()).unwrap();
+
+    // Finding #1: multi-source scan error on src_bad must NOT be wiped by pull_project.
+    let bad_source_key = format!("{multi_id}:source:{src_bad}");
+    let bad_errors = db::rows(
+        &account_db,
+        "SELECT json_object('source',source,'error',error) FROM errors WHERE source=?",
+        &[&bad_source_key],
+    )
+    .unwrap();
+    assert_eq!(
+        bad_errors.len(),
+        1,
+        "expected multi-source scan error to be preserved, got {bad_errors:?}"
+    );
+
+    // Finding #2: governed first sync must invalidate preflight_fresh after authorize()
+    // so automatic sharing queues AGENTS.md in the same sync cycle.
+    let gov_outbox = db::rows(
+        &account_db,
+        "SELECT value FROM outbox WHERE project=?",
+        &[&gov_id],
+    )
+    .unwrap();
+    assert!(
+        !gov_outbox.is_empty(),
+        "expected governed first sync to queue AGENTS.md after authorize() fetched permissions"
+    );
 
     stop.store(true, Ordering::Relaxed);
     let _ = server.join();

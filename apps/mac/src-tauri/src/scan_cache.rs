@@ -386,8 +386,11 @@ pub(crate) fn session_key(project: &Value, root: &Path, tool: &str, path: &Path)
 
 pub(crate) fn clear_project(db: &Connection, project_id: &str) -> Result<()> {
     db.execute(
-        "DELETE FROM meta WHERE key LIKE ?",
-        [format!("scanCache:%:session:{project_id}:%")],
+        "DELETE FROM meta WHERE key LIKE ?1 OR key LIKE ?2",
+        rusqlite::params![
+            format!("scanCache:%:session:{project_id}:%"),
+            format!("scanCache:%:memoryIndex:{project_id}:%")
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -430,8 +433,11 @@ pub(crate) struct CachedMemoryIndex {
     pub(crate) sources: Vec<Value>,
 }
 
-pub(crate) fn memory_index_key(memory_id: &str) -> String {
-    cache_key("memoryIndex", &json!([memory_id]))
+pub(crate) fn memory_index_key(project_id: &str, memory_id: &str) -> String {
+    format!(
+        "scanCache:{CACHE_VERSION}:memoryIndex:{project_id}:{}",
+        db::digest(memory_id.as_bytes())
+    )
 }
 
 pub(crate) fn load_memory_index(db: &Connection, key: &str) -> Result<Option<CachedMemoryIndex>> {

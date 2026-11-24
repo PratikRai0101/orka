@@ -55,6 +55,28 @@ pub fn safe_relative(raw: &str) -> Result<PathBuf> {
     }
     Ok(p.into())
 }
+pub fn check_existing_directory(base: &Path, target: &Path) -> Result<()> {
+    if fs::symlink_metadata(base).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("Root is a symlink".into());
+    }
+    let rel = target.strip_prefix(base).map_err(|_| "Path escapes root")?;
+    let mut current = base.to_path_buf();
+    for c in rel.components() {
+        if !matches!(c, Component::Normal(_)) {
+            return Err("Unsafe directory".into());
+        }
+        current.push(c);
+        match fs::symlink_metadata(&current) {
+            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+                return Err("Directory contains symlink or file".into())
+            }
+            Ok(_) => (),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
 pub fn safe_directory(base: &Path, target: &Path) -> Result<()> {
     if fs::symlink_metadata(base).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("Root is a symlink".into());
