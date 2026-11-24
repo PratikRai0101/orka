@@ -9,6 +9,17 @@ async function fixture(page: Page, names = ["desktop", "backend"]) {
       { id: "desktop", name: names[0], path: "/local/desktop" },
       { id: "backend", name: names[1], path: "/different/backend" },
     ];
+    const retiredName = names[2];
+    const sources = retiredName
+      ? [
+          ...repositories,
+          {
+            id: "retired-desktop",
+            name: retiredName,
+            removedAt: "2026-11-20T10:00:00Z",
+          },
+        ]
+      : repositories;
     const resources = repositories.flatMap((source) =>
       ["memory", "skill", "session", "plan"].map((kind) => ({
         resourceId: `${kind}-${source.id}`,
@@ -50,7 +61,7 @@ async function fixture(page: Page, names = ["desktop", "backend"]) {
                   id: "project",
                   name: "Product",
                   role: "owner",
-                  sources: repositories,
+                  sources,
                 },
                 {
                   id: "other",
@@ -136,6 +147,14 @@ async function fixture(page: Page, names = ["desktop", "backend"]) {
   ).toBeVisible();
 }
 
+const pickRepository = async (page: Page, name: string) => {
+  await page.getByRole("button", { name: /^Filter/ }).click();
+  await page.getByRole("menuitem", { name: "Repository" }).click();
+  await page.getByRole("menuitemcheckbox", { name, exact: true }).click();
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+};
+
 for (const viewport of [
   { width: 1160, height: 800 },
   { width: 900, height: 640 },
@@ -193,40 +212,29 @@ test("repository filters distinguish same-path resources and remain clearable", 
 }) => {
   await fixture(page);
   await page.getByRole("button", { name: /^Memories/ }).click();
-  const filter = page.getByRole("combobox", {
-    name: "Filter by repository",
-    exact: true,
-  });
-  await expect(
-    page.getByRole("button", { name: "desktop instructions", exact: true }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "backend instructions", exact: true }),
-  ).toBeVisible();
-  await filter.click();
-  await page.getByRole("option", { name: "backend", exact: true }).click();
-  await expect(
-    page.getByRole("button", { name: "desktop instructions", exact: true }),
-  ).toHaveCount(0);
-  await expect(
-    page.getByRole("button", { name: "backend instructions", exact: true }),
-  ).toBeVisible();
-  await page
-    .getByRole("searchbox", { name: "Search memories" })
-    .fill("missing");
-  await expect(filter).toBeVisible();
+  const desktop = page.getByRole("row", { name: /desktop instructions/ });
+  const backend = page.getByRole("row", { name: /backend instructions/ });
+  await expect(desktop).toContainText("desktop");
+  await expect(backend).toContainText("backend");
+  await pickRepository(page, "backend");
+  await expect(desktop).toHaveCount(0);
+  await expect(backend).toBeVisible();
+  const search = page.getByRole("searchbox", { name: "Search memories" });
+  await search.fill("missing");
   await page.getByRole("button", { name: "Clear filters" }).click();
-  await expect(filter).toHaveText("All repositories");
-  await expect(
-    page.getByRole("button", { name: "desktop instructions", exact: true }),
-  ).toBeVisible();
+  await search.clear();
+  await expect(page.getByRole("group", { name: "Active filters" })).toHaveCount(
+    0,
+  );
+  await expect(desktop).toBeVisible();
+  await expect(backend).toBeVisible();
 });
 
 for (const viewport of [
   { width: 1160, height: 800 },
   { width: 900, height: 640 },
 ]) {
-  test(`repository context stays in the header across collections at ${viewport.width}`, async ({
+  test(`repository context fits every collection at ${viewport.width}`, async ({
     page,
   }, testInfo) => {
     await page.setViewportSize(viewport);
@@ -240,23 +248,23 @@ for (const viewport of [
     for (const [tab, kind] of [
       ["Memories", "memory"],
       ["Skills", "skill"],
-      ["Sessions", "session"],
       ["Plans", "plan"],
+      ["Sessions", "session"],
       ...(ENV_ENABLED ? [["ENVs", "env"]] : []),
     ]) {
       await page.getByRole("button", { name: new RegExp(`^${tab}`) }).click();
-      // Skills filter by repository inside their own Filter menu.
+      // Collections filter by repository inside their own Filter menu.
       await expect(
         page.getByRole("combobox", { name: /Filter.*repository/ }),
-      ).toHaveCount(kind === "skill" ? 0 : 1);
+      ).toHaveCount(kind === "env" ? 1 : 0);
       if (kind === "env") {
         await expect(page.locator(".env-list-item")).toHaveCount(2);
-      } else if (kind === "skill") {
-        const row = page.locator(".skill-table tbody tr", {
-          has: page.locator('[data-resource-id="skill-desktop"]'),
+      } else {
+        const row = page.locator(".index-table tbody tr", {
+          has: page.locator(`[data-resource-id="${kind}-desktop"]`),
         });
         await expect(
-          row.locator(".skill-table-repository-label"),
+          row.locator(".index-table-repository-label"),
         ).toHaveAttribute("title", longName);
         await page.getByRole("button", { name: "Filter", exact: true }).click();
         await page.getByRole("menuitem", { name: "Repository" }).click();
@@ -265,62 +273,18 @@ for (const viewport of [
         ).toBeVisible();
         await page.keyboard.press("Escape");
         await page.keyboard.press("Escape");
-        await row.hover();
-        await expect(row.getByRole("tooltip")).toContainText(
-          "From your global skills",
-        );
-      } else {
-        await expect(
-          page.getByRole("columnheader", { name: "Repository", exact: true }),
-        ).toHaveCount(1);
-        await expect(page.locator(".resource-table-repository")).toHaveCount(2);
-        const columns = await page
-          .locator("tbody tr")
-          .first()
-          .evaluate((row) => {
-            const metadata = Array.from(
-              row.querySelectorAll("td:not(.resource-table-actions)"),
-            );
-            return metadata.map((cell) => ({
-              width: cell.getBoundingClientRect().width,
-              paddingLeft: getComputedStyle(cell).paddingLeft,
-              paddingRight: getComputedStyle(cell).paddingRight,
-              align: getComputedStyle(cell).textAlign,
-            }));
-          });
-        expect(new Set(columns.map((column) => column.width)).size).toBe(1);
-        expect(new Set(columns.map((column) => column.paddingLeft)).size).toBe(
-          1,
-        );
-        expect(
-          columns.every(
-            (column) =>
-              column.paddingLeft === column.paddingRight &&
-              column.align === "left",
-          ),
-        ).toBe(true);
-        const sourceFits = await page
-          .locator("tbody tr")
-          .first()
-          .locator("td")
-          .nth(1)
-          .evaluate((cell) => {
-            const pill = cell.querySelector(".resource-identity")!;
-            return (
-              pill.getBoundingClientRect().right <=
-              cell.getBoundingClientRect().right -
-                parseFloat(getComputedStyle(cell).paddingRight) +
-                1
-            );
-          });
-        expect(sourceFits).toBe(true);
+        if (kind === "skill") {
+          await row.hover();
+          await expect(row.getByRole("tooltip")).toContainText(
+            "From your global skills",
+          );
+        }
       }
       await page.screenshot({
         path: testInfo.outputPath(`${kind}-${viewport.width}.png`),
       });
-      // The Skills table gives repository names more room; its own test
-      // covers the label and its title above.
-      if (kind !== "skill") {
+      // The index tables check the label and its title above.
+      if (kind === "env") {
         const overflowing = await page
           .locator(".resource-repository")
           .filter({ hasText: longName })
@@ -340,6 +304,8 @@ for (const viewport of [
         (await new AxeBuilder({ page }).include("main").analyze()).violations,
       ).toEqual([]);
     }
+    // Only ENVs keep the header repository picker.
+    if (!ENV_ENABLED) return;
     const geometry = await header.evaluate((el) => {
       const filter = el.querySelector(".workspace-repository-filter")!,
         status = el.querySelector(".sync-status")!;
@@ -401,57 +367,36 @@ for (const viewport of [
   });
 }
 
-test("one repository selection follows tabs, supports the keyboard, and resets on project changes", async ({
+test("each collection keeps its own repository pick until the project changes", async ({
   page,
 }) => {
   await fixture(page);
+  const rows = page.locator("tbody tr");
   await page.getByRole("button", { name: /^Memories/ }).click();
-  const filter = page.getByRole("combobox", { name: "Filter by repository" });
-  await filter.focus();
-  await page.keyboard.press("Enter");
-  await expect(
-    page.getByRole("option", { name: "All repositories", exact: true }),
-  ).toBeFocused();
-  await page.keyboard.press("End");
-  await expect(
-    page.getByRole("option", { name: "backend", exact: true }),
-  ).toBeFocused();
-  await page.keyboard.press("Enter");
-  await expect(filter).toBeFocused();
-  await expect(filter).toHaveText("backend");
-  for (const [tab, selector] of [
-    ["Memories", "tbody tr"],
-    ["Skills", ".skill-table tbody tr"],
-    ["Sessions", "tbody tr"],
-    ["Plans", "tbody tr"],
-    ...(ENV_ENABLED ? [["ENVs", ".env-list-item"]] : []),
-  ]) {
+  await pickRepository(page, "backend");
+  await expect(rows).toHaveCount(1);
+  await expect(rows).toContainText("backend");
+  for (const tab of ["Skills", "Sessions", "Plans"]) {
     await page.getByRole("button", { name: new RegExp(`^${tab}`) }).click();
-    if (tab === "Skills") {
-      // Skills keep their own filters; the header selection does not reach them.
-      await expect(filter).toHaveCount(0);
-      await expect(page.locator(selector)).toHaveCount(2);
-      continue;
-    }
-    await expect(filter).toHaveText("backend");
-    await expect(page.locator(selector)).toHaveCount(1);
-    await expect(page.locator(selector)).toContainText("backend");
+    await expect(rows).toHaveCount(2);
   }
+  await page.getByRole("button", { name: /^Memories/ }).click();
+  await expect(rows).toHaveCount(1);
   await page
     .getByRole("combobox", { name: "Select project", exact: true })
     .click();
   await page
     .getByRole("option", { name: "Another project", exact: true })
     .click();
-  await expect(filter).toHaveCount(0);
   await page
     .getByRole("combobox", { name: "Select project", exact: true })
     .click();
   await page.getByRole("option", { name: "Product", exact: true }).click();
-  await expect(filter).toHaveText("All repositories");
-  await filter.click();
-  await page.keyboard.press("Escape");
-  await expect(filter).toBeFocused();
+  await page.getByRole("button", { name: /^Memories/ }).click();
+  await expect(rows).toHaveCount(2);
+  await expect(page.getByRole("group", { name: "Active filters" })).toHaveCount(
+    0,
+  );
 });
 
 test("duplicate repository names stay distinguishable in the custom picker", async ({
@@ -459,16 +404,30 @@ test("duplicate repository names stay distinguishable in the custom picker", asy
 }) => {
   await fixture(page, ["orka", "orka"]);
   await page.getByRole("button", { name: /^Memories/ }).click();
-  const filter = page.getByRole("combobox", { name: "Filter by repository" });
-  await filter.click();
+  await page.getByRole("button", { name: /^Filter/ }).click();
+  await page.getByRole("menuitem", { name: "Repository" }).click();
   await expect(
-    page.getByRole("option", { name: "orka · deskto", exact: true }),
+    page.getByRole("menuitemcheckbox", { name: "orka · deskto", exact: true }),
   ).toBeVisible();
-  await page
-    .getByRole("option", { name: "orka · backen", exact: true })
-    .click();
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+  await pickRepository(page, "orka · backen");
   await expect(page.locator("tbody tr")).toHaveCount(1);
   await expect(page.locator("tbody tr")).toContainText("backend instructions");
+});
+
+test("an active repository keeps the same label in its rows and filter when a retired source has its name", async ({
+  page,
+}) => {
+  await fixture(page, ["desktop", "backend", "desktop"]);
+  await page.getByRole("button", { name: /^Memories/ }).click();
+  const row = page
+    .locator("tbody tr")
+    .filter({ hasText: "desktop instructions" });
+  await expect(row).toContainText("desktop · deskto");
+  await pickRepository(page, "desktop · deskto");
+  await expect(page.locator("tbody tr")).toHaveCount(1);
+  await expect(row).toBeVisible();
 });
 
 test("Home can open a resource outside the previous repository selection", async ({
@@ -476,16 +435,20 @@ test("Home can open a resource outside the previous repository selection", async
 }) => {
   await fixture(page);
   await page.getByRole("button", { name: /^Memories/ }).click();
-  const filter = page.getByRole("combobox", { name: "Filter by repository" });
-  await filter.click();
-  await page.getByRole("option", { name: "backend", exact: true }).click();
+  await pickRepository(page, "backend");
   await page.getByRole("button", { name: "Home", exact: true }).click();
-  await expect(filter).toHaveCount(0);
   await page.locator('[data-resource-id="memory-desktop"]').click();
   await expect(page.locator(".resource-detail h2").first()).toHaveText(
     "desktop instructions",
   );
-  await expect(filter).toHaveText("All repositories");
+  await page.getByRole("button", { name: "Back to Memories" }).click();
+  // The page keeps its own filter; the item opened from Home is outside it.
+  await expect(
+    page.getByRole("group", { name: "Active filters" }),
+  ).toContainText("backend");
+  await expect(
+    page.getByRole("searchbox", { name: "Search memories" }),
+  ).toBeFocused();
 });
 
 test("ENV repository filtering keeps an unpublished draft and hides other set details", async ({

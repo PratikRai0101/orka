@@ -1124,9 +1124,7 @@ test("access requests start from resource pages and do not appear in management"
     }),
   ).toHaveCount(0);
   await page.getByRole("button", { name: "Plans 0", exact: true }).click();
-  await page
-    .getByRole("button", { name: "Request editing access", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Ask to edit", exact: true }).click();
   const dialog = page.getByRole("dialog", {
     name: "Request access",
     exact: true,
@@ -1241,7 +1239,10 @@ test("a member with no shared access can request a collection from its empty pag
   await fixture(page, true, false, "restricted");
   await page.getByRole("button", { name: "Memories 0", exact: true }).click();
   await expect(
-    page.getByText("Access to shared memories is restricted.", { exact: true }),
+    page.getByRole("heading", {
+      name: "Shared memories are restricted",
+      exact: true,
+    }),
   ).toBeVisible();
   await page
     .getByRole("button", { name: "Request access", exact: true })

@@ -116,17 +116,192 @@
   }
 }
 
-/* Search, Filter, Sort and the chips stay put while the list scrolls under. */
-.skill-index-head {
+/* Search, Filter, Sort and the chips stay put while the list scrolls under.
+   It holds the space below them too, so rows never show above the headings. */
+.index-head {
   position: sticky;
   z-index: 10;
   top: 0;
+  display: flow-root;
   background: var(--surface-secondary);
 }
 
 /* First in the page, it also covers the page's top padding as rows pass. */
-.skill-index-head:first-child {
+.index-head:first-child {
   top: -20px;
   margin-top: -20px;
   padding-top: 20px;
+}
+
+/* A page-wide limit beside the toolbar: the status pill at control height. */
+.index-access-pill {
+  height: 28px;
+  padding-inline: 10px;
+  border: 1px solid transparent;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.index-access-pill:hover,
+.index-access-pill[data-state="open"] {
+  border-color: currentColor;
+}
+
+.index-access-pill:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.index-access-panel {
+  z-index: 110;
+  display: flex;
+  width: 320px;
+  max-width: calc(100vw - 24px);
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-surface);
+  background: var(--surface-tertiary);
+  box-shadow: var(--shadow-workspace);
+  outline: none;
+}
+
+.index-access-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: var(--font-weight-medium);
+  line-height: 20px;
+}
+
+.index-access-title > svg {
+  flex-shrink: 0;
+  color: var(--amber-text);
+}
+
+.index-access-description {
+  margin: 0 0 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.modal.index-access-dialog {
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+}
+
+.index-access-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.modal .index-access-dialog-header h2 {
+  margin: 0;
+  font-size: var(--heading-settings-font-size);
+  font-weight: var(--heading-settings-font-weight);
+  line-height: var(--heading-settings-line-height);
+  letter-spacing: var(--heading-settings-letter-spacing);
+}
+
+.index-access-section {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: 8px;
+  padding-top: 12px;
+}
+
+.index-access-section > svg {
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
+
+.index-access-section-body {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.index-access-section + .index-access-section {
+  margin-top: 12px;
+  border-top: 1px solid var(--border-default);
+}
+
+.index-access-dialog .index-access-section p {
+  margin: 0;
+}
+
+.index-access-connect {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.index-access-request-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.index-access-request-fields > label {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--label-xs-font-size);
+  line-height: var(--label-xs-line-height);
+}
+
+.index-access-request-fields .permission-select-trigger {
+  padding: 5px 10px;
+  line-height: var(--body-sm-line-height);
+}
+
+.index-access-request-fields > .actions {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.index-access-request-fields > [role="alert"] {
+  grid-column: 1 / -1;
+  color: var(--red-text);
+  overflow-wrap: anywhere;
+}
+
+.index-access-panel > .ui-button {
+  width: 100%;
+}
+
+/* A secondary action keeps a visible fill on the panel's raised surface. */
+.index-access-panel .ui-button--secondary {
+  box-shadow: inset 0 0 0 100vmax var(--state-hover);
+}
+
+.index-access-panel .ui-button--secondary:hover:not(:disabled) {
+  box-shadow: inset 0 0 0 100vmax var(--state-pressed);
+}
+
+/* An access request beside the toolbar or in its panel has no margin. */
+.index-toolbar-actions .resource-access-request,
+.index-access-panel .resource-access-request {
+  margin: 0;
+}
+
+.index-toolbar-actions p.resource-access-request,
+.index-access-panel p.resource-access-request {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 20px;
 }
