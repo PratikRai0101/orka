@@ -554,7 +554,7 @@ fn git_instruction_files(repo_dir: &Path) -> Result<BTreeSet<PathBuf>> {
         .args(["ls-files", "-z", "--stage"])
         .output()
         .map_err(|e| e.to_string())?;
-    if !staged.status.success() {
+    if !staged.status.success() || !staged.stderr.is_empty() {
         return Err(format!(
             "Cannot verify Git ignore rules for {}",
             repo_dir.display()
@@ -564,7 +564,24 @@ fn git_instruction_files(repo_dir: &Path) -> Result<BTreeSet<PathBuf>> {
         .args(["ls-files", "-z", "--others", "--exclude-standard"])
         .output()
         .map_err(|e| e.to_string())?;
-    if !others.status.success() {
+    if !others.status.success() || !others.stderr.is_empty() {
+        return Err(format!(
+            "Cannot verify Git ignore rules for {}",
+            repo_dir.display()
+        ));
+    }
+    let ignored = git_command(repo_dir)
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !ignored.status.success() || !ignored.stderr.is_empty() {
         return Err(format!(
             "Cannot verify Git ignore rules for {}",
             repo_dir.display()
@@ -627,6 +644,27 @@ fn git_instruction_files(repo_dir: &Path) -> Result<BTreeSet<PathBuf>> {
         }
     }
 
+    for entry in ignored.stdout.split(|b| *b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let trimmed = entry.strip_suffix(b"/").unwrap_or(entry);
+        let rel = path_from_git_bytes(trimmed)?;
+        if !memory_context::discoverable(&rel) {
+            continue;
+        }
+        if let Some(nested) = nested_git_ancestor(repo_dir, &rel) {
+            nested_repos.insert(nested);
+            continue;
+        }
+        let full = repo_dir.join(&rel);
+        if fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir())
+            && fs::symlink_metadata(full.join(".git")).is_ok()
+        {
+            nested_repos.insert(rel);
+        }
+    }
+
     for rel in candidates {
         if let Some(nested) = nested_git_ancestor(repo_dir, &rel) {
             nested_repos.insert(nested);
@@ -670,7 +708,13 @@ pub(crate) fn instruction_allowed(
     let path = root.join(relative);
     Ok(memory_context::discoverable(relative)
         && if path.try_exists().map_err(|error| error.to_string())? {
-            instructions.contains(relative)
+            if instructions.contains(relative) {
+                true
+            } else if nested_git_ancestor(root, relative).is_some() {
+                git_instruction_allowed(&path)?.unwrap_or(true)
+            } else {
+                false
+            }
         } else {
             git_instruction_allowed(&path)?.unwrap_or(true)
         })
@@ -1526,36 +1570,66 @@ fn session_handoff_scope(
     Ok((scope, has_handoffs))
 }
 
+fn resolve_plans_dir(
+    cache: &mut HashMap<(PathBuf, &'static str), Result<PathBuf>>,
+    scope: &Path,
+    tool: &'static str,
+) -> Result<PathBuf> {
+    let key = (scope.to_path_buf(), tool);
+    if let Some(dir) = cache.get(&key) {
+        return dir.clone();
+    }
+    let dir = plans::project_directory(scope, tool);
+    cache.insert(key, dir.clone());
+    dir
+}
+
 #[allow(clippy::too_many_arguments)]
-fn collect_session_plans(
+fn collect_session_plan_refs(
     db: &rusqlite::Connection,
     blobs: &db::BlobStore,
     project: &Value,
     project_id: &str,
     scan_id: &str,
+    session_path: &Path,
     tool: &str,
     id: &str,
     checkout: &crate::worktrees::SessionCheckout,
     plans_dir: &Path,
     plan_refs: &[PathBuf],
-    embedded_plans: &[scan_cache::CachedEmbeddedPlan],
     seen: &mut BTreeSet<String>,
-) -> Result<()> {
-    let mut has_plan_file = false;
+) -> Result<bool> {
+    let native_dir = plans::native_directory(tool)?;
+    let native_parent = native_dir.parent().ok_or("Missing native home")?;
+    let mut validated = Vec::with_capacity(plan_refs.len());
     for path in plan_refs {
+        let checked = if let Ok(relative) = path.strip_prefix(plans_dir) {
+            plans::check_path(&checkout.scope, path).map(|()| checkout.plan_key(tool, relative))
+        } else {
+            path.strip_prefix(&native_dir)
+                .map_err(|e| e.to_string())
+                .and_then(|relative| {
+                    plans::check_path(native_parent, path)
+                        .map(|()| format!("{tool}/native/{}", relative.to_string_lossy()))
+                })
+        };
+        match checked {
+            Ok(logical) => validated.push((path, logical)),
+            Err(err) => {
+                error(
+                    db,
+                    &format!("{scan_id}:scan:plans:{}", session_path.display()),
+                    &err,
+                )?;
+                return Ok(false);
+            }
+        }
+    }
+    let mut has_plan_file = false;
+    for (path, logical) in validated {
         if !path.try_exists().map_err(|e| e.to_string())? {
             continue;
         }
-        let logical = if let Ok(relative) = path.strip_prefix(plans_dir) {
-            checkout.plan_key(tool, relative)
-        } else {
-            format!(
-                "{tool}/native/{}",
-                path.strip_prefix(plans::native_directory(tool)?)
-                    .map_err(|e| e.to_string())?
-                    .to_string_lossy()
-            )
-        };
         if project["governed"] == true && project["catalogOnly"] != true {
             let mut known = db::get(
                 db,
@@ -1590,6 +1664,21 @@ fn collect_session_plans(
             Err(err) => error(db, &format!("{scan_id}:scan:{}", path.display()), &err)?,
         }
     }
+    Ok(has_plan_file)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_session_embedded_plans(
+    db: &rusqlite::Connection,
+    blobs: &db::BlobStore,
+    project: &Value,
+    scan_id: &str,
+    tool: &str,
+    id: &str,
+    has_plan_file: bool,
+    embedded_plans: &[scan_cache::CachedEmbeddedPlan],
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
     for plan in embedded_plans {
         if tool == "claude" && has_plan_file {
             continue;
@@ -2417,10 +2506,10 @@ fn scan_source(
             crate::worktrees::SessionScope::new(db, project, &root, &sources, &home)?;
         let topology = session_scope.cache_scope()?;
         let governed_sync = project["governed"] == true && project["catalogOnly"] != true;
-        let (handoff_scope, has_handoffs) = session_handoff_scope(db, project_id, governed_sync)?;
+        let (handoff_scope, _) = session_handoff_scope(db, project_id, governed_sync)?;
         let share_plans = crate::projects::sharing_allowed(project, "plan");
         let codex_index = history::CodexSegmentIndex::new(&codex);
-        let mut plan_dirs: HashMap<(PathBuf, &'static str), PathBuf> = HashMap::new();
+        let mut plan_dirs: HashMap<(PathBuf, &'static str), Result<PathBuf>> = HashMap::new();
         let mut last_history_progress = None;
         let include_pi =
             project["catalogOnly"] == true && crate::projects::sharing_allowed(project, "session");
@@ -2495,27 +2584,78 @@ fn scan_source(
                                     }
                                     Some(Err(_)) => {}
                                     _ => {
+                                        let ancestors_valid = if tool == "codex" {
+                                            let candidates_ok = cached
+                                                .ancestor_candidates
+                                                .iter()
+                                                .all(|(ancestor_id, expected_paths)| {
+                                                    codex_index
+                                                        .candidate_paths(ancestor_id)
+                                                        .is_ok_and(|paths| paths == *expected_paths)
+                                                });
+                                            let cwds_ok = checkout.historical
+                                                || cached.ancestor_cwds.is_empty()
+                                                || checkout.scope.canonicalize().is_ok_and(
+                                                    |canonical_scope| {
+                                                        cached.ancestor_cwds.iter().all(|cwd| {
+                                                            cwd.canonicalize().is_ok_and(|c| {
+                                                                c.starts_with(&canonical_scope)
+                                                            })
+                                                        })
+                                                    },
+                                                );
+                                            candidates_ok && cwds_ok
+                                        } else {
+                                            true
+                                        };
                                         let need_plans =
                                             tool != "pi" && !checkout.historical && share_plans;
                                         let current_plans_dir = if need_plans {
-                                            let key = (checkout.scope.clone(), tool);
-                                            if let Some(dir) = plan_dirs.get(&key) {
-                                                Some(dir.clone())
-                                            } else {
-                                                let dir = plans::project_directory(
-                                                    &checkout.scope,
-                                                    tool,
-                                                )?;
-                                                plan_dirs.insert(key, dir.clone());
-                                                Some(dir)
-                                            }
+                                            resolve_plans_dir(&mut plan_dirs, &checkout.scope, tool)
+                                                .ok()
                                         } else {
                                             None
                                         };
+                                        let claude_fallback_safe = !need_plans
+                                            || tool != "claude"
+                                            || !cached.had_plan_file
+                                            || cached.plan_refs.iter().any(|path| {
+                                                scan_cache::FileStamp::of(path).is_some()
+                                                    && current_plans_dir.as_ref().is_some_and(
+                                                        |dir| {
+                                                            if path.starts_with(dir) {
+                                                                plans::check_path(
+                                                                    &checkout.scope,
+                                                                    path,
+                                                                )
+                                                                .is_ok()
+                                                            } else {
+                                                                plans::native_directory(tool)
+                                                                    .ok()
+                                                                    .and_then(|native| {
+                                                                        native.parent().map(
+                                                                            |parent| {
+                                                                                plans::check_path(
+                                                                                    parent, path,
+                                                                                )
+                                                                                .is_ok()
+                                                                            },
+                                                                        )
+                                                                    })
+                                                                    .unwrap_or(false)
+                                                            }
+                                                        },
+                                                    )
+                                            });
                                         let plans_ready = !need_plans
                                             || (cached.plans_checked
-                                                && cached.plans_dir == current_plans_dir);
-                                        if plans_ready && cached.blobs_present(&blobs, need_plans) {
+                                                && current_plans_dir.is_some()
+                                                && cached.plans_dir == current_plans_dir
+                                                && claude_fallback_safe);
+                                        if ancestors_valid
+                                            && plans_ready
+                                            && cached.blobs_present(&blobs, need_plans)
+                                        {
                                             if unattributed_paths.contains(&unattributed) {
                                                 db.execute(
                                                     "DELETE FROM errors WHERE source=?",
@@ -2525,7 +2665,7 @@ fn scan_source(
                                             }
                                             report_file(e.path())?;
                                             session_scope.pin(&checkout, tool, &cached.id)?;
-                                            if governed_sync && !has_handoffs {
+                                            if governed_sync {
                                                 native::bind_handoff(
                                                     db,
                                                     project_id,
@@ -2534,17 +2674,28 @@ fn scan_source(
                                                 )?;
                                             }
                                             if let Some(plans_dir) = &current_plans_dir {
-                                                collect_session_plans(
+                                                let has_plan_file = collect_session_plan_refs(
                                                     db,
                                                     &blobs,
                                                     project,
                                                     project_id,
                                                     &scan_id,
+                                                    e.path(),
                                                     tool,
                                                     &cached.id,
                                                     &checkout,
                                                     plans_dir,
                                                     &cached.plan_refs,
+                                                    &mut seen,
+                                                )?;
+                                                collect_session_embedded_plans(
+                                                    db,
+                                                    &blobs,
+                                                    project,
+                                                    &scan_id,
+                                                    tool,
+                                                    &cached.id,
+                                                    has_plan_file,
                                                     &cached.embedded_plans,
                                                     &mut seen,
                                                 )?;
@@ -2756,23 +2907,50 @@ fn scan_source(
                 }
                 let mut can_cache = !snapshot.deps.is_empty();
                 let mut plans_checked = false;
+                let mut cached_had_plan_file = false;
                 let mut cached_plans_dir = None;
                 let mut cached_plan_refs = Vec::new();
                 let mut cached_embedded_plans = Vec::new();
                 if tool != "pi" && !checkout.historical && share_plans {
-                    let key = (checkout_scope.clone(), tool);
-                    let plans_dir = if let Some(dir) = plan_dirs.get(&key) {
-                        dir.clone()
-                    } else {
-                        let dir = plans::project_directory(checkout_scope, tool)?;
-                        plan_dirs.insert(key, dir.clone());
-                        dir
-                    };
+                    let mut has_plan_file = false;
                     let mut plan_refs_ok = false;
-                    match plans::references(tool, checkout_scope, &snapshot.redacted_records) {
-                        Ok(paths) => {
-                            cached_plan_refs = paths;
-                            plan_refs_ok = true;
+                    match resolve_plans_dir(&mut plan_dirs, checkout_scope, tool) {
+                        Ok(plans_dir) => {
+                            match plans::references(
+                                tool,
+                                checkout_scope,
+                                &snapshot.redacted_records,
+                            ) {
+                                Ok(paths) => {
+                                    cached_plan_refs = paths;
+                                    plan_refs_ok = true;
+                                    has_plan_file = collect_session_plan_refs(
+                                        db,
+                                        &blobs,
+                                        project,
+                                        project_id,
+                                        &scan_id,
+                                        e.path(),
+                                        tool,
+                                        &id,
+                                        &checkout,
+                                        &plans_dir,
+                                        &cached_plan_refs,
+                                        &mut seen,
+                                    )?;
+                                }
+                                Err(err) => {
+                                    can_cache = false;
+                                    error(
+                                        db,
+                                        &format!("{scan_id}:scan:plans:{}", e.path().display()),
+                                        &err,
+                                    )?;
+                                }
+                            }
+                            if plan_refs_ok {
+                                cached_plans_dir = Some(plans_dir);
+                            }
                         }
                         Err(err) => {
                             can_cache = false;
@@ -2785,14 +2963,36 @@ fn scan_source(
                     }
                     let mut embedded_ok = true;
                     for (name, text) in plans::embedded(tool, &snapshot.redacted_records) {
+                        if tool == "claude" && has_plan_file {
+                            continue;
+                        }
                         match plans::content(text.as_bytes()) {
                             Ok(file) => {
-                                cached_embedded_plans.push(scan_cache::CachedEmbeddedPlan {
+                                let plan = scan_cache::CachedEmbeddedPlan {
                                     name: name.to_owned(),
                                     title: plans::title(&text, "Plan"),
                                     file,
                                     origin_hash: db::digest(text.as_bytes()),
-                                });
+                                };
+                                if let Err(err) = collect_embedded_plan(
+                                    db,
+                                    &blobs,
+                                    project,
+                                    tool,
+                                    &format!("{tool}/sessions/{id}/{}", plan.name),
+                                    &plan,
+                                    &mut seen,
+                                ) {
+                                    embedded_ok = false;
+                                    can_cache = false;
+                                    error(
+                                        db,
+                                        &format!("{scan_id}:scan:plan:{tool}/{id}/{}", plan.name),
+                                        &err,
+                                    )?;
+                                } else {
+                                    cached_embedded_plans.push(plan);
+                                }
                             }
                             Err(err) => {
                                 embedded_ok = false;
@@ -2805,23 +3005,9 @@ fn scan_source(
                             }
                         }
                     }
-                    collect_session_plans(
-                        db,
-                        &blobs,
-                        project,
-                        project_id,
-                        &scan_id,
-                        tool,
-                        &id,
-                        &checkout,
-                        &plans_dir,
-                        &cached_plan_refs,
-                        &cached_embedded_plans,
-                        &mut seen,
-                    )?;
                     if plan_refs_ok && embedded_ok {
                         plans_checked = true;
-                        cached_plans_dir = Some(plans_dir);
+                        cached_had_plan_file = has_plan_file;
                     }
                 }
                 let result = collect(
@@ -2851,6 +3037,8 @@ fn scan_source(
                             topology: topology.clone(),
                             handoff_scope: handoff_scope.clone(),
                             deps: snapshot.deps,
+                            ancestor_candidates: snapshot.ancestor_candidates,
+                            ancestor_cwds: snapshot.ancestor_cwds,
                             id,
                             cwd,
                             title,
@@ -2858,6 +3046,7 @@ fn scan_source(
                             logical,
                             native_parent,
                             plans_checked,
+                            had_plan_file: cached_had_plan_file,
                             plans_dir: cached_plans_dir,
                             plan_refs: cached_plan_refs,
                             embedded_plans: cached_embedded_plans,

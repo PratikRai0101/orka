@@ -12,7 +12,7 @@ use std::{
 };
 use walkdir::WalkDir;
 
-const CACHE_VERSION: &str = "v1";
+const CACHE_VERSION: &str = concat!("v2-", env!("CARGO_PKG_VERSION"));
 
 #[cfg(test)]
 thread_local! {
@@ -318,6 +318,10 @@ pub(crate) struct CachedSession {
     pub(crate) topology: String,
     pub(crate) handoff_scope: String,
     pub(crate) deps: Vec<(PathBuf, FileStamp)>,
+    #[serde(default)]
+    pub(crate) ancestor_candidates: Vec<(String, Vec<PathBuf>)>,
+    #[serde(default)]
+    pub(crate) ancestor_cwds: Vec<PathBuf>,
     pub(crate) id: String,
     pub(crate) cwd: PathBuf,
     pub(crate) title: String,
@@ -325,6 +329,8 @@ pub(crate) struct CachedSession {
     pub(crate) logical: String,
     pub(crate) native_parent: Option<String>,
     pub(crate) plans_checked: bool,
+    #[serde(default)]
+    pub(crate) had_plan_file: bool,
     pub(crate) plans_dir: Option<PathBuf>,
     pub(crate) plan_refs: Vec<PathBuf>,
     pub(crate) embedded_plans: Vec<CachedEmbeddedPlan>,
@@ -355,16 +361,24 @@ impl CachedSession {
 }
 
 pub(crate) fn session_key(project: &Value, root: &Path, tool: &str, path: &Path) -> String {
-    cache_key(
-        "session",
-        &json!([
-            project["id"],
-            project["sourceId"],
-            root,
-            tool,
-            abs_path(path)
-        ]),
+    let project_id = project["id"].as_str().unwrap_or("");
+    format!(
+        "scanCache:{CACHE_VERSION}:session:{project_id}:{}",
+        db::digest(
+            json!([project["sourceId"], root, tool, abs_path(path)])
+                .to_string()
+                .as_bytes()
+        )
     )
+}
+
+pub(crate) fn clear_project(db: &Connection, project_id: &str) -> Result<()> {
+    db.execute(
+        "DELETE FROM meta WHERE key LIKE ?",
+        [format!("scanCache:%:session:{project_id}:%")],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub(crate) fn load_session(db: &Connection, key: &str) -> Result<Option<CachedSession>> {

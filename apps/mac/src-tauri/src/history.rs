@@ -278,14 +278,14 @@ fn candidate_uuids(name: &str) -> Vec<&str> {
         return Vec::new();
     };
     let mut ids = Vec::new();
-    if stem.len() >= 36 {
+    if stem.len() >= 36 && stem.is_char_boundary(stem.len() - 36) {
         let tail = &stem[stem.len() - 36..];
         if Uuid::parse_str(tail).is_ok() {
             ids.push(tail);
         }
     }
     for (idx, _) in stem.match_indices('_') {
-        if idx >= 37 && stem.as_bytes()[idx - 37] == b'-' {
+        if idx >= 37 && stem.as_bytes()[idx - 37] == b'-' && stem.is_char_boundary(idx - 36) {
             let cand = &stem[idx - 36..idx];
             if Uuid::parse_str(cand).is_ok() && !ids.contains(&cand) {
                 ids.push(cand);
@@ -383,7 +383,22 @@ impl CodexSegmentIndex {
         resolve_current_path(&self.home, path, id, &candidates)
     }
 
-    fn parent_prefix(&self, id: &str, end: u64, offset: u64) -> Result<(Vec<u8>, PathBuf)> {
+    pub(crate) fn candidate_paths(&self, id: &str) -> Result<Vec<PathBuf>> {
+        Uuid::parse_str(id).map_err(|_| "Invalid history identity")?;
+        if let Some(err) = &self.error {
+            return Err(err.clone());
+        }
+        let mut paths = self.by_id.get(id).cloned().unwrap_or_default();
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn parent_prefix(
+        &self,
+        id: &str,
+        end: u64,
+        offset: u64,
+    ) -> Result<(Vec<u8>, PathBuf, Option<crate::scan_cache::FileStamp>)> {
         parent_prefix_in(self.segments(id)?, end, offset)
     }
 }
@@ -565,12 +580,17 @@ pub fn current_path(path: &Path, id: &str) -> Result<PathBuf> {
     resolve_current_path(&home, path, id, &candidates)
 }
 
-fn parent_prefix_in(candidates: Vec<Segment>, end: u64, offset: u64) -> Result<(Vec<u8>, PathBuf)> {
-    let mut found: Option<(Vec<u8>, PathBuf)> = None;
+fn parent_prefix_in(
+    candidates: Vec<Segment>,
+    end: u64,
+    offset: u64,
+) -> Result<(Vec<u8>, PathBuf, Option<crate::scan_cache::FileStamp>)> {
+    let mut found: Option<(Vec<u8>, PathBuf, Option<crate::scan_cache::FileStamp>)> = None;
     for segment in candidates.into_iter().rev() {
         if segment.ordinal >= end {
             continue;
         }
+        let stamp_before = crate::scan_cache::FileStamp::of(&segment.path);
         let bytes = read(&segment.path, Some(offset))?;
         if bytes.len() as u64 != offset {
             continue;
@@ -585,18 +605,18 @@ fn parent_prefix_in(candidates: Vec<Segment>, end: u64, offset: u64) -> Result<(
         {
             if found
                 .as_ref()
-                .is_some_and(|(previous, _)| previous != &bytes)
+                .is_some_and(|(previous, _, _)| previous != &bytes)
             {
                 return Err("Ambiguous inherited history; original sources preserved".into());
             }
-            found = Some((bytes, segment.path));
+            found = Some((bytes, segment.path, stamp_before));
         }
     }
     found.ok_or("Inherited Codex history is missing or has an invalid boundary. Sync this session again from the original device.".into())
 }
 
 fn parent_prefix(home: &Path, id: &str, end: u64, offset: u64) -> Result<Vec<u8>> {
-    parent_prefix_in(segments(home, id)?, end, offset).map(|(bytes, _)| bytes)
+    parent_prefix_in(segments(home, id)?, end, offset).map(|(bytes, _, _)| bytes)
 }
 
 impl History {
@@ -917,6 +937,8 @@ pub(crate) struct SessionSnapshot {
     pub(crate) files: Vec<Value>,
     pub(crate) redacted_records: Vec<Value>,
     pub(crate) deps: Vec<(PathBuf, crate::scan_cache::FileStamp)>,
+    pub(crate) ancestor_candidates: Vec<(String, Vec<PathBuf>)>,
+    pub(crate) ancestor_cwds: Vec<PathBuf>,
 }
 
 /// Builds a redacted session manifest from already-parsed leaf records without
@@ -938,19 +960,27 @@ pub(crate) fn session_snapshot(
     }
     if tool == "codex" {
         let mut ancestor_deps = Vec::new();
+        let mut ancestor_candidates = Vec::new();
         let mut missing_stamp = false;
         let mut history = History::load_from_records(
             leaf_bytes_len,
             leaf_records,
             |id, end, offset| {
-                let (bytes, parent_path) = match codex_index {
-                    Some(index) => index.parent_prefix(id, end, offset)?,
+                let (bytes, parent_path, stamp_before) = match codex_index {
+                    Some(index) => {
+                        let cands = index.candidate_paths(id)?;
+                        let loaded = index.parent_prefix(id, end, offset)?;
+                        ancestor_candidates.push((id.to_owned(), cands));
+                        loaded
+                    }
                     None => {
                         let home = native::codex_home()?;
-                        parent_prefix_in(segments(&home, id)?, end, offset)?
+                        let loaded = parent_prefix_in(segments(&home, id)?, end, offset)?;
+                        missing_stamp = true;
+                        loaded
                     }
                 };
-                if let Some(stamp) = crate::scan_cache::FileStamp::of(&parent_path) {
+                if let Some(stamp) = stamp_before {
                     let abs_parent =
                         std::path::absolute(&parent_path).unwrap_or_else(|_| parent_path.clone());
                     ancestor_deps.push((abs_parent, stamp));
@@ -961,6 +991,16 @@ pub(crate) fn session_snapshot(
             },
             scope,
         )?;
+        let ancestor_cwds = history.rollouts[..history.rollouts.len().saturating_sub(1)]
+            .iter()
+            .filter_map(|rollout| {
+                rollout
+                    .records
+                    .first()
+                    .and_then(|record| record["payload"]["cwd"].as_str())
+                    .map(PathBuf::from)
+            })
+            .collect();
         for rollout in &mut history.rollouts {
             rollout
                 .records
@@ -979,6 +1019,8 @@ pub(crate) fn session_snapshot(
             files,
             redacted_records,
             deps,
+            ancestor_candidates,
+            ancestor_cwds,
         });
     }
     if tool == "pi" {
@@ -1002,6 +1044,8 @@ pub(crate) fn session_snapshot(
         files,
         redacted_records: leaf_records,
         deps,
+        ancestor_candidates: Vec::new(),
+        ancestor_cwds: Vec::new(),
     })
 }
 
