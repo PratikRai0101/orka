@@ -14,6 +14,7 @@ import {
   activeSources,
   hasConnectedSource,
   repositoryLabel,
+  repositoryLabelSuffix,
 } from "./components/project-sources.js";
 import React, {
   lazy,
@@ -44,7 +45,7 @@ import { Overlay } from "./components/overlay.js";
 import { SettingsUpdates } from "./components/settings/settings-updates.js";
 import { SettingsPluginConnections } from "./components/settings/settings-plugin-connections.js";
 import type { WorkspaceResource as Resource } from "./types.js";
-import type { ProjectPage, ProjectResource } from "./types.js";
+import type { ProjectPage, ProjectResource, Snapshot } from "./types.js";
 import {
   MembersPage,
   type ManagementSection,
@@ -102,17 +103,20 @@ import {
 } from "./components/desktop-updates.js";
 import { WorkspaceHeader } from "./components/workspace-header.js";
 import {
+  bindingProjectId,
+  bindingResourceId,
   projectAttention,
   syncReviewItems,
   type SyncReviewItem,
 } from "./components/sync-attention.js";
 import { skillReviewState } from "./components/skill-review-state.js";
-import { skillStatus, type SkillStatus } from "./components/skill-status.js";
+import { skillStatus, type IndexStatus } from "./components/skill-status.js";
+import { listStatus } from "./components/list-status.js";
 import { useDeepLinks } from "./components/use-deep-links.js";
 import { PluginAuthorization } from "./components/plugin-authorization.js";
 import { parseProjectInvite } from "./components/project-invite.js";
 import { useIndexFilters } from "./components/use-index-filters.js";
-import { defaultIndexFilters } from "./components/index-toolbar.js";
+import { defaultIndexFilters } from "./components/index-pages.js";
 import { useResourceView } from "./components/use-resource-view.js";
 import {
   useSkillSummaries,
@@ -560,7 +564,13 @@ function WorkspaceApp({
   useEffect(() => {
     if (alreadyConnectedRepositories) setRepositorySetup("");
   }, [alreadyConnectedRepositories]);
-  const repositories = activeSources(selectedProject?.sources);
+  const repositories = useMemo(() => {
+    const sources = selectedProject?.sources ?? [];
+    return activeSources(sources).map((source) => ({
+      ...source,
+      label: source.name + repositoryLabelSuffix(sources, source),
+    }));
+  }, [selectedProject?.sources]);
   const repository = repositories.some(
     (source) => source.id === index.repository,
   )
@@ -570,14 +580,9 @@ function WorkspaceApp({
     tab === "home" || tab === "env" || tab === "members" || tab === "reviews"
       ? undefined
       : index.filters[tab];
-  const collectionRepository = tab === "skill" ? "all" : repository;
   const filters = useMemo(
-    () => ({
-      ...defaultIndexFilters,
-      ...collectionFilters,
-      repository: collectionRepository,
-    }),
-    [collectionFilters, collectionRepository],
+    () => ({ ...defaultIndexFilters, ...collectionFilters }),
+    [collectionFilters],
   );
   const projectPath = selectedProject?.path;
   const localCatalog = useLocalResources({
@@ -635,17 +640,6 @@ function WorkspaceApp({
       ),
     [sessionTitles.previews, skillSummaries, projectPath],
   );
-  const duplicateTitles = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const item of resources) {
-      if (item.kind === "session" || item.kind === "skill") continue;
-      const title = displayTitle(item).toLocaleLowerCase();
-      counts.set(title, (counts.get(title) ?? 0) + 1);
-    }
-    return new Set(
-      [...counts].filter(([, count]) => count > 1).map(([title]) => title),
-    );
-  }, [resources, displayTitle]);
   const conflicted = useMemo(
     () => new Set(state.conflicts.map((c) => c.resourceId)),
     [state.conflicts],
@@ -697,15 +691,6 @@ function WorkspaceApp({
       }
       if (link.hostname === "project") {
         const [id, resourceId] = link.pathname.split("/").filter(Boolean);
-        const sameProjectSkill =
-          id === project &&
-          catalogResources.some(
-            (item) =>
-              item.projectId === id &&
-              item.resourceId === resourceId &&
-              item.kind === "skill",
-          );
-        if (!sameProjectSkill) index.setRepository("all");
         setProject(id);
         if (resourceId) setResource(resourceId);
         else {
@@ -744,27 +729,51 @@ function WorkspaceApp({
     () => projectAttention(state, project),
     [state, project],
   );
-  const skillStatusOf = useMemo(() => {
+  const statusOf = useMemo(() => {
     const items = new Map(
       attention.items.map((item) => [item.resourceId ?? item.key, item]),
     );
-    const cache = new Map<string, SkillStatus | null>();
-    return (skill: ProjectResource) => {
-      if (!cache.has(skill.resourceId))
+    // Waiting to sync reads every queued upload; attention drops error-free ones.
+    const uploads = new Map<string, Snapshot["outbox"]>();
+    for (const upload of state.outbox)
+      if (upload.project === project && upload.resourceId)
+        uploads.set(upload.resourceId, [
+          ...(uploads.get(upload.resourceId) ?? []),
+          upload,
+        ]);
+    const files = new Map<string, string[]>();
+    for (const binding of state.bindings) {
+      const id = bindingResourceId(binding);
+      if (id && bindingProjectId(binding) === project)
+        files.set(id, binding.paths ?? []);
+    }
+    const cache = new Map<string, IndexStatus | null>();
+    return (resource: ProjectResource) => {
+      const id = resource.resourceId;
+      if (!cache.has(id))
         cache.set(
-          skill.resourceId,
-          skillStatus({
-            resource: skill,
-            conflicted: conflicted.has(skill.resourceId),
-            attention: items.get(skill.resourceId),
-            review: skillReviewState(skill, state, {
-              governed: selectedProject?.governed,
-            }),
-          }),
+          id,
+          resource.kind === "skill"
+            ? skillStatus({
+                resource,
+                conflicted: conflicted.has(id),
+                attention: items.get(id),
+                review: skillReviewState(resource, state, {
+                  governed: selectedProject?.governed,
+                }),
+              })
+            : listStatus({
+                resource,
+                conflicted: conflicted.has(id),
+                attention: items.get(id),
+                uploads: uploads.get(id) ?? [],
+                governed: Boolean(selectedProject?.governed),
+                files: files.get(id) ?? [],
+              }),
         );
-      return cache.get(skill.resourceId) ?? null;
+      return cache.get(id) ?? null;
     };
-  }, [attention, conflicted, state, selectedProject?.governed]);
+  }, [attention, conflicted, state, project, selectedProject?.governed]);
   const syncReviews = useMemo(
     () => syncReviewItems(state, project, attention),
     [state, project, attention],
@@ -842,13 +851,6 @@ function WorkspaceApp({
       </>
     );
   const openResource = (id: string) => {
-    const target = catalogResources.find((item) => item.resourceId === id);
-    if (
-      target?.kind !== "skill" &&
-      repository !== "all" &&
-      target?.sourceId !== repository
-    )
-      index.setRepository("all");
     setResource(id);
     view.setChanges(false);
   };
@@ -910,6 +912,18 @@ function WorkspaceApp({
   const resourceLabel = pageLabels[tab];
   const collectionLabel =
     resourceLabel.charAt(0).toUpperCase() + resourceLabel.slice(1);
+  const listPage = tab === "memory" || tab === "plan" || tab === "session";
+  const repositoryProject = activeSources(selectedProject?.sources).some(
+    (source) => source.repository,
+  );
+  const connect = {
+    repositories: repositoryProject,
+    busy,
+    onConnect: () =>
+      repositoryProject
+        ? openSettings("general")
+        : void act(() => connectProject(project)),
+  };
   const accessRequest =
     selectedProject &&
     (tab === "memory" ||
@@ -1199,11 +1213,8 @@ function WorkspaceApp({
               selectedProject &&
               !inactiveProject &&
               repositories.length > 1 &&
-              tab !== "home" &&
-              // Skills filter by repository inside their own Filter menu.
-              tab !== "skill" &&
-              tab !== "reviews" &&
-              tab !== "members" ? (
+              // Collections filter by repository in their own Filter menu.
+              tab === "env" ? (
                 <RepositoryFilter
                   key={`${workspaceScope}:${project}`}
                   repositories={repositories}
@@ -1361,20 +1372,14 @@ function WorkspaceApp({
           ) : (
             <>
               {!hasConnectedSource(selectedProject) &&
-                selected?.kind !== "skill" && (
+                selected?.kind !== "skill" &&
+                // Lists say so in a pill beside their toolbar.
+                !(listPage && !selected) && (
                   <FolderConnectionPrompt
                     projectName={projectLabel(selectedProject)}
                     busy={busy}
-                    repositories={activeSources(selectedProject.sources).some(
-                      (source) => source.repository,
-                    )}
-                    onConnect={() =>
-                      activeSources(selectedProject.sources).some(
-                        (source) => source.repository,
-                      )
-                        ? openSettings("general")
-                        : void act(() => connectProject(project))
-                    }
+                    repositories={connect.repositories}
+                    onConnect={connect.onConnect}
                   />
                 )}
               <Suspense
@@ -1444,7 +1449,6 @@ function WorkspaceApp({
                     resources={catalogResources}
                     pendingCounts={localCatalog.pendingCounts}
                     onNavigate={(kind) => {
-                      if (kind !== "skill") index.setRepository("all");
                       setEnvSet("");
                       setTab(kind);
                       setResource("");
@@ -1504,10 +1508,15 @@ function WorkspaceApp({
                     onFilters={(next) => index.set(tab, next)}
                     user={state.user}
                     displayTitle={displayTitle}
-                    duplicateTitles={duplicateTitles}
-                    conflicted={conflicted}
-                    skillStatus={skillStatusOf}
+                    statusOf={statusOf}
+                    repositories={repositories}
+                    multiMember={
+                      (state.governance?.find(
+                        (item) => item.projectId === project,
+                      )?.catalog.members?.length ?? 0) > 1
+                    }
                     connected={hasConnectedSource(selectedProject)}
+                    connect={connect}
                     noAccess={Boolean(
                       selectedProject.governed &&
                       selectedProject.role !== "owner" &&

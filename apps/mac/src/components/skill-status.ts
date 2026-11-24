@@ -39,12 +39,15 @@ export type SkillStatusKey =
   | "sharing-paused"
   | "local-edits";
 
-export interface SkillStatus {
-  key: SkillStatusKey;
+/** The one pill an index row shows. */
+export interface IndexStatus<Key extends string = string> {
+  key: Key;
   label: string;
   tone: SkillStatusTone;
   icon: IconGlyph;
 }
+
+type SkillStatus = IndexStatus<SkillStatusKey>;
 
 const status = (
   key: SkillStatusKey,
@@ -57,7 +60,7 @@ const status = (
 export const skillStatuses: SkillStatus[] = [
   status("conflict", "Conflict", "red", TriangleAlertIcon),
   status("upload-failed", "Upload failed", "red", CloudAlertIcon),
-  status("could-not-read", "Could not read", "red", FileWarningIcon),
+  status("could-not-read", "Couldn’t read", "red", FileWarningIcon),
   status("sync-issue", "Sync issue", "red", CircleAlertIcon),
   status("sharing-blocked", "Sharing blocked", "amber", BanIcon),
   status("update-blocked", "Update blocked", "amber", BanIcon),
@@ -73,8 +76,8 @@ export const skillStatuses: SkillStatus[] = [
 const byKey = new Map(skillStatuses.map((item) => [item.key, item]));
 const tones: SkillStatusTone[] = ["red", "amber", "blue", "neutral"];
 
-/** Sort rank: most urgent first, and skills with no status last. */
-export const skillStatusRank = (value: SkillStatus | null) =>
+/** Sort rank: most urgent first, and rows with no status last. */
+export const statusRank = (value: IndexStatus | null) =>
   value ? tones.indexOf(value.tone) : tones.length;
 
 export interface SkillStatusInput {
@@ -88,18 +91,26 @@ export interface SkillStatusInput {
 const unreadable =
   /^(Cannot|Could not|Couldn’t|Couldn't) (read|scan)\b|^Cannot inspect skill folder$/i;
 
-// Previously recorded skill scan failures may only have the native OS error.
+// Native records a bare OS error for files outside a skill package, and
+// previously recorded skill scan failures may only have it too.
 const legacyReadError =
   /^(?:IO error for operation on .+: )?(?:Operation not permitted|No such file or directory|Input\/output error|Permission denied|Not a directory|Is a directory) \(os error (?:1|2|5|13|20|21)\)$/;
+
+/**
+ * Whether a scan error says a file could not be read. A bare OS error names
+ * the file only through the error's source, so it counts only from a source
+ * that is the item's own file.
+ */
+export const isReadFailure = (error: string, ownFile: boolean) =>
+  unreadable.test(error) || (ownFile && legacyReadError.test(error));
 
 function couldNotRead(
   resource: ProjectResource,
   { source, error }: AttentionItem["errors"][number],
 ) {
-  return (
-    unreadable.test(error) ||
-    (source.endsWith(`:scan:skills/${resource.logicalPath}`) &&
-      legacyReadError.test(error))
+  return isReadFailure(
+    error,
+    source.endsWith(`:scan:skills/${resource.logicalPath}`),
   );
 }
 

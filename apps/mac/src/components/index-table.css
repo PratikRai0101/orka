@@ -1,0 +1,512 @@
+.index-table {
+  --index-cell-padding: 16px;
+  width: 100%;
+  table-layout: fixed;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-surface);
+  border-collapse: separate;
+  border-spacing: 0;
+  text-align: left;
+}
+
+.index-table-col-repository {
+  width: 26%;
+}
+
+.index-table-col-person {
+  width: 156px;
+}
+
+.index-table-col-status {
+  width: 180px;
+}
+
+.index-table-col-actions {
+  width: 52px;
+}
+
+.index-table-col-agent {
+  width: 132px;
+}
+
+.index-table-col-updated {
+  width: 124px;
+}
+
+/* Memories, Sessions, and Plans keep their own widths for shared columns. */
+.index-table:not([data-kind="skill"]) .index-table-col-repository {
+  width: 224px;
+}
+
+.index-table:not([data-kind="skill"]) .index-table-col-person {
+  width: 160px;
+}
+
+.index-table:not([data-kind="skill"]) .index-table-col-status {
+  width: 168px;
+}
+
+.index-table:not([data-kind="skill"]) .index-table-col-actions {
+  width: 44px;
+}
+
+.index-table th,
+.index-table td {
+  height: 44px;
+  padding-block: 0;
+  padding-inline: var(--index-cell-padding);
+  border-bottom: 1px solid var(--border-default);
+  vertical-align: middle;
+  font-size: 12px;
+  font-weight: var(--font-weight-regular);
+  line-height: 20px;
+  color: var(--text-secondary);
+}
+
+/* The headings stay under the toolbar while rows pass beneath them. */
+.index-table thead th {
+  position: sticky;
+  z-index: 1;
+  top: var(--index-head-bottom, 0px);
+  height: 36px;
+  overflow: visible;
+  background: var(--surface-secondary);
+  color: var(--text-tertiary);
+}
+
+/* The table's top edge and corners move with the headings. At rest they lie
+   over the table's own; the corners hide the rows passing outside them. */
+.index-table thead th::before {
+  content: "";
+  position: absolute;
+  inset: -1px 0 0;
+  border-top: 1px solid var(--border-default);
+  pointer-events: none;
+}
+
+.index-table thead th:first-child::before {
+  left: -1px;
+  border-left: 1px solid var(--border-default);
+  border-top-left-radius: var(--radius-surface);
+  box-shadow: calc(-1 * var(--radius-surface)) calc(-1 * var(--radius-surface))
+    0 var(--surface-secondary);
+}
+
+.index-table thead th:last-child::before {
+  right: -1px;
+  border-right: 1px solid var(--border-default);
+  border-top-right-radius: var(--radius-surface);
+  box-shadow: var(--radius-surface) calc(-1 * var(--radius-surface)) 0
+    var(--surface-secondary);
+}
+
+/* A row scrolled to for focus lands below the toolbar and headings. */
+.index-table tbody :is(tr, button) {
+  scroll-margin-top: var(--index-rows-top, 0px);
+}
+
+.index-table tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
+/* WebKit selects the word under a secondary click, and selected text gets
+   the native text menu in place of the row's own. */
+.index-table tbody tr {
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.index-table tbody tr:hover > *,
+.index-table tbody tr:focus-within > * {
+  background: var(--state-hover);
+}
+
+/* Rows not drawn: only their height, so the list scrolls its full length.
+   Drawing rows never moves what is on screen. */
+.index-table tbody .index-table-spacer {
+  overflow-anchor: none;
+  cursor: default;
+}
+
+.index-table tbody .index-table-spacer > td {
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.index-table tbody tr:last-child > :first-child {
+  border-bottom-left-radius: calc(var(--radius-surface) - 1px);
+}
+
+.index-table tbody tr:last-child > :last-child {
+  border-bottom-right-radius: calc(var(--radius-surface) - 1px);
+}
+
+.index-table-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.index-table-heading > svg {
+  flex-shrink: 0;
+}
+
+.index-table-heading-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.index-table-name {
+  position: relative;
+}
+
+.index-table-name-content {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.index-table-leading {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.index-table-open {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: var(--font-weight-medium);
+  line-height: 20px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.index-table-open:focus-visible {
+  outline-offset: 2px;
+}
+
+.index-table-name-detail {
+  min-width: 0;
+  max-width: 50%;
+  flex-shrink: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--body-xs-font-size);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.index-table-fork {
+  flex-shrink: 0;
+  margin-left: -2px;
+  color: var(--blue-text);
+}
+
+.index-table-repository-label {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.index-table-repository-label > svg {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.index-table-repository-label > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.index-table-agent .source-label {
+  display: flex;
+}
+
+.index-table-updated {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.index-table-person {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.index-table-avatar {
+  position: relative;
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: var(--surface-tertiary);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+}
+
+.index-table-avatar > img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.index-table-person-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.index-status-pill {
+  display: inline-flex;
+  max-width: 100%;
+  height: 22px;
+  align-items: center;
+  gap: 5px;
+  padding-inline: 8px;
+  border-radius: var(--radius-full);
+  background: var(--surface-tertiary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: var(--font-weight-medium);
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.index-status-pill > svg {
+  flex-shrink: 0;
+}
+
+.index-status-pill[data-tone="red"] {
+  background: var(--red-surface);
+  color: var(--red-text);
+}
+
+.index-status-pill[data-tone="amber"] {
+  background: var(--amber-surface);
+  color: var(--amber-text);
+}
+
+.index-status-pill[data-tone="blue"] {
+  background: var(--blue-surface);
+  color: var(--blue-text);
+}
+
+.index-table-actions {
+  padding-inline: 0 2px !important;
+  text-align: right;
+}
+
+.index-table-actions .ui-icon-button {
+  color: var(--text-tertiary);
+}
+
+.index-table tbody tr:hover .index-table-actions .ui-icon-button,
+.index-table-actions .ui-icon-button[data-state="open"] {
+  color: var(--text-primary);
+}
+
+.index-table-peek {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% - 4px);
+  left: calc(var(--index-cell-padding) + 22px);
+  display: flex;
+  width: min(340px, calc(100vw - 320px));
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+  background: var(--surface-tertiary);
+  box-shadow: var(--shadow-tooltip);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: var(--font-weight-regular);
+  line-height: 18px;
+  white-space: normal;
+  pointer-events: none;
+}
+
+.index-table-peek[data-side="above"] {
+  top: auto;
+  bottom: calc(100% - 4px);
+}
+
+.index-table-peek-description {
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+
+.index-table-peek-empty {
+  color: var(--text-tertiary);
+}
+
+.index-table-peek-origin {
+  color: var(--text-tertiary);
+}
+
+.index-table-peek-path {
+  overflow-wrap: anywhere;
+  color: var(--text-tertiary);
+}
+
+/* Updated has its own column until the window is too narrow for it. */
+.index-table-peek-updated {
+  display: none;
+  color: var(--text-tertiary);
+}
+
+.index-table-peek-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-block: 4px;
+}
+
+.index-table-peek-loading > span {
+  display: block;
+  height: 8px;
+  border-radius: var(--radius-detail);
+  background: var(--border-default);
+}
+
+.index-table-peek-loading > span:nth-child(2) {
+  width: 70%;
+}
+
+/* Default window: the repository column gives width back to skill names. */
+@media (max-width: 1280px) {
+  .index-table-col-repository {
+    width: 22%;
+  }
+}
+
+/* Default window: list agents and people become a logo and an avatar. */
+@media (max-width: 1280px) {
+  .index-table-col-agent,
+  .index-table:not([data-kind="skill"]) .index-table-col-person {
+    width: 52px;
+  }
+
+  .index-table:not([data-kind="skill"]) .index-table-col-repository {
+    width: 150px;
+  }
+
+  /* Hidden from sight only: the names still label the logo and the avatar. */
+  .index-table-agent .source-label > span,
+  .index-table-agent-heading .index-table-heading-label,
+  .index-table:not([data-kind="skill"]) .index-table-person-name,
+  .index-table:not([data-kind="skill"])
+    .index-table-person-heading
+    .index-table-heading-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* Minimum window: list rows move Updated into the peek. The repository
+   keeps the Skills width, enough for its heading and a short name. */
+@media (max-width: 1000px) {
+  .index-table:not([data-kind="skill"]) .index-table-col-repository {
+    width: 134px;
+  }
+
+  .index-table:not([data-kind="skill"]) .index-table-col-actions {
+    width: 36px;
+  }
+
+  .index-table-col-updated,
+  .index-table-updated {
+    display: none;
+  }
+
+  .index-table-peek-updated {
+    display: block;
+  }
+
+  .index-table-peek-kind .index-table-peek-updated {
+    display: inline;
+  }
+}
+
+/* A peek that would say only when the row was updated waits for that width. */
+@media (min-width: 1001px) {
+  .index-table-peek:not(:has(> :not(.index-table-peek-updated))) {
+    display: none;
+  }
+}
+
+/* Minimum window: Shared by becomes an avatar, and the repository narrows. */
+@media (max-width: 1000px) {
+  .index-table-col-repository {
+    width: 134px;
+  }
+
+  .index-table-col-person {
+    width: 52px;
+  }
+
+  .index-table-col-status {
+    width: 168px;
+  }
+
+  /* Hidden from sight only: the name still labels the avatar and the column. */
+  .index-table-person-name,
+  .index-table-person-heading .index-table-heading-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .index-table-peek {
+    animation: index-table-peek-in var(--motion-control-duration)
+      var(--motion-control-ease);
+  }
+}
+
+@keyframes index-table-peek-in {
+  from {
+    opacity: 0;
+  }
+}
