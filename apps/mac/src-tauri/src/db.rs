@@ -353,6 +353,66 @@ fn blob_dir(root: &Path, origin: &str) -> PathBuf {
     }
 }
 
+pub(crate) struct BlobStore {
+    dir: PathBuf,
+}
+
+impl BlobStore {
+    pub(crate) fn current() -> Result<Self> {
+        let config = global_setting("config")?;
+        let dir = blob_dir(&root()?, config["apiUrl"].as_str().unwrap_or(""));
+        Ok(Self { dir })
+    }
+
+    pub(crate) fn present(&self, hash: &str, expected_size: u64) -> bool {
+        use crate::scan_cache::FileStamp;
+        use std::{
+            collections::HashMap,
+            sync::{LazyLock, Mutex},
+        };
+
+        // Memoize successful digest checks in the worker process.
+        // The service-scoped path includes the expected digest in its filename.
+        static VERIFIED: LazyLock<Mutex<HashMap<PathBuf, FileStamp>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+
+        let Ok(path) = checked_blob_path(&self.dir, hash) else {
+            return false;
+        };
+        let Some(stamp) = FileStamp::of(&path) else {
+            return false;
+        };
+        if stamp.length != expected_size {
+            return false;
+        }
+        if VERIFIED
+            .lock()
+            .is_ok_and(|cache| cache.get(&path) == Some(&stamp))
+        {
+            return true;
+        }
+        let Some(verified) = crate::scan_cache::verified_stamp(&path, hash, expected_size) else {
+            return false;
+        };
+        if let Ok(mut cache) = VERIFIED.lock() {
+            if cache.len() >= 8192 {
+                cache.clear();
+            }
+            cache.insert(path, verified);
+        }
+        true
+    }
+
+    pub(crate) fn all_present(&self, files: &[Value]) -> bool {
+        files.iter().all(|file| {
+            file["hash"]
+                .as_str()
+                .zip(file["size"].as_u64())
+                .is_some_and(|(hash, size)| self.present(hash, size))
+        })
+    }
+}
+
 pub fn blob_path(hash: &str) -> Result<PathBuf> {
     let config = global_setting("config")?;
     let dir = blob_dir(&root()?, config["apiUrl"].as_str().unwrap_or(""));

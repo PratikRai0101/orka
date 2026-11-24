@@ -37,6 +37,7 @@ mod projects;
 mod repair;
 mod repositories;
 mod resource_commands;
+mod scan_cache;
 mod selective_sharing;
 mod session_forks;
 mod session_launcher;
