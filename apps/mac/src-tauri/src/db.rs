@@ -394,9 +394,10 @@ impl BlobStore {
         if stamp.length != expected_size {
             return false;
         }
-        if VERIFIED
-            .lock()
-            .is_ok_and(|cache| cache.get(&path) == Some(&stamp))
+        if !crate::scan_cache::is_reconciling()
+            && VERIFIED
+                .lock()
+                .is_ok_and(|cache| cache.get(&path) == Some(&stamp))
         {
             return true;
         }

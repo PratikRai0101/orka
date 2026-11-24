@@ -1103,7 +1103,7 @@ fn materialize_skips_rewriting_matching_memory_file_and_writes_remote_updates() 
 }
 
 #[test]
-fn pull_project_skips_current_resources_and_applies_only_changed_or_missing_blobs() {
+fn incremental_sync_skips_current_resources_repairs_stale_caches_and_honors_cancel() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{
@@ -1137,6 +1137,11 @@ fn pull_project_skips_current_resources_and_applies_only_changed_or_missing_blob
         Arc::new(Mutex::new(std::collections::HashMap::new()));
     let project_json = f.project.clone();
 
+    let cancel_pull = Arc::new(AtomicBool::new(false));
+    let cancel_on_server = Arc::clone(&cancel_pull);
+    let fail_finish = Arc::new(AtomicBool::new(false));
+    let fail_on_server = Arc::clone(&fail_finish);
+    let server_project = project_id.clone();
     let server_blobs = Arc::clone(&blobs_store);
     let server = std::thread::spawn(move || {
         while !stop_srv.load(Ordering::Relaxed) {
@@ -1211,8 +1216,23 @@ fn pull_project_skips_current_resources_and_applies_only_changed_or_missing_blob
                     json!([project_json]).to_string().into_bytes(),
                 )
             } else if method == "GET" && path == "/v2/devices" {
-                ("200 OK", "application/json", b"[]".to_vec())
+                if fail_on_server.load(Ordering::SeqCst) {
+                    (
+                        "503 Service Unavailable",
+                        "application/json",
+                        b"{}".to_vec(),
+                    )
+                } else {
+                    ("200 OK", "application/json", b"[]".to_vec())
+                }
             } else if method == "GET" && path.starts_with("/v2/sync/pull") {
+                if cancel_on_server.swap(false, Ordering::SeqCst) {
+                    crate::sync_queue::SyncQueue::mark_cancelled(
+                        &db::open().unwrap(),
+                        &server_project,
+                    )
+                    .unwrap();
+                }
                 (
                         "200 OK",
                         "application/json",
@@ -1401,6 +1421,92 @@ fn pull_project_skips_current_resources_and_applies_only_changed_or_missing_blob
         "missing blob should force only that 1 resource to re-download"
     );
     assert!(remote_blob.exists());
+
+    let cadence = format!("syncReconciliation:{project_id}");
+    assert_eq!(db::get(&account_db, &cadence).unwrap(), 4);
+
+    // Rejected rows stay visible for manual resolution and must not starve
+    // reconciliation for the rest of the project.
+    let rejected = uuid::Uuid::new_v4().to_string();
+    account_db
+        .execute(
+            "INSERT INTO outbox VALUES(?,?,?,?,?)",
+            rusqlite::params![
+                rejected,
+                project_id,
+                "/v2/sync/push",
+                json!({
+                    "id":rejected,
+                    "resource":{"resourceId":uuid::Uuid::new_v4().to_string()}
+                })
+                .to_string(),
+                "403: Access denied"
+            ],
+        )
+        .unwrap();
+
+    // Prime the verified-blob memo before replacing the stored bytes.
+    let blobs = db::BlobStore::current().unwrap();
+    assert!(blobs.present(&remote_hash, remote_bytes.len() as u64));
+    fs::write(&remote_blob, vec![b'X'; remote_bytes.len()]).unwrap();
+
+    // Simulate a missed local edit by keeping the old manifest behind an
+    // otherwise-current file stamp. The fifth pass still takes the fast path.
+    let old_hash = db::digest(&fs::read(&agents).unwrap());
+    let old_stamp = json!(scan_cache::FileStamp::of(&agents).unwrap());
+    let revised = b"# Agents edited behind a stale manifest\n";
+    fs::write(&agents, revised).unwrap();
+    let mut cached = db::rows(
+        &account_db,
+        "SELECT json_object('key',key,'value',json(value)) FROM meta WHERE key LIKE 'scanCache:%:file:%' AND json_extract(value,'$.file.hash')=?",
+        &[&old_hash],
+    ).unwrap();
+    cached.retain(|entry| entry["value"]["stamp"] == old_stamp);
+    assert_eq!(cached.len(), 1);
+    let mut cached = cached.pop().unwrap();
+    cached["value"]["stamp"] = json!(scan_cache::FileStamp::of(&agents).unwrap());
+    db::set(
+        &account_db,
+        cached["key"].as_str().unwrap(),
+        &cached["value"],
+    )
+    .unwrap();
+
+    let agents_resource = || {
+        let rows = db::rows(&account_db, "SELECT value FROM resources WHERE json_extract(value,'$.logicalPath')='instructions/AGENTS.md'", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        rows.into_iter().next().unwrap()
+    };
+    rt.block_on(sync::once()).unwrap();
+    assert_eq!(db::blob_read(&remote_hash).unwrap(), remote_bytes);
+    assert_eq!(agents_resource()["files"][0]["hash"], old_hash);
+    assert_eq!(db::get(&account_db, &cadence).unwrap(), 5);
+
+    // The sixth pass bypasses the cached manifest and uploads the edit. A
+    // failure in the final remote stage leaves the durable cadence due.
+    fail_finish.store(true, Ordering::SeqCst);
+    assert!(rt.block_on(sync::once()).is_err());
+    fail_finish.store(false, Ordering::SeqCst);
+    assert_eq!(agents_resource()["files"][0]["hash"], db::digest(revised));
+    let reopened = db::open().unwrap();
+    assert_eq!(db::get(&reopened, &cadence).unwrap(), 5);
+    rt.block_on(sync::once()).unwrap();
+    assert_eq!(db::get(&account_db, &cadence).unwrap(), 0);
+    let rejected_status: String = account_db
+        .query_row("SELECT error FROM outbox WHERE id=?", [&rejected], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rejected_status, "403: Access denied");
+
+    // Cancellation while pulling an already-current project must stop local
+    // post-pull work and must not consume any reconciliation credit.
+    fs::remove_file(&out_index).unwrap();
+    cancel_pull.store(true, Ordering::SeqCst);
+    rt.block_on(sync::once()).unwrap();
+    assert!(!cancel_pull.load(Ordering::SeqCst));
+    assert!(!out_index.exists());
+    assert_eq!(db::get(&account_db, &cadence).unwrap(), 0);
 
     stop.store(true, Ordering::Relaxed);
     let _ = server.join();

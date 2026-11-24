@@ -2673,6 +2673,11 @@ fn scan_source(
                     }
                     continue;
                 };
+                if scan_cache::is_reconciling() {
+                    if let Some(cache) = &negative {
+                        cache.forget(db)?;
+                    }
+                }
                 report_file(e.path())?;
                 if tool == "codex" {
                     match codex_index.current_path(e.path(), &id) {
@@ -3254,8 +3259,8 @@ fn source_memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()>
             let hash = file["hash"].as_str().ok_or("Missing hash")?;
             let size = file["size"].as_u64().ok_or("Missing size")?;
             let parent = target.parent().ok_or("No parent")?;
-            let is_regular = fs::symlink_metadata(&target)
-                .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink());
+            let before = scan_cache::FileStamp::of(&target);
+            let is_regular = before.is_some();
             let mut local_file: Option<Value> = None;
             if project["governed"] == true && target.is_file() {
                 if !checked_parents.contains(parent) {
@@ -3300,17 +3305,18 @@ fn source_memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()>
             } else {
                 false
             };
-            if !already_written {
+            let stamp = if already_written {
+                before.filter(|stamp| scan_cache::FileStamp::of(&target).as_ref() == Some(stamp))
+            } else {
                 packages::write_file(root, &target, file)?;
                 checked_parents.insert(parent.to_path_buf());
-            }
-            let cached_target = scan_cache::FileStamp::of(&target).map(|stamp| {
-                scan_cache::CachedMemoryIndexTarget {
-                    path: target.clone(),
-                    stamp,
-                    hash: hash.to_owned(),
-                    size,
-                }
+                scan_cache::verified_stamp(&target, hash, size)
+            };
+            let cached_target = stamp.map(|stamp| scan_cache::CachedMemoryIndexTarget {
+                path: target.clone(),
+                stamp,
+                hash: hash.to_owned(),
+                size,
             });
             if !canonical_text.contains_key(id) {
                 return Ok((String::new(), cached_target));
@@ -3356,15 +3362,15 @@ fn source_memory_index(db: &rusqlite::Connection, project: &Value) -> Result<()>
         }
     }
     db::set(db, &format!("contextSources:{project_id}"), &json!(sources))?;
-    let index_unchanged = fs::symlink_metadata(&index_path).is_ok_and(|meta| {
-        meta.is_file() && !meta.file_type().is_symlink() && meta.len() == text.len() as u64
-    }) && fs::read(&index_path)
-        .is_ok_and(|existing| existing == text.as_bytes());
-    if !index_unchanged {
+    let index_hash = db::digest(text.as_bytes());
+    let index_size = text.len() as u64;
+    let mut index_stamp = scan_cache::verified_stamp(&index_path, &index_hash, index_size);
+    if index_stamp.is_none() {
         db::atomic(&index_path, text.as_bytes())?;
+        index_stamp = scan_cache::verified_stamp(&index_path, &index_hash, index_size);
     }
     if !had_error && cacheable {
-        if let Some(index_stamp) = scan_cache::FileStamp::of(&index_path) {
+        if let Some(index_stamp) = index_stamp {
             scan_cache::save_memory_index(
                 db,
                 &cache_key,

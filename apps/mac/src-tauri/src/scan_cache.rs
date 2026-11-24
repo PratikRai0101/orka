@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    cell::Cell,
     fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -13,6 +14,34 @@ use std::{
 use walkdir::WalkDir;
 
 const CACHE_VERSION: &str = concat!("v3-", env!("CARGO_PKG_VERSION"));
+
+thread_local! {
+    static RECONCILING: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn is_reconciling() -> bool {
+    RECONCILING.get()
+}
+
+/// Run a synchronous scan without trusting cached reads, while still refreshing its caches.
+pub(crate) fn reconcile<T>(scan: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECONCILING.set(self.0);
+        }
+    }
+    let _restore = Restore(RECONCILING.replace(true));
+    scan()
+}
+
+fn read_cache(db: &Connection, key: &str) -> Result<Value> {
+    if is_reconciling() {
+        Ok(Value::Null)
+    } else {
+        db::get(db, key)
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -154,7 +183,7 @@ pub(crate) fn package_file(
         return packages::file(path, name);
     };
     let key = cache_key("file", &json!([abs_path(path), name]));
-    if let Ok(cached) = serde_json::from_value::<CachedPackageFile>(db::get(db, &key)?) {
+    if let Ok(cached) = serde_json::from_value::<CachedPackageFile>(read_cache(db, &key)?) {
         if cached.stamp == before && blobs.all_present(std::slice::from_ref(&cached.file)) {
             return Ok(cached.file);
         }
@@ -191,7 +220,7 @@ pub(crate) fn plan_file(
         return plans::file(path);
     };
     let key = cache_key("plan", &json!([abs_path(path)]));
-    if let Ok(cached) = serde_json::from_value::<CachedPlanFile>(db::get(db, &key)?) {
+    if let Ok(cached) = serde_json::from_value::<CachedPlanFile>(read_cache(db, &key)?) {
         if cached.stamp == before && blobs.all_present(std::slice::from_ref(&cached.file)) {
             return Ok((cached.file, cached.title));
         }
@@ -259,7 +288,7 @@ pub(crate) fn skill_directory(
         return packages::directory(path);
     };
     let key = cache_key("skill", &json!([abs_path(path)]));
-    if let Ok(cached) = serde_json::from_value::<CachedSkillDir>(db::get(db, &key)?) {
+    if let Ok(cached) = serde_json::from_value::<CachedSkillDir>(read_cache(db, &key)?) {
         if cached.entries == before && blobs.all_present(&cached.files) {
             return Ok(cached.files);
         }
@@ -296,7 +325,7 @@ pub(crate) fn codex_summary_meta(db: &Connection, path: &Path) -> Result<CodexSu
     let before = FileStamp::of(path);
     let key = cache_key("codexSummary", &json!([abs_path(path)]));
     if let Some(before) = &before {
-        if let Ok(cached) = serde_json::from_value::<CachedCodexSummary>(db::get(db, &key)?) {
+        if let Ok(cached) = serde_json::from_value::<CachedCodexSummary>(read_cache(db, &key)?) {
             if &cached.stamp == before {
                 return Ok(cached.meta);
             }
@@ -412,7 +441,7 @@ pub(crate) fn clear_project(db: &Connection, project_id: &str) -> Result<()> {
 }
 
 pub(crate) fn load_session(db: &Connection, key: &str) -> Result<Option<CachedSession>> {
-    let raw = db::get(db, key)?;
+    let raw = read_cache(db, key)?;
     if raw.is_null() {
         return Ok(None);
     }
@@ -456,7 +485,7 @@ pub(crate) fn memory_index_key(project_id: &str, memory_id: &str) -> String {
 }
 
 pub(crate) fn load_memory_index(db: &Connection, key: &str) -> Result<Option<CachedMemoryIndex>> {
-    let raw = db::get(db, key)?;
+    let raw = read_cache(db, key)?;
     if raw.is_null() {
         return Ok(None);
     }

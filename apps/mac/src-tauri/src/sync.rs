@@ -1787,6 +1787,20 @@ fn preflight_project(db: &rusqlite::Connection, project: &Value, retry_only: boo
     Ok(())
 }
 
+fn run_preflight_scan(
+    db: &rusqlite::Connection,
+    project: &Value,
+    retry_only: bool,
+    reconcile: bool,
+) -> Result<()> {
+    let scan = || preflight_project(db, project, retry_only);
+    if reconcile {
+        crate::scan_cache::reconcile(scan)
+    } else {
+        scan()
+    }
+}
+
 fn scan_off_runtime<T: Send + 'static>(
     db: &rusqlite::Connection,
     project: &Value,
@@ -2055,6 +2069,26 @@ fn validate_preflight_folders(project: &Value) -> bool {
     true
 }
 
+const RECONCILE_AFTER: u64 = 5;
+
+fn reconciliation_key(project: &str) -> String {
+    format!("syncReconciliation:{project}")
+}
+
+fn syncs_since_reconciliation(db: &rusqlite::Connection, project: &str) -> Result<u64> {
+    let value = db::get(db, &reconciliation_key(project))?;
+    Ok(value.as_u64().unwrap_or(0).min(RECONCILE_AFTER))
+}
+
+pub(crate) fn clear_reconciliation(db: &rusqlite::Connection, project: &str) -> Result<()> {
+    db.execute(
+        "DELETE FROM meta WHERE key=?",
+        [reconciliation_key(project)],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// One sync cycle. `sync_workspace_global` holds the workspace-wide stages and
 /// `sync_project` one project's stages. A whole-workspace cycle interleaves the
 /// same stages stage by stage across projects, in `sync_workspace`.
@@ -2068,6 +2102,8 @@ struct SyncPass<'a> {
     held: HashSet<String>,
     deferred: HashSet<Value>,
     preflight_at: HashMap<String, Instant>,
+    reconciled_preflight: HashSet<String>,
+    reconciliation_progress: HashMap<String, (Value, u64)>,
 }
 
 impl<'a> SyncPass<'a> {
@@ -2090,6 +2126,8 @@ impl<'a> SyncPass<'a> {
             held: HashSet::new(),
             deferred: HashSet::new(),
             preflight_at: HashMap::new(),
+            reconciled_preflight: HashSet::new(),
+            reconciliation_progress: HashMap::new(),
         }
     }
 
@@ -2131,6 +2169,7 @@ impl<'a> SyncPass<'a> {
             return Ok(Break(()));
         }
         crate::codex_skills::retry_project(self.db, project)?;
+        self.finish_reconciliation()?;
         Ok(Continue(()))
     }
 
@@ -2222,7 +2261,14 @@ impl<'a> SyncPass<'a> {
             0,
             None,
         )?;
-        match scan_off_runtime(db, p, move |db, p| preflight_project(db, p, retry_only)).await {
+        let reconcile = !retry_only
+            && syncs_since_reconciliation(db, p["id"].as_str().ok_or("Missing project")?)?
+                == RECONCILE_AFTER;
+        match scan_off_runtime(db, p, move |db, p| {
+            run_preflight_scan(db, p, retry_only, reconcile)
+        })
+        .await
+        {
             Ok(()) => {
                 if !retry_only {
                     if let Some(id) = p["id"].as_str() {
@@ -2238,6 +2284,9 @@ impl<'a> SyncPass<'a> {
                             self.preflight_at.remove(id);
                         } else {
                             self.preflight_at.insert(id.to_string(), Instant::now());
+                            if reconcile {
+                                self.reconciled_preflight.insert(id.to_string());
+                            }
                         }
                     }
                     if waiting.is_none() {
@@ -2363,27 +2412,7 @@ impl<'a> SyncPass<'a> {
         }
         let blocked_projects = &mut self.blocked;
         let mut outbox = ProjectOutbox::open(db, project)?;
-        let paused_sources = crate::sources::paused_upload_sources(p);
-        let queued: Vec<_> = outbox
-            .queued(db)?
-            .into_iter()
-            .filter(|q| {
-                // Unattributed older rows may belong to the paused source.
-                // Keep the bytes and request ID untouched for a verified retry.
-                if crate::sources::upload_paused(&paused_sources, &q["sourceId"]) {
-                    return false;
-                }
-                if q["path"] == crate::selective_sharing::QUEUE_PATH {
-                    crate::selective_sharing::authorized_origin(db, q)
-                        .is_ok_and(|origin| origin.is_some())
-                } else {
-                    crate::projects::sharing_allowed(
-                        p,
-                        crate::projects::queued_kind(q["path"].as_str().unwrap_or(""), &q["value"]),
-                    )
-                }
-            })
-            .collect();
+        let queued = outbox.eligible(db, p)?;
         deferred.extend(
             queued
                 .iter()
@@ -2594,7 +2623,15 @@ impl<'a> SyncPass<'a> {
             return Ok(Continue(()));
         }
         let project = p["id"].as_str().ok_or("Missing project")?;
+        let completed = if retry_only {
+            0
+        } else {
+            syncs_since_reconciliation(db, project)?
+        };
+        let reconcile = completed == RECONCILE_AFTER;
+        let reconcile_on_pull = reconcile && !self.reconciled_preflight.contains(project);
         let preflight_fresh = !retry_only
+            && !reconcile
             && self
                 .preflight_at
                 .get(project)
@@ -2610,7 +2647,10 @@ impl<'a> SyncPass<'a> {
                 0,
                 None,
             )?;
-            scan_off_runtime(db, p, move |db, p| preflight_project(db, p, retry_only)).await
+            scan_off_runtime(db, p, move |db, p| {
+                run_preflight_scan(db, p, retry_only, reconcile_on_pull)
+            })
+            .await
         };
         let scanned = scan.is_ok();
         record_result(db, project, scan)?;
@@ -2642,6 +2682,9 @@ impl<'a> SyncPass<'a> {
         if !pulled {
             return Ok(Continue(()));
         }
+        if crate::projects::foreground_waiting()? || boundary(db, project)?.is_break() {
+            return Ok(Break(()));
+        }
         // Prepare unsent context only after pending approvals and accepted
         // revisions have arrived; exact-base resources must not freeze early.
         if !retry_only {
@@ -2661,10 +2704,17 @@ impl<'a> SyncPass<'a> {
             &[&project],
         )?;
         let apply_state = PullApplyState::load(db, p)?;
-        let pending: Vec<&Value> = resources
-            .iter()
-            .filter(|r| !apply_state.is_current(p, r))
-            .collect();
+        let classify = || {
+            resources
+                .iter()
+                .filter(|r| !apply_state.is_current(p, r))
+                .collect::<Vec<_>>()
+        };
+        let pending = if reconcile {
+            crate::scan_cache::reconcile(classify)
+        } else {
+            classify()
+        };
         #[cfg(test)]
         PULL_APPLIED_RESOURCES.with_borrow_mut(|counts| {
             *counts.entry(project.to_owned()).or_default() += pending.len();
@@ -2720,6 +2770,9 @@ impl<'a> SyncPass<'a> {
                 last_progress = Some(Instant::now());
             }
         }
+        if crate::projects::foreground_waiting()? || boundary(db, project)?.is_break() {
+            return Ok(Break(()));
+        }
         record_result(
             db,
             &format!("{project}:history"),
@@ -2732,12 +2785,48 @@ impl<'a> SyncPass<'a> {
             0,
             None,
         )?;
-        record_result(
-            db,
-            &format!("{project}:memory-index"),
-            indexer::memory_index(db, p),
-        )?;
+        let build_index = || indexer::memory_index(db, p);
+        let result = if reconcile {
+            crate::scan_cache::reconcile(build_index)
+        } else {
+            build_index()
+        };
+        record_result(db, &format!("{project}:memory-index"), result)?;
+        if !retry_only
+            && crate::sources::views(p)
+                .iter()
+                .any(|source| source["path"].is_string())
+        {
+            let next = if reconcile { 0 } else { completed + 1 };
+            self.reconciliation_progress
+                .insert(project.to_owned(), (p.clone(), next));
+        }
         Ok(Continue(()))
+    }
+
+    /// Checkpoint a completed reconciliation after the final sync stage.
+    /// Work that the upload stage intentionally excludes must not stall it.
+    fn finish_reconciliation(&mut self) -> Result<()> {
+        for (project, (view, next)) in std::mem::take(&mut self.reconciliation_progress) {
+            if crate::projects::foreground_waiting()?
+                || project_has_retryable_errors(self.db, &project)?
+            {
+                continue;
+            }
+            let outbox = ProjectOutbox::open(self.db, &project)?;
+            if !outbox.eligible(self.db, &view)?.is_empty() {
+                continue;
+            }
+            let tx = rusqlite::Transaction::new_unchecked(self.db, TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            // Serialize the checkpoint with cancellation. A cancel after this
+            // checkpoint does not undo a reconciliation that already finished.
+            if boundary(&tx, &project)?.is_continue() {
+                db::set(&tx, &reconciliation_key(&project), &json!(next))?;
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Retries pending Codex skill refreshes and records the account's devices.
@@ -2753,7 +2842,7 @@ impl<'a> SyncPass<'a> {
         }
         let devices = api_as(owner, "GET", "/v2/devices", None).await?;
         crate::device_metadata::update_devices(db, &devices)?;
-        Ok(())
+        self.finish_reconciliation()
     }
 }
 
@@ -3194,6 +3283,30 @@ impl<'p> ProjectOutbox<'p> {
     fn queued(&self, db: &rusqlite::Connection) -> Result<Vec<Value>> {
         let source = crate::sources::OUTBOX_SOURCE;
         db::rows(db, &format!("SELECT json_object('sequence',o.rowid,'id',o.id,'project',o.project,'path',o.path,'value',json(o.value),'error',o.error,'sourceId',{source}) FROM outbox o WHERE o.project=? AND (EXISTS(SELECT 1 FROM meta WHERE key='sessionOutboxRedaction:'||o.id) OR o.error IS NULL OR o.error NOT GLOB '4[0-9][0-9]:*' OR substr(o.error,1,3) IN ('401','408','429')) ORDER BY o.rowid"), &[&self.project])
+    }
+
+    fn eligible(&self, db: &rusqlite::Connection, p: &Value) -> Result<Vec<Value>> {
+        let paused_sources = crate::sources::paused_upload_sources(p);
+        Ok(self
+            .queued(db)?
+            .into_iter()
+            .filter(|q| {
+                // Unattributed older rows may belong to the paused source.
+                // Keep the bytes and request ID untouched for a verified retry.
+                if crate::sources::upload_paused(&paused_sources, &q["sourceId"]) {
+                    return false;
+                }
+                if q["path"] == crate::selective_sharing::QUEUE_PATH {
+                    crate::selective_sharing::authorized_origin(db, q)
+                        .is_ok_and(|origin| origin.is_some())
+                } else {
+                    crate::projects::sharing_allowed(
+                        p,
+                        crate::projects::queued_kind(q["path"].as_str().unwrap_or(""), &q["value"]),
+                    )
+                }
+            })
+            .collect())
     }
 
     fn batch<'q>(&self, queued: &'q [Value]) -> Vec<&'q Value> {
