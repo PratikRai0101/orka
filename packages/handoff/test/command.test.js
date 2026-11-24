@@ -1075,3 +1075,94 @@ test("a revoked sign-in that can't be forgotten is replaced", async (t) => {
   }
   assert.equal(seen.starts, 2);
 });
+
+test("an agent's unsaved or unclear session is never replaced by another", async (t) => {
+  const { run } = fixture(t);
+  const unsaved = "88888888-8888-4888-8888-888888888888";
+  for (const extra of [
+    { CLAUDE_CODE_SESSION_ID: unsaved },
+    { CODEX_THREAD_ID: unsaved },
+    { CLAUDE_CODE_SESSION_ID: ID, CODEX_THREAD_ID: RELATED },
+  ]) {
+    const result = await run(["--preview"], { extra });
+    assert.equal(result.code, 1);
+    assert.match(result.err, /Pass --session/);
+    assert.ok(!result.err.includes("Fix it"));
+    const chosen = await run(["--preview", "--session", ID], { extra });
+    assert.equal(chosen.code, 0, chosen.err);
+  }
+});
+
+test("another worktree's session doesn't stand in for a cleared one", async (t) => {
+  const { run, git, claude, home } = fixture(t);
+  const worktree = join(home, "linked");
+  git("worktree", "add", "-q", "-b", "feature", worktree);
+  for (const id of [ID, RELATED])
+    claude(id, [["user", "<command-name>/clear</command-name>"]]);
+  claude(
+    "99999999-9999-4999-8999-999999999999",
+    [["user", "Worktree work"]],
+    undefined,
+    worktree,
+  );
+  const { code, err } = await run(["--preview"]);
+  assert.equal(code, 1);
+  assert.match(err, /no readable conversation/);
+});
+
+test("a worktree folder left behind doesn't report this checkout's branch", async (t) => {
+  const { run, claude, write, project } = fixture(t);
+  write("project/.claude/worktrees/wt/node_modules/a.js", "");
+  const file = claude(
+    "99999999-9999-4999-8999-999999999999",
+    [["user", "Worktree work"]],
+    undefined,
+    join(project, ".claude/worktrees/wt"),
+  );
+  const { bundle } = await preview(run, ["--session", file]);
+  assert.deepEqual(bundle.repository, { name: "team/repo" });
+});
+
+test("a fork from a deleted folder keeps its history below a linked or Git home", async (t) => {
+  const { run, write, home, project } = fixture(t);
+  execFileSync("git", ["init", "-q", home]);
+  symlinkSync(project, join(home, "ln"));
+  const parent = "66666666-6666-4666-8666-666666666666";
+  const child = "77777777-7777-4777-8777-777777777777";
+  const lines = (id, cwd, first, text, base) =>
+    [
+      {
+        type: "session_meta",
+        payload: { id, cwd, ...(base ? { history_base: base } : {}) },
+      },
+      {
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text }],
+        },
+      },
+    ]
+      .map((record, index) =>
+        JSON.stringify({ ...record, ordinal: first + index }),
+      )
+      .join("\n") + "\n";
+  for (const cwd of [join(home, "work/gone"), join(home, "ln/gone")]) {
+    const kept = lines(parent, cwd, 0, "Kept");
+    write(`.codex/sessions/rollout-${parent}.jsonl`, kept);
+    const file = write(
+      `.codex/sessions/rollout-${child}.jsonl`,
+      lines(child, cwd, 2, "Child", {
+        thread_id: parent,
+        end_ordinal_exclusive: 2,
+        end_byte_offset: Buffer.byteLength(kept),
+      }),
+    );
+    const { bundle } = await preview(run, ["--session", file]);
+    assert.deepEqual(
+      bundle.messages.map((message) => message.text),
+      ["Kept", "Child"],
+    );
+  }
+});

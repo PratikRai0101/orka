@@ -65,7 +65,16 @@ function attempt(action, fallback) {
   }
 }
 
-const real = (path) => attempt(() => realpathSync(path), resolve(path));
+/** Resolves links, including those above a folder that is gone. */
+function real(path) {
+  const full = resolve(path);
+  return (
+    attempt(
+      () => realpathSync(full),
+      full === dirname(full) ? full : undefined,
+    ) ?? join(real(dirname(full)), basename(full))
+  );
+}
 const inside = (path, root) => path === root || path.startsWith(root + sep);
 
 // A hook or alias can point these at another repository.
@@ -356,7 +365,11 @@ function codexRecords(path, homes) {
       throw new HandoffError(`${basename(path)} is too large to share.`);
     records = decodeLines(bytes.toString("utf8"));
     const folder = records[0]?.payload?.cwd;
-    if (!space || typeof folder !== "string" || !belongs(real(folder), space))
+    if (
+      !space ||
+      typeof folder !== "string" ||
+      (real(folder) !== real(cwd) && !belongs(real(folder), space))
+    )
       throw new HandoffError(
         "This Codex session continues one from another folder, so it wasn’t shared.",
       );
@@ -408,20 +421,29 @@ export function chooseSession(
     if (match) return openSession(match, homes);
     throw new HandoffError("That session wasn’t found.");
   }
-  const running = env.CLAUDE_CODE_SESSION_ID || env.CODEX_THREAD_ID;
-  if (running && /^[0-9a-f-]{36}$/i.test(running)) {
-    const match = sessionById(homes, running);
+  const running = [env.CLAUDE_CODE_SESSION_ID, env.CODEX_THREAD_ID].filter(
+    Boolean,
+  );
+  // One agent can start another, and either could be the one meant.
+  if (running.length > 1)
+    throw new HandoffError(
+      "Two agents are running here. Pass --session with the ID of the one to share.",
+    );
+  if (running.length) {
+    const match = sessionById(homes, running[0]);
     if (match) return openSession(match, homes);
+    // An unsaved session must not be replaced by a different one.
+    throw new HandoffError(
+      "The running agent’s session isn’t saved on this computer. Pass --session to share another one.",
+    );
   }
   const sessions = listSessions(space, homes);
   // A linked worktree can be inside this checkout without being part of it.
   const here = (item) =>
     item.cwd === space.cwd || checkout(item.cwd) === space.root;
+  const own = sessions.filter(here);
   let empty;
-  for (const item of [
-    ...sessions.filter(here),
-    ...sessions.filter((item) => !here(item)),
-  ])
+  for (const item of own.length ? own : sessions)
     try {
       return openSession(item.path, homes);
     } catch (error) {
@@ -730,9 +752,17 @@ export function collectContext(session, space, homes) {
 export function sessionWorkspace(session, fallback) {
   if (!session.cwd) return missing("");
   if (attempt(() => statSync(session.cwd).isDirectory()))
-    return workspace(session.cwd);
+    return withoutWorktree(workspace(session.cwd));
   const cwd = real(session.cwd);
   return belongs(cwd, fallback) ? { ...fallback, moved: true } : missing(cwd);
+}
+
+/** A removed worktree can leave its folder behind, inside another checkout. */
+function withoutWorktree(space) {
+  const path = relative(space.root, space.cwd);
+  return /(?:^|[\\/])(?:\.claude[\\/]worktrees|\.worktrees)[\\/]/.test(path)
+    ? { ...space, moved: true }
+    : space;
 }
 
 function missing(cwd) {

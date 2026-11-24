@@ -11,7 +11,7 @@ node /path/to/orka/packages/handoff/bin/orka-handoff.js
 ```
 
 Run it inside a project. It picks the latest Claude Code, Codex or Pi session
-there, shows what it will share, and prints a link. The first time, it opens the
+there, or the agent's own session when an agent runs it, shows what it will share, and prints a link. The first time, it opens the
 Dashboard so you can sign in and approve this command.
 
 ## What is shared
