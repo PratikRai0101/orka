@@ -132,9 +132,7 @@ fn cached_session_still_detects_referenced_plan_edits_and_enabling_plan_sharing(
         json!({"memory":false,"skill":false,"session":true,"plan":true,"env":false});
     indexer::scan(&f.db, &with_plans).unwrap();
     assert_eq!(history::read_counts(&claude_path), (2, 0));
-    for r in f.resources() {
-        f.accept(&r);
-    }
+    f.db.execute("DELETE FROM outbox", []).unwrap();
     assert_eq!(
         f.resources().iter().filter(|r| r["kind"] == "plan").count(),
         1
