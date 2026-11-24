@@ -23,11 +23,11 @@ lives. You don't need to copy the raw file to your computer or sign in:
 orka-handoff --host --session <id-or-file>
 ```
 
-Review the selected context before sharing. Keep the handoff ID printed by the
-command so you can revoke it early:
+Review the selected context before sharing. Keep the request ID printed before
+upload. You can cancel the share even if the command never received the link:
 
 ```sh
-orka-handoff revoke <handoff-id> --host
+orka-handoff revoke <request-id> --host --request
 ```
 
 Host mode requires `ORKA_HANDOFF_API` and a provisioned `ORKA_HANDOFF_HOST_TOKEN`.

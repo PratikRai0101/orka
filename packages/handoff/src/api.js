@@ -117,6 +117,10 @@ export async function requireHandoffs(origin, options) {
     throw new HandoffError("This Orka service doesn’t support handoffs yet.");
   if (options?.host && instance.handoffHost !== 1)
     throw new HandoffError("This Orka service hasn’t enabled host sharing.");
+  if (options?.cancel && instance.handoffHostCancel !== 1)
+    throw new HandoffError(
+      "This Orka service needs an update before it can cancel host share requests.",
+    );
 }
 
 /** Shows a short code to approve in any browser, so it works over SSH too. */
@@ -166,7 +170,7 @@ export async function upload(origin, bundle, token, options = {}) {
       if (tries >= 2)
         throw new HandoffError(
           options.host
-            ? `${error.message} The link may have been created. Ask the host operator before sharing again.`
+            ? `${error.message} The link may have been created. Run the cancellation command printed above before sharing again.`
             : `${error.message} The link may have been created. Run orka-handoff list to check.`,
         );
       await (options.delay ?? delay)(1000 * (tries + 1));

@@ -141,7 +141,14 @@ async function service(
     error = "Busy",
   } = {},
 ) {
-  const seen = { creates: [], polls: 0, starts: 0, tokens: [], paths: [] };
+  const seen = {
+    creates: [],
+    revokes: [],
+    polls: 0,
+    starts: 0,
+    tokens: [],
+    paths: [],
+  };
   let valid = "orka_handoff_first";
   const server = createServer(async (request, response) => {
     let raw = "";
@@ -153,7 +160,10 @@ async function service(
       response.end(JSON.stringify(value));
     };
     if (request.url === "/v2/instance")
-      return send(200, { handoffs, handoffHost: hostToken ? 1 : undefined });
+      return send(200, {
+        handoffs,
+        ...(hostToken ? { handoffHost: 1, handoffHostCancel: 1 } : {}),
+      });
     if (request.url === "/v2/handoffs/device") {
       seen.starts++;
       return send(200, {
@@ -205,7 +215,10 @@ async function service(
           },
         ],
       });
-    if (request.url === "/v2/handoffs/revoke") return send(200, { revoked });
+    if (request.url === "/v2/handoffs/revoke") {
+      seen.revokes.push(body);
+      return send(200, { revoked });
+    }
     return send(200, {});
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -218,13 +231,26 @@ async function service(
 }
 
 test("host sharing creates and revokes a link without starting browser sign-in", async (t) => {
-  const { run, claude } = fixture(t);
+  const { run, claude, write, home } = fixture(t);
+  const git = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const marker = join(home, "git-checked");
+  chmodSync(
+    write(
+      "bin/git",
+      `#!/bin/sh\n[ -z "\${ORKA_HANDOFF_HOST_TOKEN+x}" ] || exit 1\n[ "$1" = -c ] && [ "$2" = core.fsmonitor=false ] || exit 1\nprintf checked > "$GIT_CHECK_MARKER"\nexec "$REAL_GIT" "$@"\n`,
+    ),
+    0o755,
+  );
   const hostToken = `orka_handoff_host_${"b".repeat(64)}`;
-  claude(ID, [["user", `Session notes: ${hostToken}`]]);
+  const accountToken = `orka_handoff_${"c".repeat(64)}`;
+  claude(ID, [["user", `Session notes: ${hostToken} ${accountToken}`]]);
   const { origin, seen } = await service(t, { hostToken });
   const extra = {
     ORKA_HANDOFF_API: origin,
     ORKA_HANDOFF_HOST_TOKEN: hostToken,
+    PATH: `${join(home, "bin")}:${process.env.PATH}`,
+    REAL_GIT: git,
+    GIT_CHECK_MARKER: marker,
   };
   const unspecified = await run(["--host", "--yes"], { extra });
   assert.match(unspecified.err, /Pass --session/);
@@ -238,7 +264,11 @@ test("host sharing creates and revokes a link without starting browser sign-in",
     extra,
   });
   assert.equal(result.code, 0, result.err);
-  assert.equal(seen.creates[0].messages[0].text, "Session notes: [REDACTED]");
+  assert.equal(readFileSync(marker, "utf8"), "checked");
+  assert.equal(
+    seen.creates[0].messages[0].text,
+    "Session notes: [REDACTED] [REDACTED]",
+  );
   const revoked = await run(["revoke", JSON.parse(result.out).id, "--host"], {
     extra,
   });
@@ -249,6 +279,34 @@ test("host sharing creates and revokes a link without starting browser sign-in",
     "/v2/instance",
     "/v2/handoffs/revoke",
   ]);
+});
+
+test("a host can cancel by request ID without receiving a create response", async (t) => {
+  const { run } = fixture(t);
+  const hostToken = `orka_handoff_host_${"b".repeat(64)}`;
+  const { origin, seen } = await service(t, { hostToken, cut: 3 });
+  const extra = {
+    ORKA_HANDOFF_API: origin,
+    ORKA_HANDOFF_HOST_TOKEN: hostToken,
+  };
+  const result = await run(["--host", "--session", ID, "--yes", "--json"], {
+    extra,
+  });
+  assert.notEqual(result.code, 0);
+  assert.equal(result.out, "");
+  const requestId = result.err.match(
+    /revoke ([a-f0-9-]+) --host --request/,
+  )?.[1];
+  assert.ok(requestId);
+  assert.deepEqual(
+    seen.creates.map((body) => body.requestId),
+    Array(3).fill(requestId),
+  );
+  const canceled = await run(["revoke", requestId, "--host", "--request"], {
+    extra,
+  });
+  assert.equal(canceled.code, 0, canceled.err);
+  assert.deepEqual(seen.revokes, [{ requestId }]);
 });
 
 test("sharing signs in once, sends related context and never sends secrets or personal notes", async (t) => {

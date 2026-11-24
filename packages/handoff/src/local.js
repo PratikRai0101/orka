@@ -83,16 +83,24 @@ const GIT_LOCATION =
 
 function runGit(cwd, ...args) {
   const env = Object.fromEntries(
-    Object.entries(process.env).filter(([name]) => !GIT_LOCATION.test(name)),
+    Object.entries(process.env).filter(
+      ([name]) =>
+        !GIT_LOCATION.test(name) &&
+        name.toUpperCase() !== "ORKA_HANDOFF_HOST_TOKEN",
+    ),
   );
-  return execFileSync("git", ["-C", cwd, ...args], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-    timeout: 10_000,
-    maxBuffer: 64_000_000,
-    // Reading status must not write the sender's index.
-    env: { ...env, GIT_OPTIONAL_LOCKS: "0" },
-  }).trim();
+  return execFileSync(
+    "git",
+    ["-c", "core.fsmonitor=false", "-C", cwd, ...args],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+      maxBuffer: 64_000_000,
+      // Reading status must not write the sender's index.
+      env: { ...env, GIT_OPTIONAL_LOCKS: "0" },
+    },
+  ).trim();
 }
 
 const git = (...args) => attempt(() => runGit(...args), "");
